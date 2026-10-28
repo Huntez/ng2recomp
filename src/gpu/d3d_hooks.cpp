@@ -6,12 +6,14 @@
 // plugin's null backend retires that stream); the renderer reads the device
 // state at these points. Otherwise they only call the original.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 
 #include <rex/hook.h>
 #include <rex/logging.h>
 
+#include "guest.h"
 #include "video.h"
 
 namespace {
@@ -80,7 +82,23 @@ REX_HOOK_RAW(sub_8373C1F0) {
 REX_EXTERN(__imp__sub_837390C8);
 REX_HOOK_RAW(sub_837390C8) {
   g_counters.clears++;
+  // The float takes r8's slot, so stencil comes in r9.
+  uint32_t device = ctx.r3.u32, count = ctx.r4.u32, rects = ctx.r5.u32, flags = ctx.r6.u32;
+  uint32_t color = ctx.r7.u32, stencil = ctx.r9.u32;
+  float z = float(ctx.f1.f64);
+  // The game builds the rects below its stack pointer, where the call itself
+  // writes: copy them first.
+  int32_t rectData[8][4];
+  count = rects ? std::min(count, 8u) : 0;
+  for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t j = 0; j < 4; j++) {
+      rectData[i][j] = ng2::guest::LoadS32(rects + i * 16 + j * 4);
+    }
+  }
   __imp__sub_837390C8(ctx, base);
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::video::OnClear(device, count, rectData, flags, color, z, stencil);
+  }
 }
 
 // Resolve(dev, flags, src rect, dest texture, dest point, level, slice,
@@ -88,14 +106,26 @@ REX_HOOK_RAW(sub_837390C8) {
 REX_EXTERN(__imp__sub_8373D570);
 REX_HOOK_RAW(sub_8373D570) {
   g_counters.resolves++;
+  uint32_t device = ctx.r3.u32, flags = ctx.r4.u32, rect = ctx.r5.u32, texture = ctx.r6.u32;
+  uint32_t point = ctx.r7.u32, clearColor = ctx.r10.u32;
+  float clearZ = float(ctx.f1.f64);
+  // 10th argument on the caller's stack (the float takes the 9th slot).
+  uint32_t clearStencil = ng2::guest::Load32(ctx.r1.u32 + 92);
   __imp__sub_8373D570(ctx, base);
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::video::OnResolve(device, flags, rect, texture, point, clearColor, clearZ, clearStencil);
+  }
 }
 
 // Swap: the frame is done.
 REX_EXTERN(__imp__sub_837452C0);
 REX_HOOK_RAW(sub_837452C0) {
   g_counters.swaps++;
+  uint32_t device = ctx.r3.u32, frontBuffer = ctx.r4.u32;
   __imp__sub_837452C0(ctx, base);
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::video::OnSwap(device, frontBuffer);
+  }
   if (StatsEnabled()) {
     ReportStats();
   }

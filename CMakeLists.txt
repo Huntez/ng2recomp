@@ -92,3 +92,33 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(plume PUBLIC X11::X11)
 endif()
 target_link_libraries(ng2 PRIVATE plume)
+
+# Internal shaders (present, copies), HLSL compiled to SPIR-V with the DXC
+# that ships with XenosRecomp and embedded in the executable.
+set(NG2_DXC_DIR "${NG2_XENOS_RECOMP_DIR}/thirdparty/dxc-bin")
+set(NG2_INTERNAL_SHADERS
+    "fullscreen_vs:vs_6_0"
+    "present_ps:ps_6_0"
+)
+set(NG2_INTERNAL_SHADER_SOURCES "")
+foreach(_entry ${NG2_INTERNAL_SHADERS})
+    string(REPLACE ":" ";" _parts "${_entry}")
+    list(GET _parts 0 _name)
+    list(GET _parts 1 _profile)
+    set(_hlsl "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/shaders/${_name}.hlsl")
+    set(_spv "${NG2_SHADER_DIR}/internal/${_name}.spv")
+    set(_cpp "${NG2_SHADER_DIR}/internal/${_name}.cpp")
+    add_custom_command(
+        OUTPUT "${_cpp}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${NG2_SHADER_DIR}/internal"
+        COMMAND ${CMAKE_COMMAND} -E env "LD_LIBRARY_PATH=${NG2_DXC_DIR}/lib/x64"
+            "${NG2_DXC_DIR}/bin/x64/dxc-linux" -T ${_profile} -E main -spirv
+            -fvk-use-dx-layout -HV 2021 -Qstrip_debug -Fo "${_spv}" "${_hlsl}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${_spv} -DOUTPUT=${_cpp} -DNAME=g_${_name}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake"
+        DEPENDS "${_hlsl}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv.cmake"
+        COMMENT "Compiling ${_name}.hlsl"
+        VERBATIM)
+    list(APPEND NG2_INTERNAL_SHADER_SOURCES "${_cpp}")
+endforeach()
+target_sources(ng2_shaders PRIVATE ${NG2_INTERNAL_SHADER_SOURCES})
