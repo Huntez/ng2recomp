@@ -85,13 +85,13 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   hang: a vertex fetch with a garbage index read past the 512 MB guest
   memory buffer (page fault, ring timeout); addresses now wrap at 512 MB
   (patches/xenosrecomp/0003). The opening now plays into gameplay.
-- Gameplay (Chapter 1 start): HUD, level and combat (hit counter, blood)
-  work, but characters don't show: only thin red streaks where Ryu and
-  the enemies should be, as if their skinned meshes collapse. No memexport
-  shaders run in these frames (nor in cutscenes, where characters do
-  draw); no textures are skipped. Next: find the character draws (e.g. a
-  debug switch that tints one vertex shader's draws) and compare their
-  bone constants and vertex fetches with a cutscene's.
+- Gameplay (Chapter 1 start) renders: Ryu, enemies, level, HUD, blood.
+  The "missing characters" were a depth bug: the game uses a reversed
+  viewport depth range (negative zScale) and the renderer sorted min/max,
+  so far geometry won over near. The range now goes to Vulkan as is.
+  Still to check: distant buildings look flat and untextured.
+  NG2_DEBUG_HIGHLIGHT=<vs hash> or cycle:<seconds> paints a vertex
+  shader's draws magenta (finding which draws are which).
 - The xenos plugin draws the in-game 3D black (only the HUD shows), so it
   is no reference for gameplay either.
 - Movie audio is pushed as it decodes, paced by the video queue (about

@@ -54,6 +54,8 @@ extern const uint8_t g_depth_copy_ps[];
 extern const size_t g_depth_copy_ps_size;
 extern const uint8_t g_depth_copy_ms_ps[];
 extern const size_t g_depth_copy_ms_ps_size;
+extern const uint8_t g_debug_ps[];
+extern const size_t g_debug_ps_size;
 
 namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();
@@ -144,6 +146,7 @@ std::unique_ptr<RenderShader> g_presentShader;
 std::unique_ptr<RenderPipeline> g_presentPipeline;
 std::unique_ptr<RenderShader> g_rectListShader;
 std::unique_ptr<RenderShader> g_copyShader;
+std::unique_ptr<RenderShader> g_debugShader;
 std::unique_ptr<RenderShader> g_depthCopyShader;
 std::unique_ptr<RenderShader> g_depthCopyMsShader;
 // Copy pipelines by pixel shader and destination format.
@@ -273,6 +276,38 @@ std::unordered_map<uint64_t, CachedTexture> g_textures;
 // frame's fence has passed.
 std::vector<std::unique_ptr<HostTexture>> g_garbage[NUM_FRAMES];
 uint64_t g_frameCount = 0;
+
+// NG2_DEBUG_HIGHLIGHT=<vs hash>: that vertex shader's draws in magenta.
+// =cycle:<seconds>: from that long after the first draw, each vertex shader
+// seen in turn for 2 s (logged), to find which draws are which.
+bool Highlighted(uint64_t vertexShader) {
+  static const char* spec = std::getenv("NG2_DEBUG_HIGHLIGHT");
+  if (!spec) {
+    return false;
+  }
+  static const bool cycle = std::strncmp(spec, "cycle:", 6) == 0;
+  if (!cycle) {
+    static const uint64_t hash = std::strtoull(spec, nullptr, 16);
+    return vertexShader == hash;
+  }
+  static const auto start = std::chrono::steady_clock::now();
+  static const double begin = std::strtod(spec + 6, nullptr);
+  double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  if (elapsed < begin) {
+    return false;
+  }
+  static std::vector<uint64_t> seen;
+  if (std::find(seen.begin(), seen.end(), vertexShader) == seen.end()) {
+    seen.push_back(vertexShader);
+  }
+  size_t index = size_t((elapsed - begin) / 2.0) % seen.size();
+  static size_t logged = ~size_t(0);
+  if (index != logged) {
+    logged = index;
+    REXLOG_INFO("video: highlighting vs {:016X} ({} of {})", seen[index], index, seen.size());
+  }
+  return vertexShader == seen[index];
+}
 
 // NG2_TRACE_FRAME=<n>: log what frame n draws; t<seconds>: the first frame
 // that starts that long after the first draw.
@@ -1562,8 +1597,10 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     float zScale = RegisterFloat(device, 0x2113), zOffset = RegisterFloat(device, 0x2114);
     viewport = RenderViewport(xOffset - std::fabs(xScale), yOffset - std::fabs(yScale),
                               2.0f * std::fabs(xScale), 2.0f * std::fabs(yScale),
-                              std::min(zOffset, zOffset + zScale),
-                              std::max(zOffset, zOffset + zScale));
+                              // Window z = zOffset + z * zScale, as on Xenos: a
+                              // negative scale (reversed depth) stays reversed,
+                              // which Vulkan allows (minDepth > maxDepth).
+                              zOffset, zOffset + zScale);
     // The host viewport is always top-down with positive sizes. D3D's usual
     // negative Y scale is what -fvk-invert-y (on every translated vertex
     // shader) expects; mirror only the unusual signs.
@@ -1657,6 +1694,10 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   key.stencilMasks = Register(device, 0x210D);
   key.cull = mode.value & 0x7;
   key.alphaTest = colorControl.alpha_test_enable;
+  if (Highlighted(vs->entry->hash)) {
+    key.pixelShader = 0;  // the debug shader's pipelines
+    pixelShader = g_debugShader.get();
+  }
   RenderPipeline* pipeline = GetPipeline(key, vertexShader, pixelShader);
   if (!pipeline) {
     return;
@@ -1931,6 +1972,7 @@ void CreatePipelines() {
 
   g_rectListShader = CreateShader(g_rect_list_gs, g_rect_list_gs_size);
   g_copyShader = CreateShader(g_copy_ps, g_copy_ps_size);
+  g_debugShader = CreateShader(g_debug_ps, g_debug_ps_size);
   g_depthCopyShader = CreateShader(g_depth_copy_ps, g_depth_copy_ps_size);
   g_depthCopyMsShader = CreateShader(g_depth_copy_ms_ps, g_depth_copy_ms_ps_size);
 
