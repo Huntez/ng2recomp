@@ -200,11 +200,15 @@ void ReportProfile() {
 constexpr uint64_t GUEST_MEMORY_SIZE = 512ull << 20;
 std::unique_ptr<RenderBuffer> g_guestMemory;
 uint64_t g_guestMemoryAddress = 0;
-// Ranges uploaded to it: the hash of their contents then, and the frame they
-// were last checked in (each range is checked once a frame).
+// Ranges uploaded to it: the hash of their contents then, the frame they were
+// last checked in and the frame they last changed in. A range that hasn't
+// changed for a frame is checked once a frame; one that has (a dynamic buffer
+// the game fills in batches, which the null backend never stalls) is checked
+// on every draw.
 struct GuestMemoryRange {
   uint64_t hash = 0;
   uint64_t checkedFrame = ~0ull;
+  uint64_t changedFrame = 0;
 };
 std::unordered_map<uint64_t, GuestMemoryRange> g_guestMemoryRanges;
 
@@ -653,16 +657,18 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
 }
 
 // Makes guest physical [address, address + size) current in g_guestMemory.
-void SyncGuestMemory(uint32_t address, uint32_t size) {
+// always: inline vertex data in the ring buffer, rewritten at any time.
+void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false) {
   if (!size || uint64_t(address) + size > GUEST_MEMORY_SIZE) {
     return;
   }
   StageTimer timer(Stage::kSync);
   auto& range = g_guestMemoryRanges[(uint64_t(address) << 32) | size];
-  if (range.checkedFrame == g_frameCount) {
+  bool first = range.checkedFrame == ~0ull;
+  bool stable = !first && range.changedFrame + 1 < g_frameCount;
+  if (!always && stable && range.checkedFrame == g_frameCount) {
     return;
   }
-  bool first = range.checkedFrame == ~0ull;
   range.checkedFrame = g_frameCount;
   const uint8_t* source = guest::Physical(address);
   uint64_t hash = XXH3_64bits(source, size);
@@ -671,6 +677,7 @@ void SyncGuestMemory(uint32_t address, uint32_t size) {
     return;
   }
   range.hash = hash;
+  range.changedFrame = g_frameCount;
   g_profile.uploadedBytes += size;
   Upload upload = Allocate(size, 16);
   std::memcpy(upload.data, source, size);
@@ -1283,7 +1290,7 @@ void FlushPendingDraw() {
   PendingDraw pending = std::move(*g_pendingDraw);
   g_pendingDraw.reset();
   auto& data = pending.data;
-  SyncGuestMemory(PhysicalAddress(data.vertexAddress), data.vertexBytes);
+  SyncGuestMemory(PhysicalAddress(data.vertexAddress), data.vertexBytes, true);
   if (Tracing()) {
     const uint32_t* v = reinterpret_cast<const uint32_t*>(guest::Virtual(data.vertexAddress));
     REXLOG_INFO("  inline vertices at {:#x} ({} bytes): {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
@@ -1413,8 +1420,11 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   }
 
   // Declared vertex elements, from the vertex declaration.
-  uint32_t fetchMask[3] = {vs->entry->vertexFetchMask[0], vs->entry->vertexFetchMask[1],
-                           vs->entry->vertexFetchMask[2]};
+  // Pixel shaders can fetch vertex data too.
+  uint32_t fetchMask[3];
+  for (int i = 0; i < 3; i++) {
+    fetchMask[i] = vs->entry->vertexFetchMask[i] | ps->entry->vertexFetchMask[i];
+  }
   uint32_t declaration = guest::Load32(device + 0x2E24);
   if (declaration && !vs->elements.empty()) {
     uint32_t declCount = guest::Load32(declaration + 24);

@@ -52,8 +52,11 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   ~650 draws and ~33 resolves a frame (NG2_PROFILE=1: about 150 ms a second
   in the renderer on the game thread). Guest memory is synced only for the
   fetch constants a shader reads (XenosRecomp's per-shader mask plus the
-  declaration's streams), each range checked once a frame. A buffer the
-  CPU rewrites at the same address within one frame would be missed.
+  declaration's streams). A range unchanged for a frame is checked once a
+  frame; one that changed recently (dynamic buffers filled in batches) on
+  every draw; inline data always. Not handled: overlapping ranges with
+  separate hashes, CPU uploads overwriting memexport results, more than 16
+  declared elements.
 - The xenos plugin draws the in-game cutscene black (only the credits), so
   in-game frames have no emulated reference; judge them on their own.
 - Seen in the opening: k_24_8_FLOAT textures (depth resolves) skipped; the

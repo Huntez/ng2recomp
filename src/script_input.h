@@ -135,8 +135,12 @@ class ScriptInputDriver : public rex::input::InputDriver {
     Pad pad;
     for (auto& step : steps_) {
       bool late = t >= step.at + step.hold;
-      if (t < step.at || (late && step.announced)) {
+      // Steps missed in a stall go one at a time, with a release between.
+      if (t < step.at || (late && (step.announced || t < lateResume_))) {
         continue;
+      }
+      if (late) {
+        lateResume_ = t + 350;
       }
       if (!step.announced) {
         step.announced = true;
@@ -373,9 +377,8 @@ class ScriptInputDriver : public rex::input::InputDriver {
   bool started_ = false;
   std::chrono::steady_clock::time_point start_;
   Pad last_;
-  // Starts high: InputSystem merges player one's devices by the largest packet
-  // number, and a real pad's must not hide this one's changes.
-  uint32_t packet_ = 0x10000000;
+  uint32_t packet_ = 1;
+  uint64_t lateResume_ = 0;
 
   std::string livePath_;
   size_t consumed_ = 0;
