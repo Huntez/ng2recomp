@@ -52,7 +52,15 @@ The patch (`patches/xenosrecomp/0001-*.patch`):
   unnamed ones.
 - 32 texture fetch slots (vertex textures use s16/s17) and 1D textures,
   sampled as Nx1 2D textures. Vertex shaders sample mip 0.
-- Vertex input locations for NG2's semantics (POSITION0-3, NORMAL0-3, ...).
+- No vertex input attributes: every vertex fetch reads guest memory. Fetches
+  of declared elements are placeholders in the microcode (D3D patches them
+  from the vertex declaration on the console), so the renderer supplies each
+  element slot's fetch constant, offset, stride and format at draw time.
+- An NDC transform in every vertex shader (identity with the hardware
+  viewport transform, pixels to NDC without it).
+- Interpolator order TEXCOORD0-7, COLOR0-1, TEXCOORD8-15, so the rectangle
+  list geometry shader can pass what pixel shaders read (TEXCOORD0-7,
+  COLOR0-1) within 64 input components.
 
 ## Contract with the renderer
 
@@ -69,13 +77,10 @@ shared constants), as in Unleashed. Shared constants, in bytes:
 | 680 | half pixel offset (float2) |
 | 688 | guest memory base (uint64): GPU address of guest physical address 0 |
 | 696 | the 96 vertex fetch constants, 2 dwords each |
+| 1464 | 16 declared vertex elements (uint4): fetch constant, offset and stride in dwords, format flags |
+| 1720 | NDC transform (float4) |
 
 The D3D12/DXIL side of the patch is not maintained (Vulkan only).
-
-Vertex input locations (from `USAGE_LOCATIONS` in the patch):
-POSITION0 0, NORMAL0 1, TANGENT0 2, BINORMAL0 3, TEXCOORD0-3 4-7, COLOR0 8,
-BLENDINDICES0 9, BLENDWEIGHT0 10, COLOR1 11, POSITION1-3 12-14,
-NORMAL1-3 15-17, TEXCOORD4-7 18-21.
 
 Consequence for the renderer: memexport targets and raw-fetched vertex data
 are addressed by guest physical address, so vertex buffers live in one GPU

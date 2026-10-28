@@ -25,5 +25,8 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
 void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t destTexture,
                uint32_t destPoint, uint32_t clearColor, float clearZ, uint32_t clearStencil);
 void OnSwap(uint32_t device, uint32_t frontBuffer);
+void OnCreateShader(uint32_t object, uint32_t container, bool pixel);
+void OnDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
+            bool indexed, uint32_t startIndex);
 
 }  // namespace ng2::video

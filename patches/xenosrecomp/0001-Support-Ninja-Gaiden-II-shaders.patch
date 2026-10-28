@@ -1,4 +1,4 @@
-From 4fc6ca0f7fc7a41b4fa153583a2c88886520a5d0 Mon Sep 17 00:00:00 2001
+From f9422ec2636600b6fa53facb727c31f42455d85d Mon Sep 17 00:00:00 2001
 From: gambuzino24 <gambuzino24@gmail.com>
 Date: Wed, 28 Oct 2026 14:18:02 +0000
 Subject: [PATCH] Support Ninja Gaiden II shaders
@@ -22,10 +22,10 @@ Subject: [PATCH] Support Ninja Gaiden II shaders
 The DXIL (D3D12) path is not updated for the new shared constant layout.
 ---
  XenosRecomp/main.cpp              |  18 +-
- XenosRecomp/shader_common.h       | 316 ++++++++++++++++++++++++++++--
- XenosRecomp/shader_recompiler.cpp | 179 +++++++++++++++--
- XenosRecomp/shader_recompiler.h   |   4 +
- 4 files changed, 488 insertions(+), 29 deletions(-)
+ XenosRecomp/shader_common.h       | 345 ++++++++++++++++++++++++++++--
+ XenosRecomp/shader_recompiler.cpp | 206 ++++++++++++++++--
+ XenosRecomp/shader_recompiler.h   |   5 +
+ 4 files changed, 544 insertions(+), 30 deletions(-)
 
 diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
 index d015145..3d16fc4 100644
@@ -73,10 +73,10 @@ index d015145..3d16fc4 100644
  
          StringBuffer f;
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..a6fb322 100644
+index 1c74034..eac681a 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -26,10 +26,20 @@ struct PushConstants
+@@ -26,10 +26,27 @@ struct PushConstants
  
  [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
  
@@ -92,16 +92,23 @@ index 1c74034..a6fb322 100644
 +// 688 guest memory base: GPU address of guest physical address 0 (vertex data
 +//     read by vfetchRaw and memexport targets live there)
 +// 696 the 96 vertex fetch constants, 2 dwords each as the GPU sees them
++// 1464 16 declared vertex elements (uint4 each): fetch constant index,
++//     offset and stride in dwords, format | signed << 8 | integer << 9 |
++//     swap red/blue << 11
++// 1720 NDC transform (float4): oPos.xy = oPos.xy * xy + zw * oPos.w; identity
++//     with the hardware viewport transform, pixels to NDC without it
 +#define g_Booleans(i)              vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 640 + (i) * 4)
 +#define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 672)
 +#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 676)
 +#define g_HalfPixelOffset          vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 680)
 +#define g_GuestMemoryBase          vk::RawBufferLoad<uint64_t>(g_PushConstants.SharedConstants + 688, 8)
 +#define g_VertexFetch(i)           vk::RawBufferLoad<uint2>(g_PushConstants.SharedConstants + 696 + (i) * 8)
++#define g_VertexElement(i)         vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + 1464 + (i) * 16)
++#define g_NdcTransform             vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 1720, 0x10)
  
  [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
  
-@@ -38,15 +48,23 @@ struct PushConstants
+@@ -38,15 +55,23 @@ struct PushConstants
  #else
  
  #define DEFINE_SHARED_CONSTANTS() \
@@ -129,7 +136,7 @@ index 1c74034..a6fb322 100644
  Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
  Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
  TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
-@@ -62,7 +80,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -62,7 +87,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
  float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
@@ -144,7 +151,7 @@ index 1c74034..a6fb322 100644
  }
  
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
-@@ -135,17 +159,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+@@ -135,17 +166,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
      float h1y = h1(fy);
  
      float4 r =
@@ -167,7 +174,7 @@ index 1c74034..a6fb322 100644
  }
  
  struct CubeMapData
-@@ -156,7 +180,7 @@ struct CubeMapData
+@@ -156,7 +187,7 @@ struct CubeMapData
  
  float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
  {
@@ -176,7 +183,7 @@ index 1c74034..a6fb322 100644
  }
  
  float4 tfetchR11G11B10(uint4 value)
-@@ -217,6 +241,268 @@ float computeMipLevel(float2 pixelCoord)
+@@ -217,6 +248,290 @@ float computeMipLevel(float2 pixelCoord)
      return max(0.0, 0.5 * log2(deltaMaxSqr));
  }
  
@@ -309,6 +316,28 @@ index 1c74034..a6fb322 100644
 +        break;
 +    }
 +    return v * exp2(float(expAdjust));
++}
++
++// A fetch of a declared vertex element, set up at draw time from the vertex
++// declaration. Components a format lacks read as (0, 0, 0, 1) like D3D9.
++float4 vfetchElement(float indexValue, uint slot)
++{
++#ifdef __spirv__
++    uint4 element = g_VertexElement(slot);
++#else
++    uint4 element = 0;
++#endif
++    uint flags = element.w;
++    float4 v = vfetchRaw(indexValue, element.x, element.z, int(element.y), flags & 0xFF,
++        (flags & 0x100) != 0, (flags & 0x200) != 0, 0, false);
++    uint format = flags & 0xFF;
++    // Formats with fewer than four components get w = 1.
++    if (format == 36 || format == 37 || format == 57 || format == 25 || format == 31 ||
++        format == 33 || format == 34 || format == 16 || format == 17)
++        v.w = 1.0;
++    if ((flags & 0x800) != 0)
++        v = v.zyxw;
++    return v;
 +}
 +
 +// Memory export (eA/eM#), after Xenia's SPIR-V translator. eA comes from
@@ -446,55 +475,56 @@ index 1c74034..a6fb322 100644
  
  #endif
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..1f705ae 100644
+index 698a418..3e6f57c 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
-@@ -75,6 +75,35 @@ struct DeclUsageLocation
+@@ -75,6 +75,7 @@ struct DeclUsageLocation
  };
  
  // NOTE: These are specialized Vulkan locations for Unleashed Recompiled. Change as necessary. Likely not going to work with other games.
-+#ifndef UNLEASHED_RECOMP
-+// Ninja Gaiden II: up to four position/normal streams. The renderer builds
-+// vertex inputs from this same table; 22 locations (desktop GPUs have 32).
-+static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
-+{
-+    { DeclUsage::Position, 0, 0 },
-+    { DeclUsage::Normal, 0, 1 },
-+    { DeclUsage::Tangent, 0, 2 },
-+    { DeclUsage::Binormal, 0, 3 },
-+    { DeclUsage::TexCoord, 0, 4 },
-+    { DeclUsage::TexCoord, 1, 5 },
-+    { DeclUsage::TexCoord, 2, 6 },
-+    { DeclUsage::TexCoord, 3, 7 },
-+    { DeclUsage::Color, 0, 8 },
-+    { DeclUsage::BlendIndices, 0, 9 },
-+    { DeclUsage::BlendWeight, 0, 10 },
-+    { DeclUsage::Color, 1, 11 },
-+    { DeclUsage::Position, 1, 12 },
-+    { DeclUsage::Position, 2, 13 },
-+    { DeclUsage::Position, 3, 14 },
-+    { DeclUsage::Normal, 1, 15 },
-+    { DeclUsage::Normal, 2, 16 },
-+    { DeclUsage::Normal, 3, 17 },
-+    { DeclUsage::TexCoord, 4, 18 },
-+    { DeclUsage::TexCoord, 5, 19 },
-+    { DeclUsage::TexCoord, 6, 20 },
-+    { DeclUsage::TexCoord, 7, 21 },
-+};
-+#else
++#ifdef UNLEASHED_RECOMP
  static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
  {
      { DeclUsage::Position, 0, 0 },
-@@ -95,6 +124,7 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
+@@ -95,9 +96,33 @@ static constexpr DeclUsageLocation USAGE_LOCATIONS[] =
      { DeclUsage::TexCoord, 7, 15 },
      { DeclUsage::Position, 1, 15 },
  };
 +#endif
  
++// Interface order = location order. Without UNLEASHED_RECOMP the colors come
++// right after TEXCOORD0-7 so a geometry shader passing what pixel shaders read
++// (TEXCOORD0-7, COLOR0-1) stays within 64 input components.
  static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
  {
-@@ -118,13 +148,18 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
++#ifndef UNLEASHED_RECOMP
++    { DeclUsage::TexCoord, 0 },
++    { DeclUsage::TexCoord, 1 },
++    { DeclUsage::TexCoord, 2 },
++    { DeclUsage::TexCoord, 3 },
++    { DeclUsage::TexCoord, 4 },
++    { DeclUsage::TexCoord, 5 },
++    { DeclUsage::TexCoord, 6 },
++    { DeclUsage::TexCoord, 7 },
++    { DeclUsage::Color, 0 },
++    { DeclUsage::Color, 1 },
++    { DeclUsage::TexCoord, 8 },
++    { DeclUsage::TexCoord, 9 },
++    { DeclUsage::TexCoord, 10 },
++    { DeclUsage::TexCoord, 11 },
++    { DeclUsage::TexCoord, 12 },
++    { DeclUsage::TexCoord, 13 },
++    { DeclUsage::TexCoord, 14 },
++    { DeclUsage::TexCoord, 15 },
++#else
+     { DeclUsage::TexCoord, 0 },
+     { DeclUsage::TexCoord, 1 },
+     { DeclUsage::TexCoord, 2 },
+@@ -116,15 +141,21 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::TexCoord, 15 },
+     { DeclUsage::Color, 0 },
      { DeclUsage::Color, 1 }
++#endif
  };
  
 +// Descriptor index slots in the shared constants: TEXTURE_SLOTS per dimension,
@@ -513,7 +543,7 @@ index 698a418..1f705ae 100644
  static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
  {
      return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
-@@ -170,6 +205,15 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+@@ -170,14 +201,61 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
          ++indentation;
      }
  
@@ -529,9 +559,25 @@ index 698a418..1f705ae 100644
      indent();
      print("r{}.", instr.dstRegister);
      printDstSwizzle(instr.dstSwizzle, false);
-@@ -177,7 +221,29 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+ 
      out += " = ";
  
++    if (auto slot = declaredElementSlots.find(address); slot != declaredElementSlots.end())
++    {
++        print("vfetchElement(vfetchIndex, {}).", slot->second);
++        printDstSwizzle(instr.dstSwizzle, true);
++        out += ";\n";
++        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
++
++        if (instr.isPredicated)
++        {
++            --indentation;
++            indent();
++            out += "}\n";
++        }
++        return;
++    }
++
      auto findResult = vertexElements.find(address);
 -    assert(findResult != vertexElements.end());
 +    if (findResult == vertexElements.end())
@@ -560,7 +606,7 @@ index 698a418..1f705ae 100644
  
      switch (findResult->second.usage)
      {
-@@ -336,6 +402,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+@@ -336,6 +414,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
  
      switch (instr.dimension)
      {
@@ -570,7 +616,7 @@ index 698a418..1f705ae 100644
      case TextureDimension::Texture2D:
          print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
          break;
-@@ -360,6 +429,25 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+@@ -360,6 +441,25 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
      }
  }
  
@@ -596,7 +642,7 @@ index 698a418..1f705ae 100644
  void ShaderRecompiler::recompile(const AluInstruction& instr)
  {
      if (instr.isPredicated)
-@@ -599,6 +687,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -599,6 +699,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
              case ExportRegister::PSDepth:
                  exportRegister = "oDepth";
                  break;
@@ -606,7 +652,7 @@ index 698a418..1f705ae 100644
              }
          }
          else
-@@ -625,6 +716,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -625,6 +728,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
  
              default:
              {
@@ -617,7 +663,7 @@ index 698a418..1f705ae 100644
                  auto findResult = interpolators.find(instr.vectorDest);
                  assert(findResult != interpolators.end());
                  exportRegister = findResult->second;
-@@ -1105,6 +1200,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1105,6 +1212,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
      assert(shaderContainer->constantTableOffset != NULL);
  
@@ -628,7 +674,7 @@ index 698a418..1f705ae 100644
      out += include;
      out += '\n';
  
-@@ -1174,11 +1273,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1174,11 +1285,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
              {
                  println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
@@ -642,7 +688,7 @@ index 698a418..1f705ae 100644
  
              samplers.emplace(constantInfo->registerIndex, constantName);
              break;
-@@ -1187,6 +1286,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1187,6 +1298,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      }
  
@@ -660,7 +706,7 @@ index 698a418..1f705ae 100644
      out += "\n#else\n\n";
  
      println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
-@@ -1254,8 +1364,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1254,8 +1376,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          if (constantInfo->registerSet == RegisterSet::Bool)
          {
              const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
@@ -672,29 +718,40 @@ index 698a418..1f705ae 100644
          }
      }
  
-@@ -1324,14 +1435,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
- 
-             out += '\t';
- 
-+            bool foundLocation = false;
-             for (auto& usageLocation : USAGE_LOCATIONS)
-             {
-                 if (usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
-                 {
-                     print("[[vk::location({})]] ", usageLocation.location);
-+                    foundLocation = true;
-                     break;
-                 }
-             }
-+            if (!foundLocation)
+@@ -1301,7 +1424,24 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     }
+     else
+     {
++        // Without UNLEASHED_RECOMP no vertex inputs are declared: every
++        // vertex fetch reads guest memory, as the hardware does. Fetches of
++        // declared elements get their format, offset and stride at draw time
++        // (D3D patches them into the microcode from the vertex declaration on
++        // the console): element slot i is the i-th element in the container.
+         auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
++    #ifndef UNLEASHED_RECOMP
++        for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
++        {
++            union
 +            {
-+                fmt::println(stderr, "no vertex input location for {}{}", USAGE_SEMANTICS[uint32_t(vertexElement.usage)], uint32_t(vertexElement.usageIndex));
-+                throw std::runtime_error("unmapped vertex input semantic");
-+            }
++                VertexElement vertexElement;
++                uint32_t value;
++            };
++            value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
++            declaredElementSlots.emplace(uint32_t(vertexElement.address), i);
++        }
++    #else
+         for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
+         {
+             union
+@@ -1338,6 +1478,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
-             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
-                 uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
-@@ -1345,6 +1463,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
+         }
++    #endif
+ 
+     #ifdef UNLEASHED_RECOMP
+         if (hasIndexCount)
+@@ -1345,6 +1486,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              out += "\tin uint iVertexId : SV_VertexID,\n";
              out += "\tin uint iInstanceId : SV_InstanceID,\n";
          }
@@ -703,7 +760,7 @@ index 698a418..1f705ae 100644
      #endif
  
          out += "\tout float4 oPos : SV_Position";
-@@ -1471,6 +1591,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1471,6 +1614,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
              }
@@ -716,7 +773,7 @@ index 698a418..1f705ae 100644
          #endif
              else
              {
-@@ -1482,6 +1608,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1482,6 +1631,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      out += "\tint a0 = 0;\n";
      out += "\tint aL = 0;\n";
      out += "\tbool p0 = false;\n";
@@ -727,7 +784,7 @@ index 698a418..1f705ae 100644
      out += "\tfloat ps = 0.0;\n";
      if (isPixelShader)
      {
-@@ -1630,7 +1760,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1630,7 +1783,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  address = cfInstr.condExec.address;
                  count = cfInstr.condExec.count;
                  sequence = cfInstr.condExec.sequence;
@@ -736,7 +793,7 @@ index 698a418..1f705ae 100644
                  break;
  
              case ControlFlowOpcode::CondExecPred:
-@@ -1694,11 +1824,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1694,11 +1847,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      }
                      else
                      {
@@ -750,7 +807,7 @@ index 698a418..1f705ae 100644
                      }
  
                      if (simpleControlFlow)
-@@ -1719,6 +1846,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1719,6 +1869,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
              }
  
@@ -774,7 +831,7 @@ index 698a418..1f705ae 100644
              auto instructionCode = code + address * 3;
              
              for (uint32_t i = 0; i < count; i++)
-@@ -1792,6 +1936,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1792,6 +1959,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  instructionCode += 3;
              }
  
@@ -788,8 +845,17 @@ index 698a418..1f705ae 100644
              if (shouldReturn)
              {
                  if (isPixelShader)
-@@ -1836,6 +1987,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1830,12 +2004,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 {
+                 #ifdef UNLEASHED_RECOMP
+                     if (!hasMtxProjection)
+-                #endif
+                     {
+                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                      }
++                #else
++                    out += "\toPos.xy = oPos.xy * g_NdcTransform.xy + g_NdcTransform.zw * oPos.w;\n";
++                #endif
                  }
  
 +                // Unconditional: an exit can be emitted before the first export.
@@ -800,19 +866,20 @@ index 698a418..1f705ae 100644
                  {
                      indent();
 diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
-index b2e317d..e19fd78 100644
+index b2e317d..7998935 100644
 --- a/XenosRecomp/shader_recompiler.h
 +++ b/XenosRecomp/shader_recompiler.h
-@@ -33,6 +33,8 @@ struct ShaderRecompiler : StringBuffer
+@@ -33,6 +33,9 @@ struct ShaderRecompiler : StringBuffer
      std::unordered_map<uint32_t, const char*> samplers;
      std::unordered_map<uint32_t, uint32_t> ifEndLabels;
      uint32_t specConstantsMask = 0;
 +    bool hasMemExport = false;
 +    VertexFetchInstruction lastFullVertexFetch{};
++    std::unordered_map<uint32_t, uint32_t> declaredElementSlots;
  
  #ifdef UNLEASHED_RECOMP
      bool hasMtxProjection = false;
-@@ -45,6 +47,8 @@ struct ShaderRecompiler : StringBuffer
+@@ -45,6 +48,8 @@ struct ShaderRecompiler : StringBuffer
              out += '\t';
      }
  

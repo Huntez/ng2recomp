@@ -80,8 +80,13 @@ add_custom_command(
     COMMENT "Translating NG2 shaders with XenosRecomp"
     VERBATIM)
 
-add_library(ng2_shaders STATIC "${NG2_SHADER_CACHE}")
-target_include_directories(ng2_shaders PUBLIC src/gpu)
+add_library(ng2_shaders STATIC "${NG2_SHADER_CACHE}"
+    "${NG2_XENOS_RECOMP_DIR}/thirdparty/smol-v/source/smolv.cpp")
+target_include_directories(ng2_shaders PUBLIC src/gpu
+    "${NG2_XENOS_RECOMP_DIR}/thirdparty/smol-v/source")
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+target_link_libraries(ng2_shaders PUBLIC PkgConfig::ZSTD)
 target_link_libraries(ng2 PRIVATE ng2_shaders)
 
 # Native renderer: plume (Unleashed Recompiled's RHI), Vulkan only, with the
@@ -99,6 +104,7 @@ set(NG2_DXC_DIR "${NG2_XENOS_RECOMP_DIR}/thirdparty/dxc-bin")
 set(NG2_INTERNAL_SHADERS
     "fullscreen_vs:vs_6_0"
     "present_ps:ps_6_0"
+    "rect_list_gs:gs_6_0"
 )
 set(NG2_INTERNAL_SHADER_SOURCES "")
 foreach(_entry ${NG2_INTERNAL_SHADERS})

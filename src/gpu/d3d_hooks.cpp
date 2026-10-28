@@ -53,14 +53,23 @@ void ReportStats() {
 REX_EXTERN(__imp__sub_8373C720);
 REX_HOOK_RAW(sub_8373C720) {
   g_counters.draws++;
+  uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, start = ctx.r5.u32, count = ctx.r6.u32;
   __imp__sub_8373C720(ctx, base);
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::video::OnDraw(device, primitive, start, count, false, 0);
+  }
 }
 
 // DrawIndexedVertices(dev, prim type, base vertex, start index, index count)
 REX_EXTERN(__imp__sub_8373CB08);
 REX_HOOK_RAW(sub_8373CB08) {
   g_counters.draws++;
+  uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, baseVertex = ctx.r5.u32;
+  uint32_t startIndex = ctx.r6.u32, count = ctx.r7.u32;
   __imp__sub_8373CB08(ctx, base);
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::video::OnDraw(device, primitive, baseVertex, count, true, startIndex);
+  }
 }
 
 // BeginVertices(dev, prim type, vertex count, stride) -> vertex data
@@ -76,6 +85,26 @@ REX_EXTERN(__imp__sub_8373C1F0);
 REX_HOOK_RAW(sub_8373C1F0) {
   g_counters.draws++;
   __imp__sub_8373C1F0(ctx, base);
+}
+
+// CreateVertexShader(const DWORD* function) -> D3DVertexShader*
+REX_EXTERN(__imp__sub_8373B790);
+REX_HOOK_RAW(sub_8373B790) {
+  uint32_t container = ctx.r3.u32;
+  __imp__sub_8373B790(ctx, base);
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::video::OnCreateShader(ctx.r3.u32, container, false);
+  }
+}
+
+// CreatePixelShader(const DWORD* function) -> D3DPixelShader*
+REX_EXTERN(__imp__sub_8373B3C8);
+REX_HOOK_RAW(sub_8373B3C8) {
+  uint32_t container = ctx.r3.u32;
+  __imp__sub_8373B3C8(ctx, base);
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::video::OnCreateShader(ctx.r3.u32, container, true);
+  }
 }
 
 // Clear(dev, count, rects, flags, color, f1 z, stencil)
