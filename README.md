@@ -73,6 +73,7 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader. No GTK
   Wayland or X11, whichever SDL uses (`--video_driver=wayland|x11` to choose).
 - `NG2_DUMP_IMAGE=<file>`: write the loaded XEX image for analysis.
 - `NG2_D3D_STATS=1`: log D3D draw/clear/resolve/swap counts every second.
+- `NG2_PROFILE=1`: log time spent per native renderer stage every second.
 - `NG2_PAD_SCRIPT=12000:start,16000:a,19000:a:400`: a scripted controller for
   test runs (`<ms>:<button>[+<button>...][:<hold ms>]`, `@file` reads a file);
   `NG2_PAD_LIVE=<file>` presses each line appended to the file. Buttons and
