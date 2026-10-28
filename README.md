@@ -14,7 +14,8 @@ Boots to the title screen on Linux (Vulkan, xenos plugin). Not playable yet.
 
 ## Build
 
-Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader. No GTK
+Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader, FFmpeg
+(libavformat, libavcodec, libswresample, libswscale). No GTK
 (ReXGlue's docs list GTK3, but v0.10 does not use it); dialogs will use Qt.
 
 1. Build and install the SDK (pinned at v0.10.0):
@@ -74,6 +75,8 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader. No GTK
 - `NG2_DUMP_IMAGE=<file>`: write the loaded XEX image for analysis.
 - `NG2_D3D_STATS=1`: log D3D draw/clear/resolve/swap counts every second.
 - `NG2_PROFILE=1`: log time spent per native renderer stage every second.
+- `NG2_MOVIES=xmedia`: use the game's own movie player instead of host
+  decoding (FFmpeg); `NG2_MOVIE_TRACE=1` logs movie player calls.
 - `NG2_PAD_SCRIPT=12000:start,16000:a,19000:a:400`: a scripted controller for
   test runs (`<ms>:<button>[+<button>...][:<hold ms>]`, `@file` reads a file);
   `NG2_PAD_LIVE=<file>` presses each line appended to the file. Buttons and
