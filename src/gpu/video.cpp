@@ -289,7 +289,7 @@ uint32_t g_nextSampler = SAMPLER_FIRST_FREE;
 // Render targets by EDRAM placement and shape.
 struct SurfaceKey {
   uint32_t edramBase;
-  uint32_t format;  // ColorRenderTargetFormat, or 0x100 | DepthRenderTargetFormat
+  uint32_t format;  // host RenderFormat, or 0x100 for depth
   uint32_t width;
   uint32_t height;
   uint32_t msaa;
@@ -571,6 +571,15 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
     host->format = format;
     host->texture = g_device->createTexture(
         RenderTextureDesc::Texture2D(width, height, 1, format, RenderTextureFlag::RENDER_TARGET));
+    // Depth textures read their single channel everywhere, as Xenos does.
+    if (fetch.format == xenos::TextureFormat::k_24_8 ||
+        fetch.format == xenos::TextureFormat::k_24_8_FLOAT) {
+      RenderTextureViewDesc viewDesc = RenderTextureViewDesc::Texture2D(format);
+      viewDesc.mipLevels = 1;
+      viewDesc.componentMapping = RenderComponentMapping(RenderSwizzle::R, RenderSwizzle::R,
+                                                         RenderSwizzle::R, RenderSwizzle::R);
+      host->view = host->texture->createTextureView(viewDesc);
+    }
     SetDescriptor(*host);
     REXLOG_INFO("video: resolve texture {:#x} {}x{} format {}", address, width, height,
                 uint32_t(fetch.format));
@@ -2077,6 +2086,13 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
     BindFramebuffer(target, together ? depth : nullptr);
     CommandList()->clearColor(0, value, rectData, rectDataCount);
   }
+  if (clearDepth || clearStencil) {
+    if (!(clearColor && together)) {
+      BindFramebuffer(nullptr, depth);
+    }
+    CommandList()->clearDepthStencil(clearDepth, clearStencil, z, stencil & 0xFF, rectData,
+                                     rectDataCount);
+  }
   for (uint32_t i = 1; i < 4; i++) {
     HostTexture* other =
         (flags & (1u << i))
@@ -2087,13 +2103,6 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
       BindFramebuffer(other, nullptr);
       CommandList()->clearColor(0, value, rectData, rectDataCount);
     }
-  }
-  if (clearDepth || clearStencil) {
-    if (!(clearColor && together)) {
-      BindFramebuffer(nullptr, depth);
-    }
-    CommandList()->clearDepthStencil(clearDepth, clearStencil, z, stencil & 0xFF, rectData,
-                                     rectDataCount);
   }
 }
 
@@ -2139,6 +2148,14 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
         y2 = std::min({y2, int32_t(target->height), y1 + int32_t(dest->height - dy)});
       } else {
         x2 = x1;
+      }
+      if (depth && dest->format != RenderFormat::R32_FLOAT) {
+        static bool warned = false;
+        if (!warned) {
+          warned = true;
+          REXLOG_WARN("video: depth resolved into texture format {}, not converted",
+                      uint32_t(fetch.format));
+        }
       }
       if (x2 > x1 && y2 > y1 && (depth || dest->format != target->format)) {
         ResolveByDraw(*target, *dest, x1, y1, x2, y2, dx, dy, depth);
@@ -2262,10 +2279,12 @@ void OnSwap(uint32_t device, uint32_t frontBuffer) {
   HostTexture* front = nullptr;
   if (frontBuffer) {
     auto fetch = ReadTextureFetch(frontBuffer);
-    auto it = g_resolvedTextures.find(
-        ResolvedKey(PhysicalAddress(uint32_t(fetch.base_address) << 12), fetch));
-    if (it != g_resolvedTextures.end()) {
+    uint32_t address = PhysicalAddress(uint32_t(fetch.base_address) << 12);
+    if (auto it = g_resolvedTextures.find(ResolvedKey(address, fetch));
+        it != g_resolvedTextures.end()) {
       front = it->second.get();
+    } else if (auto last = g_lastResolve.find(address); last != g_lastResolve.end()) {
+      front = last->second;
     }
     static bool logged = false;
     if (!logged) {
