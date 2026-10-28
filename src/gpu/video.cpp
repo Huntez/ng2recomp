@@ -7,6 +7,7 @@
 #include "video.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -201,7 +202,9 @@ bool CreateHostDevice() {
   }
 
   g_swapChain = g_queue->createSwapChain(renderWindow, 3, BACKBUFFER_FORMAT, 1);
-  if (!g_swapChain) {
+  // plume always returns an object; one that failed (no surface, no present
+  // support, format not offered) has no images.
+  if (!g_swapChain || g_swapChain->getTextureCount() == 0) {
     REXLOG_ERROR("video: cannot create the swapchain");
     return false;
   }
@@ -213,6 +216,10 @@ bool CreateHostDevice() {
   g_presentThread = std::thread([] {
     while (g_running) {
       PresentFrame();
+      if (!g_swapChainValid) {
+        // Minimized or zero-sized window: don't spin.
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+      }
     }
   });
   return true;

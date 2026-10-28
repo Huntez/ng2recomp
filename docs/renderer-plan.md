@@ -41,7 +41,12 @@ the Xenos GPU. `NG2_RENDERER=native` selects it; ReXGlue's xenos plugin
    taken from the fetch constants at draw time. -c.md also decodes the
    device's pending masks.
 2. Present from Swap instead of a free-running thread; the frame = the work
-   between two swaps.
+   between two swaps. Review notes for that rewrite: acquire with a finite
+   timeout (a hidden Wayland window can block FIFO acquire/present forever,
+   hanging shutdown); take the window size from the UI thread's resize
+   events instead of SDL_GetWindowSizeInPixels on the render thread; get the
+   SDL window from ReXGlue's WindowSDL rather than SDL_GetWindows()[0]; no
+   joinable global std::thread at exit.
 3. Render targets and EDRAM: surfaces (RB_COLOR_INFO/RB_DEPTH_INFO, EDRAM
    base and pitch) become host render targets; Clear clears them; Resolve
    copies them to the destination texture's guest address, kept on the GPU

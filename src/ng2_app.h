@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include <rex/rex_app.h>
+#include <rex/system.h>
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/xmemory.h>
 
@@ -40,6 +41,13 @@ class Ng2App : public rex::ReXApp {
     if (ng2::video::IsNativeRenderer()) {
       config.gpu_plugin.clear();
       config.graphics = rex::system::LoadGpuPlugin("xenos", "null");
+      if (!config.graphics) {
+        // Without it the game's D3D waits forever on a ring nobody reads.
+        REXLOG_ERROR("NG2_RENDERER=native needs the xenos GPU plugin's null backend");
+        rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
+                                  "The GPU plugin (librexgpu-xenos) is missing or too old.");
+        std::_Exit(1);
+      }
       REXLOG_INFO("NG2_RENDERER=native: GPU emulation off (null command processor)");
     }
 
