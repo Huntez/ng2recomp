@@ -50,6 +50,10 @@ extern const uint8_t g_rect_list_gs[];
 extern const size_t g_rect_list_gs_size;
 extern const uint8_t g_copy_ps[];
 extern const size_t g_copy_ps_size;
+extern const uint8_t g_depth_copy_ps[];
+extern const size_t g_depth_copy_ps_size;
+extern const uint8_t g_depth_copy_ms_ps[];
+extern const size_t g_depth_copy_ms_ps_size;
 
 namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();
@@ -140,7 +144,10 @@ std::unique_ptr<RenderShader> g_presentShader;
 std::unique_ptr<RenderPipeline> g_presentPipeline;
 std::unique_ptr<RenderShader> g_rectListShader;
 std::unique_ptr<RenderShader> g_copyShader;
-std::unordered_map<RenderFormat, std::unique_ptr<RenderPipeline>> g_copyPipelines;
+std::unique_ptr<RenderShader> g_depthCopyShader;
+std::unique_ptr<RenderShader> g_depthCopyMsShader;
+// Copy pipelines by pixel shader and destination format.
+std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> g_copyPipelines;
 // Single-sample copies of MSAA render targets, for converting resolves.
 std::unordered_map<const void*, std::unique_ptr<HostTexture>> g_resolveTemps;
 
@@ -294,8 +301,13 @@ struct SurfaceKeyHash {
 };
 std::unordered_map<SurfaceKey, std::unique_ptr<HostTexture>, SurfaceKeyHash> g_surfaces;
 
-// Textures written by resolves, by guest physical base address.
-std::unordered_map<uint32_t, std::unique_ptr<HostTexture>> g_resolvedTextures;
+// Textures written by resolves, by guest physical base address and shape
+// (ResolvedKey): different shapes can share an address, e.g. two shadow map
+// sizes resolved to the same memory in one frame.
+std::unordered_map<uint64_t, std::unique_ptr<HostTexture>> g_resolvedTextures;
+// The latest resolve to each address, for a texture that views it with
+// another shape or format.
+std::unordered_map<uint32_t, HostTexture*> g_lastResolve;
 
 // Framebuffers by attachment.
 struct FramebufferKey {
@@ -369,10 +381,12 @@ RenderFormat ResolveTextureFormat(xenos::TextureFormat format) {
     case xenos::TextureFormat::k_16_16_16_16:
       return RenderFormat::R16G16B16A16_UNORM;
     case xenos::TextureFormat::k_16_16_16_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_16_16_EXPAND:
       return RenderFormat::R16G16B16A16_FLOAT;
     case xenos::TextureFormat::k_16_16:
       return RenderFormat::R16G16_SNORM;
     case xenos::TextureFormat::k_16_16_FLOAT:
+    case xenos::TextureFormat::k_16_16_EXPAND:
       return RenderFormat::R16G16_FLOAT;
     case xenos::TextureFormat::k_32_FLOAT:
     case xenos::TextureFormat::k_24_8:
@@ -514,6 +528,12 @@ void BindFramebuffer(HostTexture* color, HostTexture* depth) {
   }
 }
 
+uint64_t ResolvedKey(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetch) {
+  uint32_t data[4] = {address, uint32_t(fetch.size_2d.width), uint32_t(fetch.size_2d.height),
+                      uint32_t(ResolveTextureFormat(fetch.format))};
+  return XXH3_64bits(data, sizeof(data));
+}
+
 // Host texture backing a guest texture written by resolves.
 HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetch) {
   RenderFormat format = ResolveTextureFormat(fetch.format);
@@ -522,22 +542,7 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
   }
   uint32_t width = fetch.size_2d.width + 1;
   uint32_t height = fetch.size_2d.height + 1;
-  auto& slot = g_resolvedTextures[address];
-  if (slot && (slot->width != width || slot->height != height || slot->format != format)) {
-    // Same address, new shape: the old texture may still be in flight.
-    if (g_recording) {
-      auto* commandList = g_commandLists[g_frame].get();
-      commandList->end();
-      g_queue->executeCommandLists(commandList, g_commandFences[g_frame].get());
-      g_commandListPending[g_frame] = true;
-      g_recording = false;
-    }
-    WaitForGPU();
-    g_descriptors.Free(slot->descriptor);
-    ForgetTexture(slot.get());
-    g_resolveTemps.erase(slot.get());
-    slot.reset();
-  }
+  auto& slot = g_resolvedTextures[ResolvedKey(address, fetch)];
   if (!slot) {
     auto host = std::make_unique<HostTexture>();
     host->width = width;
@@ -550,6 +555,7 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
                 uint32_t(fetch.format));
     slot = std::move(host);
   }
+  g_lastResolve[address] = slot.get();
   return slot.get();
 }
 
@@ -573,10 +579,16 @@ xenos::xe_gpu_texture_fetch_t ReadTextureFetch(uint32_t texture) {
 
 // Copies [x1, y1, x2, y2) of a render target to (dx, dy) in a resolve
 // destination, converting the format with a draw.
+// Copies a rect of a render target (color, or depth into R32_FLOAT) to a
+// texture by drawing, converting formats.
 void ResolveByDraw(HostTexture& source, HostTexture& dest, int32_t x1, int32_t y1, int32_t x2,
-                   int32_t y2, uint32_t dx, uint32_t dy) {
+                   int32_t y2, uint32_t dx, uint32_t dy, bool depth = false) {
   HostTexture* readable = &source;
-  if (source.samples != RenderSampleCount::COUNT_1) {
+  RenderShader* shader = g_copyShader.get();
+  if (depth) {
+    shader = source.samples != RenderSampleCount::COUNT_1 ? g_depthCopyMsShader.get()
+                                                          : g_depthCopyShader.get();
+  } else if (source.samples != RenderSampleCount::COUNT_1) {
     auto& temp = g_resolveTemps[&source];
     if (!temp) {
       temp = std::make_unique<HostTexture>();
@@ -598,12 +610,13 @@ void ResolveByDraw(HostTexture& source, HostTexture& dest, int32_t x1, int32_t y
   }
   Transition(*readable, RenderTextureLayout::SHADER_READ);
 
-  auto& pipeline = g_copyPipelines[dest.format];
+  auto& pipeline =
+      g_copyPipelines[(uint64_t(reinterpret_cast<uintptr_t>(shader)) << 8) ^ uint64_t(dest.format)];
   if (!pipeline) {
     RenderGraphicsPipelineDesc desc;
     desc.pipelineLayout = g_pipelineLayout.get();
     desc.vertexShader = g_fullscreenShader.get();
-    desc.pixelShader = g_copyShader.get();
+    desc.pixelShader = shader;
     desc.renderTargetFormat[0] = dest.format;
     desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
     desc.renderTargetCount = 1;
@@ -744,7 +757,8 @@ TextureFormatInfo GetTextureFormatInfo(xenos::TextureFormat format) {
     case F::k_16_16_16_16: return {RenderFormat::R16G16B16A16_UNORM, 1, 8};
     case F::k_16_FLOAT: return {RenderFormat::R16_FLOAT, 1, 2};
     case F::k_16_16_FLOAT: return {RenderFormat::R16G16_FLOAT, 1, 4};
-    case F::k_16_16_16_16_FLOAT: return {RenderFormat::R16G16B16A16_FLOAT, 1, 8};
+    case F::k_16_16_16_16_FLOAT:
+    case F::k_16_16_16_16_EXPAND: return {RenderFormat::R16G16B16A16_FLOAT, 1, 8};
     case F::k_32_FLOAT: return {RenderFormat::R32_FLOAT, 1, 4};
     case F::k_32_32_FLOAT: return {RenderFormat::R32G32_FLOAT, 1, 8};
     case F::k_32_32_32_32_FLOAT: return {RenderFormat::R32G32B32A32_FLOAT, 1, 16};
@@ -942,7 +956,12 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   uint32_t base = uint32_t(fetch.base_address) << 12;
 
   // Render-to-texture results live on the GPU.
-  if (auto it = g_resolvedTextures.find(base); it != g_resolvedTextures.end()) {
+  if (auto it = g_resolvedTextures.find(ResolvedKey(base, fetch));
+      it != g_resolvedTextures.end()) {
+    Transition(*it->second, RenderTextureLayout::SHADER_READ);
+    return it->second->descriptor;
+  }
+  if (auto it = g_lastResolve.find(base); it != g_lastResolve.end()) {
     Transition(*it->second, RenderTextureLayout::SHADER_READ);
     return it->second->descriptor;
   }
@@ -1842,6 +1861,8 @@ void CreatePipelines() {
 
   g_rectListShader = CreateShader(g_rect_list_gs, g_rect_list_gs_size);
   g_copyShader = CreateShader(g_copy_ps, g_copy_ps_size);
+  g_depthCopyShader = CreateShader(g_depth_copy_ps, g_depth_copy_ps_size);
+  g_depthCopyMsShader = CreateShader(g_depth_copy_ms_ps, g_depth_copy_ms_ps_size);
 
   g_guestMemory = g_device->createBuffer(RenderBufferDesc::DefaultBuffer(
       GUEST_MEMORY_SIZE, RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE));
@@ -1925,6 +1946,7 @@ void DestroyHostDevice() {
   g_rectListShader.reset();
   g_framebuffers.clear();
   g_surfaces.clear();
+  g_lastResolve.clear();
   g_resolvedTextures.clear();
   g_presentPipeline.reset();
   g_presentShader.reset();
@@ -2028,7 +2050,7 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
                 destTexture ? uint32_t(ReadTextureFetch(destTexture).base_address) << 12 : 0u);
   }
 
-  if (target && destTexture && !depth) {
+  if (target && destTexture) {
     auto fetch = ReadTextureFetch(destTexture);
     uint32_t address = PhysicalAddress(uint32_t(fetch.base_address) << 12);
     HostTexture* dest = GetResolveDestination(address, fetch);
@@ -2050,8 +2072,8 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
       } else {
         x2 = x1;
       }
-      if (x2 > x1 && y2 > y1 && dest->format != target->format) {
-        ResolveByDraw(*target, *dest, x1, y1, x2, y2, dx, dy);
+      if (x2 > x1 && y2 > y1 && (depth || dest->format != target->format)) {
+        ResolveByDraw(*target, *dest, x1, y1, x2, y2, dx, dy, depth);
       } else if (x2 > x1 && y2 > y1) {
         if (target->samples != RenderSampleCount::COUNT_1) {
           Transition(*target, RenderTextureLayout::RESOLVE_SOURCE);
@@ -2169,7 +2191,8 @@ void OnSwap(uint32_t device, uint32_t frontBuffer) {
   HostTexture* front = nullptr;
   if (frontBuffer) {
     auto fetch = ReadTextureFetch(frontBuffer);
-    auto it = g_resolvedTextures.find(PhysicalAddress(uint32_t(fetch.base_address) << 12));
+    auto it = g_resolvedTextures.find(
+        ResolvedKey(PhysicalAddress(uint32_t(fetch.base_address) << 12), fetch));
     if (it != g_resolvedTextures.end()) {
       front = it->second.get();
     }

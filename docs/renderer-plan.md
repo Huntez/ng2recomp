@@ -59,8 +59,13 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   declared elements.
 - The xenos plugin draws the in-game cutscene black (only the credits), so
   in-game frames have no emulated reference; judge them on their own.
-- Seen in the opening: k_24_8_FLOAT textures (depth resolves) skipped; the
-  sky is black and some surfaces look flat (to investigate).
+- Depth resolves: copied by a draw (sample 0 when multisampled) into
+  R32_FLOAT. Resolved textures are keyed by address and shape (two shadow
+  map sizes share an address), with the latest resolve per address as a
+  fallback for other views.
+- Next: multiple render targets (the luminance chain draws to three at
+  once), EDRAM aliasing (two formats at EDRAM base 0 in the main pass); the
+  scene still looks dim and flat.
 - Mipmaps, cube and 3D textures, the formats that need conversion
   (5_6_5, 1_5_5_5, 4_4_4_4, 2_10_10_10, 10_11_11, 11_11_10).
 - Depth resolves, scissor (PA_SC_WINDOW_SCISSOR isn't in the device's
