@@ -486,7 +486,11 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
   uint32_t dims = guest::Load32(surface + 36);
   SurfaceKey key;
   key.edramBase = info & 0xFFF;
-  key.format = depth ? (0x100 | ((info >> 16) & 1)) : ((info >> 16) & 0xF);
+  // By host format: guest formats that share a host one (2_10_10_10_FLOAT and
+  // its AS_16_16_16_16 view, the two depth formats) are the same EDRAM data
+  // drawn and resolved through either.
+  uint32_t guestFormat = (info >> 16) & (depth ? 1 : 0xF);
+  key.format = depth ? 0x100 : uint32_t(ColorTargetFormat(guestFormat));
   key.width = ((dims >> 18) & 0x3FFF) + 1;
   key.height = ((dims >> 3) & 0x7FFF) + 1;
   key.msaa = guest::Load16(surface + 24) & 3;
@@ -497,14 +501,14 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
     host->width = key.width;
     host->height = key.height;
     host->samples = SampleCount(key.msaa);
-    host->format = depth ? RenderFormat::D32_FLOAT_S8_UINT : ColorTargetFormat(key.format);
+    host->format = depth ? RenderFormat::D32_FLOAT_S8_UINT : ColorTargetFormat(guestFormat);
     RenderTextureDesc desc = RenderTextureDesc::Texture2D(
         key.width, key.height, 1, host->format,
         depth ? RenderTextureFlag::DEPTH_TARGET : RenderTextureFlag::RENDER_TARGET);
     desc.multisampling.sampleCount = host->samples;
     host->texture = g_device->createTexture(desc);
     REXLOG_INFO("video: {} target {}x{} edram {:#x} format {} msaa {}", depth ? "depth" : "color",
-                key.width, key.height, key.edramBase, key.format & 0xFF, key.msaa);
+                key.width, key.height, key.edramBase, guestFormat, key.msaa);
     slot = std::move(host);
   }
   return slot.get();

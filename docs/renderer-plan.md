@@ -66,8 +66,12 @@ NG2_DEBUG_WHITE_TEXTURES=1.
 - Multiple render targets: targets 0-3 while they match target 0's shape,
   per-target format, blend and color mask; a target the pixel shader
   doesn't write keeps its contents. Clear handles targets 1-3.
-- Next: EDRAM aliasing (two formats at EDRAM base 0 in the main pass); the
-  scene still looks dim and flat.
+- EDRAM aliasing, first step: surfaces are keyed by host format, so guest
+  formats sharing one (2_10_10_10_FLOAT and its AS_16_16_16_16 view, the two
+  depth formats) share a texture; the main pass draws through both. Not
+  handled: overlapping surfaces of different sizes or host formats.
+- The opening still looks dim and flat; with no emulated reference in-game,
+  check against captures from hardware.
 - Mipmaps, cube and 3D textures, the formats that need conversion
   (5_6_5, 1_5_5_5, 4_4_4_4, 2_10_10_10, 10_11_11, 11_11_10).
 - Depth resolves, scissor (PA_SC_WINDOW_SCISSOR isn't in the device's
