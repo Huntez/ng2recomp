@@ -1,53 +1,65 @@
 # Native renderer plan
 
-Goal: replace GPU emulation (ReXGlue's `xenos` plugin, Xenia-derived) with a
-renderer that hooks NG2's statically linked D3D9 (XDK) calls and draws through
-Vulkan, modelled on Unleashed Recompiled's `gpu/video.cpp` (plume RHI, Vulkan
-backend only). The xenos plugin stays available as the reference picture.
+Goal: draw NG2 with Vulkan from hooked D3D calls, in the spirit of Unleashed
+Recompiled's `gpu/video.cpp` (plume RHI, Vulkan only), instead of emulating
+the Xenos GPU. `NG2_RENDERER=native` selects it; ReXGlue's xenos plugin
+(`--gpu_plugin=xenos`) stays as the reference picture.
 
-## What NG2 links
+## Architecture (as built)
 
-- XDK 2.0.6683 (xboxkrnl/xam import versions). Unleashed's game is a later
-  XDK, so struct offsets must be checked, not copied.
-- D3D library: 0x83737000-0x8374D8F0, 210 functions, 74 called from game code.
-  XAudio follows from 0x8374D8F0.
-- `GuestDevice` layout matches Unleashed's where checked so far:
-  VS float constants at device+0x780 (1920), PS float constants at +0x1780
-  (6016), dirty flags in the first 0x40 bytes (+16/+24 used by draws).
-
-## Identified so far
-
-| Address | Role | Evidence |
-| --- | --- | --- |
-| 83737BB8 | Direct3D_CreateDevice (inner) | only path to VdInitializeEngines (83741F00) |
-| 837C62E8 | game: device creation | calls 83737BB8 |
-| 837452C0 | swap (VdSwap, display mode) | only VdSwap caller |
-| 837C6680 | game: present | calls 837452C0 |
-| 8373BD50 | draw (49 callers) | flushes VS/PS constants from +0x780/+0x1780 |
-| 8373B1F8 | SetVertexShaderConstantF | copies to device+0x780+16*reg |
-| 8373B4D8 | SetVertexShader-like | device+12684, dirty bits |
-| 837374E8 | SetRenderTarget-like | device+12448 |
-| 8373E9E8 | resource Release | refcount, destroy |
-
-`tools/callgraph.py generated/default callers|callees|asm <addr>` answers the
-rest; the 74 public functions are the hook list to complete.
+- **The game's D3D library keeps running.** Much of NG2's D3D use is inlined
+  in game code (vertex declarations, streams, constants written straight into
+  the device), so hooking setters alone would miss state. Instead the library
+  runs unmodified against the xenos plugin's **null backend**
+  (patches/rexglue-sdk): its command processor parses the ring and retires
+  fences, interrupts, vblank and swaps without rendering. Verified: 60 fps,
+  same per-frame D3D work as under emulation.
+- **The renderer hooks the points where work happens** (src/gpu/d3d_hooks.cpp):
+  DrawVertices 8373C720, DrawIndexedVertices 8373CB08, BeginVertices
+  8373BD50, BeginIndexedVertices 8373C1F0, Clear 837390C8, Resolve 8373D570,
+  Swap 837452C0. Each calls the original, then reads the device.
+- **State comes from the device's GPU register shadows**, which the D3D
+  setters keep in Xenos register format (dev+0x2880 + 4*(reg-0x2000):
+  RB_COLOR_INFO, RB_DEPTHCONTROL, RB_BLENDCONTROL, PA_SU_SC_MODE_CNTL,
+  viewport and scissor registers, ...), the fetch constants (dev+0x480, 32 x
+  24 bytes: textures and vertex streams), the shader objects (dev+0x3190 VS,
+  dev+0x318C PS), the float constants (dev+0x780, dev+0x1780) and bool
+  constants (dev+0x2780). Xenos semantics are documented in ReXGlue's
+  include/rex/graphics/xenos.h and registers; this keeps the translation
+  independent of D3D enums.
+- **Shaders** are translated ahead of time (docs/shaders.md); the renderer
+  maps a shader object to its cache entry by hashing the container the game
+  passed to CreateVertexShader/CreatePixelShader (hook those).
+- **Presentation**: Vulkan device and swapchain on the game window through
+  plume (patched for Wayland, patches/plume), Wayland or X11.
 
 ## Steps
 
-1. Map the 74 public D3D functions to their D3D9 names (signatures, device
-   fields touched, PM4 packets written) and fill `GuestDevice` offsets.
-2. Shaders: done ahead of time with XenosRecomp, see docs/shaders.md. The
-   renderer has to follow that file's shared-constant layout and vertex
-   input locations, and keep vertex data in one GPU buffer laid out like
-   guest physical memory (skinning writes there with memexport).
-3. Port video.cpp: plume Vulkan backend, render command queue, resource
-   types, texture upload (tiling, endian swap, formats), render targets and
-   resolves (EDRAM semantics), present. Drop D3D12 and Metal paths.
-4. Hook in `ng2_codegen.toml`/`REX_HOOK`, boot with `gpu_plugin` empty
-   ("native rendering mode"), compare against `--gpu_plugin=xenos` shots.
+1. Map the D3D library (0x83732250-0x8374D558; XAudio follows): done in
+   docs/d3d-map-a.md, -b.md, -c.md. Most textures are XGSetTextureHeader
+   headers on game memory (8385CF58), not CreateTexture, so textures are
+   taken from the fetch constants at draw time. -c.md also decodes the
+   device's pending masks.
+2. Present from Swap instead of a free-running thread; the frame = the work
+   between two swaps.
+3. Render targets and EDRAM: surfaces (RB_COLOR_INFO/RB_DEPTH_INFO, EDRAM
+   base and pitch) become host render targets; Clear clears them; Resolve
+   copies them to the destination texture's guest address, kept on the GPU
+   (guest address -> host texture), as Unleashed links resolved surfaces.
+4. Draws: pipeline state from registers (blend, depth/stencil, cull, fill,
+   primitive type, viewport/scissor), vertex input from the vertex
+   declaration + vertex fetch constants, shaders from the cache, constants
+   uploaded per draw (shared-constant layout in docs/shaders.md), vertex and
+   index data copied from guest memory into the guest-physical GPU buffer.
+5. Textures: from texture fetch constants (address, format, size, tiling,
+   endianness, mips), untiled and uploaded, cached by address with
+   invalidation on CPU writes (lock/unlock hooks).
+6. GPU passes with memory export (skinning): run them with the guest memory
+   buffer bound so their output feeds later draws.
+7. Compare against `--gpu_plugin=xenos` screenshots throughout.
 
-Audio: ReXGlue's SDL3 output with its XMA decoder (libavcodec) is in use;
-Unleashed's SDL driver only if this turns out worse.
+Audio: ReXGlue's SDL3 output with its XMA decoder (libavcodec); Unleashed's
+SDL driver only if this turns out worse.
 
 License: copying Unleashed code makes this project GPL-3.0-or-later
-(Unleashed is GPL-3.0; ReXGlue is BSD-3-Clause).
+(Unleashed is GPL-3.0; ReXGlue is BSD-3-Clause; plume and XenosRecomp MIT).
