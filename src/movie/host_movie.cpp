@@ -66,6 +66,9 @@ struct HostMovie::State {
   double decodedTime = 0.0;  // the latest decoded frame's time
   bool loop = false;
   double loopOffset = 0.0;  // added to frame times after each pass
+  double frameDuration = 1.0 / 30.0;
+  uint64_t framesDecoded = 0;
+  int width = 0, height = 0;
 
   std::thread thread;
   std::mutex mutex;
@@ -140,6 +143,9 @@ struct HostMovie::State {
 
   void PushAudio(const AVFrame* frame) {
     int samples = swr_get_out_samples(resampler, frame->nb_samples);
+    if (samples <= 0) {
+      return;
+    }
     std::vector<float> buffer(size_t(samples) * 2);
     uint8_t* out = reinterpret_cast<uint8_t*>(buffer.data());
     int converted = swr_convert(resampler, &out, samples,
@@ -157,9 +163,11 @@ struct HostMovie::State {
     frame.height = picture->height;
     int64_t timestamp = picture->best_effort_timestamp;
     AVRational base = format->streams[videoStream]->time_base;
+    // Without a timestamp: one frame after the previous one.
     frame.time = timestamp == AV_NOPTS_VALUE
-                     ? decodedTime
+                     ? (framesDecoded ? decodedTime + frameDuration : loopOffset)
                      : timestamp * av_q2d(base) - startTime + loopOffset;
+    framesDecoded++;
     decodedTime = frame.time;
 
     int chromaWidth = (frame.width + 1) / 2, chromaHeight = (frame.height + 1) / 2;
@@ -175,7 +183,9 @@ struct HostMovie::State {
       scaler = sws_getCachedContext(scaler, frame.width, frame.height,
                                     AVPixelFormat(picture->format), frame.width, frame.height,
                                     AV_PIX_FMT_YUV420P, SWS_POINT, nullptr, nullptr, nullptr);
-      sws_scale(scaler, picture->data, picture->linesize, 0, frame.height, dst, dstPitch);
+      if (scaler) {
+        sws_scale(scaler, picture->data, picture->linesize, 0, frame.height, dst, dstPitch);
+      }
     }
     return frame;
   }
@@ -209,18 +219,26 @@ struct HostMovie::State {
     };
 
     bool running = true;
+    uint64_t framesAtPassStart = 0;
     while (running) {
+      {
+        std::lock_guard lock(mutex);
+        if (quit) {
+          break;
+        }
+      }
       int error = av_read_frame(format, packet);
       if (error < 0) {
         // End of file: flush the decoders.
         avcodec_send_packet(video, nullptr);
         running = drain(video);
-        if (!running || !loop) {
+        // A pass without a frame would loop forever.
+        if (!running || !loop || framesDecoded == framesAtPassStart) {
           break;
         }
+        framesAtPassStart = framesDecoded;
         // Start over, one frame after the last one shown.
-        AVRational rate = format->streams[videoStream]->avg_frame_rate;
-        loopOffset = decodedTime + (rate.num > 0 ? av_q2d(av_inv_q(rate)) : 1.0 / 30.0);
+        loopOffset = decodedTime + frameDuration;
         if (av_seek_frame(format, -1, 0, AVSEEK_FLAG_BACKWARD) < 0) {
           break;
         }
@@ -265,6 +283,12 @@ std::unique_ptr<HostMovie> HostMovie::Open(const std::filesystem::path& path, bo
   if (s.videoStream < 0 || !(s.video = s.OpenDecoder(s.videoStream))) {
     REXLOG_ERROR("movie: {}: no playable video stream", s.name);
     return nullptr;
+  }
+  s.width = s.video->width;
+  s.height = s.video->height;
+  AVRational rate = s.format->streams[s.videoStream]->avg_frame_rate;
+  if (rate.num > 0 && rate.den > 0) {
+    s.frameDuration = av_q2d(av_inv_q(rate));
   }
   if (audio && AudioEnabled()) {
     s.audioStream = av_find_best_stream(s.format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
@@ -339,11 +363,11 @@ bool HostMovie::Finished() const {
 }
 
 int HostMovie::Width() const {
-  return state_->video->width;
+  return state_->width;
 }
 
 int HostMovie::Height() const {
-  return state_->video->height;
+  return state_->height;
 }
 
 void HostMovie::SetVolume(float volume) {

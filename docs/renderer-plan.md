@@ -82,8 +82,10 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   per-frame event (tables 0x83BFB504 / 0x83BF2F44, signalled by
   82339BC8 / 82318EA8) and the main thread spins; same point in time with
   the xenos plugin, the original player and host movies, so likely not
-  movie related (streamed cutscene audio on the null audio device is a
-  candidate).
+  movie related. Not the null audio device either: it happens with real
+  audio too (NG2_TEST_AUDIO=disk in tools/run-headless.sh).
+- Movie audio is pushed as it decodes, paced by the video queue (about
+  200 ms ahead): a long hitch underruns it and audio then trails video.
 - Resolved textures are never freed (one per address and shape); a later
   CPU texture at a once-resolved address keeps sampling the GPU copy.
 - The opening still looks dim and flat; with no emulated reference in-game,

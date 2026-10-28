@@ -33,11 +33,13 @@
 // them until the game releases the player.
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -118,20 +120,51 @@ std::mutex g_mutex;
 std::unordered_map<uint32_t, Player> g_players;  // by guest object address
 std::filesystem::path g_gameDataRoot;
 
-// "game:\name.wmv" -> <game data root>/name.wmv
+// "game:\dir\name.wmv" -> <game data root>/dir/name.wmv, each component
+// matched case-insensitively like the SDK's host path device (the disc has
+// both .wmv and .WMV). Empty if the path leaves the root or isn't found.
 std::filesystem::path HostPath(const char* guestPath) {
   std::string_view path(guestPath);
   if (auto colon = path.find(":\\"); colon != std::string_view::npos) {
     path.remove_prefix(colon + 2);
   }
-  std::string relative(path);
-  std::replace(relative.begin(), relative.end(), '\\', '/');
-  return g_gameDataRoot / relative;
+  auto lower = [](std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return char(std::tolower(c)); });
+    return text;
+  };
+  std::filesystem::path result = g_gameDataRoot;
+  while (!path.empty()) {
+    size_t slash = path.find('\\');
+    std::string part(path.substr(0, slash));
+    path = slash == std::string_view::npos ? std::string_view() : path.substr(slash + 1);
+    if (part.empty() || part == ".") {
+      continue;
+    }
+    if (part == "..") {
+      return {};
+    }
+    std::error_code ec;
+    std::filesystem::path match;
+    for (const auto& entry : std::filesystem::directory_iterator(result, ec)) {
+      if (lower(entry.path().filename().string()) == lower(part)) {
+        match = entry.path();
+        break;
+      }
+    }
+    if (match.empty()) {
+      return {};
+    }
+    result = match;
+  }
+  return result;
 }
 
 // The physical allocations the original player makes when created (traced
 // for the 320x580 title movies): control blocks, then three frames of Y, U
-// and V with 256-byte aligned pitches.
+// and V with 256-byte aligned pitches. Made even when the movie can't be
+// played, since the game's memory layout depends on them.
+constexpr int kDefaultWidth = 320, kDefaultHeight = 580;
 void ReservePhysical(PPCContext& ctx, uint8_t* base, Player& player, int width, int height) {
   auto align = [](uint32_t value) { return (value + 255) & ~255u; };
   std::vector<std::pair<uint32_t, uint32_t>> blocks = {
@@ -164,6 +197,12 @@ uint32_t CreateVoice() {
   uint32_t vtable = GuestMemory()->SystemHeapAlloc(kVoiceVtableSlots * 4);
   uint32_t voice = GuestMemory()->SystemHeapAlloc(kVoiceSize);
   if (!vtable || !voice) {
+    if (vtable) {
+      GuestMemory()->SystemHeapFree(vtable);
+    }
+    if (voice) {
+      GuestMemory()->SystemHeapFree(voice);
+    }
     return 0;
   }
   for (uint32_t i = 0; i < kVoiceVtableSlots; i++) {
@@ -203,27 +242,32 @@ REX_HOOK_RAW(sub_83862EB8) {
   uint32_t params = ctx.r4.u32, out = ctx.r5.u32;
   uint32_t pathAddress = Load32(params) == 1 ? Load32(params + 32) : 0;
   const char* path = pathAddress ? reinterpret_cast<const char*>(Virtual(pathAddress)) : "";
-  if (!HostMovies()) {
+  // Only movies from files are replaced.
+  if (!HostMovies() || !pathAddress) {
     __imp__sub_83862EB8(ctx, base);
     if (TraceEnabled()) {
       REXLOG_INFO("movie: create '{}' -> {:#x} player {:#x}", path, ctx.r3.u32, Load32(out));
     }
     return;
   }
-  std::lock_guard lock(g_mutex);
-  uint32_t object = pathAddress ? GuestMemory()->SystemHeapAlloc(kObjectSize) : 0;
+  uint32_t object = GuestMemory()->SystemHeapAlloc(kObjectSize);
   if (!object) {
     ctx.r3.u64 = kFail;
     return;
   }
   std::memset(Virtual(object), 0, kObjectSize);
   Player player;
-  player.movie = ng2::movie::HostMovie::Open(HostPath(path), Load32(params + 24) != 0xFFFFFFFF,
-                                             (Load32(params + 4) & 0x8) != 0);
-  if (player.movie) {
-    ReservePhysical(ctx, base, player, player.movie->Width(), player.movie->Height());
+  std::filesystem::path hostPath = HostPath(path);
+  if (hostPath.empty()) {
+    REXLOG_ERROR("movie: '{}' not found", path);
+  } else {
+    player.movie = ng2::movie::HostMovie::Open(hostPath, Load32(params + 24) != 0xFFFFFFFF,
+                                               (Load32(params + 4) & 0x8) != 0);
   }
+  ReservePhysical(ctx, base, player, player.movie ? player.movie->Width() : kDefaultWidth,
+                  player.movie ? player.movie->Height() : kDefaultHeight);
   player.voice = CreateVoice();
+  std::lock_guard lock(g_mutex);
   if (TraceEnabled()) {
     REXLOG_INFO("movie: create '{}' -> host player {:#x} ({} reserved blocks)", path, object,
                 player.reserved.size());
@@ -265,18 +309,27 @@ REX_HOOK_RAW(sub_83680E48) {
   __imp__sub_83680E48(ctx, base);
 }
 
-// +80: draw the frame to the screen
+// +80: draw the frame to the screen. Not drawn yet, but the movie still
+// runs (time, audio) and ends, which is what ends it for the game.
 REX_EXTERN(__imp__sub_83680E58);
 REX_HOOK_RAW(sub_83680E58) {
   {
     std::lock_guard lock(g_mutex);
-    if (Find(ctx.r3.u32)) {
+    if (Player* player = Find(ctx.r3.u32)) {
       static bool logged = false;
       if (!logged) {
         logged = true;
         REXLOG_WARN("movie: full-screen movies are not drawn yet");
       }
-      ctx.r3.u64 = 0;
+      bool playing = false;
+      if (player->movie) {
+        ng2::movie::HostMovie::Planes none = {};
+        playing = player->movie->CopyFrame(none);
+        if (player->voice) {
+          player->movie->SetVolume(LoadFloat(player->voice + 140));
+        }
+      }
+      ctx.r3.u64 = playing ? 0 : kEndOfMovie;
       return;
     }
   }
@@ -320,14 +373,21 @@ REX_EXTERN(__imp__sub_83862878);
 REX_HOOK_RAW(sub_83862878) {
   uint32_t object = ctx.r3.u32;
   {
-    std::lock_guard lock(g_mutex);
-    if (auto it = g_players.find(object); it != g_players.end()) {
+    std::optional<Player> player;
+    {
+      std::lock_guard lock(g_mutex);
+      if (auto it = g_players.find(object); it != g_players.end()) {
+        player = std::move(it->second);
+        g_players.erase(it);
+      }
+    }
+    if (player) {
       if (TraceEnabled()) {
         REXLOG_INFO("movie: release {:#x}", object);
       }
-      FreeReserved(ctx, base, it->second);
-      FreeVoice(it->second.voice);
-      g_players.erase(it);
+      player->movie.reset();  // joins the decoder
+      FreeReserved(ctx, base, *player);
+      FreeVoice(player->voice);
       GuestMemory()->SystemHeapFree(object);
       ctx.r3.u64 = 0;
       return;

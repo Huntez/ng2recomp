@@ -8,6 +8,8 @@
 #   NG2_SHOTS="10 30 60"  gamescope screenshots at those seconds -> <out_dir>/shot-<s>.png
 #   NG2_WRAP="gdb -batch -x cmds.gdb --args"  put in front of the binary
 #   NG2_TEST_WAYLAND=1  run on gamescope's nested Wayland socket instead of X11
+#   NG2_TEST_AUDIO=disk  real audio output, written to <out_dir>/audio.raw
+#     (SDL's disk driver) instead of the null audio device
 set -euo pipefail
 
 secs=${1:?seconds}
@@ -44,8 +46,13 @@ if [ "${NG2_TEST_WAYLAND:-0}" = 1 ]; then
   gamescope_flags=(--expose-wayland)
 fi
 
+audio=(NG2_AUDIO=0 SDL_AUDIODRIVER=dummy SDL_AUDIO_DRIVER=dummy)
+if [ "${NG2_TEST_AUDIO:-}" = disk ]; then
+  audio=(NG2_AUDIO=1 SDL_AUDIO_DRIVER=disk SDL_AUDIO_DISK_OUTPUT_FILE="$out/audio.raw")
+fi
+
 exec env -u WAYLAND_DISPLAY -u DISPLAY HOME="$out/home" NG2_CONFIG="$out/ng2.toml" \
-  NG2_AUDIO=0 SDL_AUDIODRIVER=dummy SDL_AUDIO_DRIVER=dummy \
+  "${audio[@]}" \
   "${video[@]}" \
   SDL_GAMECONTROLLER_IGNORE_DEVICES=0x2dc8/0x310a \
   SDL_JOYSTICK_IGNORE_DEVICES=0x2dc8/0x310a \
