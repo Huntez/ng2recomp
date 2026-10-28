@@ -13,12 +13,14 @@
 #include "video.h"
 
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <unordered_set>
 #include <algorithm>
 #include <cstddef>
 #include <unordered_map>
@@ -142,13 +144,69 @@ std::unordered_map<RenderFormat, std::unique_ptr<RenderPipeline>> g_copyPipeline
 // Single-sample copies of MSAA render targets, for converting resolves.
 std::unordered_map<const void*, std::unique_ptr<HostTexture>> g_resolveTemps;
 
+// NG2_PROFILE=1: time spent per renderer stage, logged once a second.
+enum class Stage { kDraw, kSync, kTexture, kPipeline, kResolve, kPresent, kCount };
+constexpr const char* kStageNames[] = {"draw", "sync", "texture", "pipeline", "resolve",
+                                       "present"};
+struct Profile {
+  bool enabled = [] {
+    const char* v = std::getenv("NG2_PROFILE");
+    return v && v[0] == '1';
+  }();
+  uint64_t nanoseconds[size_t(Stage::kCount)] = {};
+  uint64_t hashedBytes = 0, uploadedBytes = 0, frames = 0;
+  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+} g_profile;
+
+class StageTimer {
+ public:
+  explicit StageTimer(Stage stage) : stage_(stage) {
+    if (g_profile.enabled) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+  ~StageTimer() {
+    if (g_profile.enabled) {
+      g_profile.nanoseconds[size_t(stage_)] +=
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start_)
+              .count();
+    }
+  }
+
+ private:
+  Stage stage_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+void ReportProfile() {
+  g_profile.frames++;
+  auto now = std::chrono::steady_clock::now();
+  if (!g_profile.enabled || now - g_profile.last < std::chrono::seconds(1)) {
+    return;
+  }
+  std::string line;
+  for (size_t i = 0; i < size_t(Stage::kCount); i++) {
+    line += fmt::format(" {} {:.1f}", kStageNames[i], g_profile.nanoseconds[i] / 1e6);
+  }
+  REXLOG_INFO("video: {} frames, ms:{}; hashed {:.1f} MB, uploaded {:.1f} MB", g_profile.frames,
+              line, g_profile.hashedBytes / 1048576.0, g_profile.uploadedBytes / 1048576.0);
+  g_profile = Profile{};
+  g_profile.last = now;
+}
+
 // Guest physical memory as the GPU sees it (512 MB): vertex data read by the
 // shaders and memory export targets, addressed like the console.
 constexpr uint64_t GUEST_MEMORY_SIZE = 512ull << 20;
 std::unique_ptr<RenderBuffer> g_guestMemory;
 uint64_t g_guestMemoryAddress = 0;
-// Ranges uploaded to it and the hash of their contents then.
-std::unordered_map<uint64_t, uint64_t> g_guestMemoryHashes;
+// Ranges uploaded to it: the hash of their contents then, and the frame they
+// were last checked in (each range is checked once a frame).
+struct GuestMemoryRange {
+  uint64_t hash = 0;
+  uint64_t checkedFrame = ~0ull;
+};
+std::unordered_map<uint64_t, GuestMemoryRange> g_guestMemoryRanges;
 
 // Per-frame upload memory for constants and copies.
 constexpr uint64_t UPLOAD_CHUNK_SIZE = 32ull << 20;
@@ -599,14 +657,21 @@ void SyncGuestMemory(uint32_t address, uint32_t size) {
   if (!size || uint64_t(address) + size > GUEST_MEMORY_SIZE) {
     return;
   }
-  const uint8_t* source = guest::Physical(address);
-  uint64_t hash = XXH3_64bits(source, size);
-  uint64_t key = (uint64_t(address) << 32) | size;
-  auto it = g_guestMemoryHashes.find(key);
-  if (it != g_guestMemoryHashes.end() && it->second == hash) {
+  StageTimer timer(Stage::kSync);
+  auto& range = g_guestMemoryRanges[(uint64_t(address) << 32) | size];
+  if (range.checkedFrame == g_frameCount) {
     return;
   }
-  g_guestMemoryHashes[key] = hash;
+  bool first = range.checkedFrame == ~0ull;
+  range.checkedFrame = g_frameCount;
+  const uint8_t* source = guest::Physical(address);
+  uint64_t hash = XXH3_64bits(source, size);
+  g_profile.hashedBytes += size;
+  if (!first && range.hash == hash) {
+    return;
+  }
+  range.hash = hash;
+  g_profile.uploadedBytes += size;
   Upload upload = Allocate(size, 16);
   std::memcpy(upload.data, source, size);
   auto* commandList = CommandList();
@@ -848,11 +913,24 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   return host;
 }
 
+// Logs each kind of texture the renderer can't sample yet, once.
+void ReportUnsupportedTexture(const char* reason, const xenos::xe_gpu_texture_fetch_t& fetch) {
+  static std::unordered_set<uint32_t> reported;
+  uint32_t kind = (uint32_t(fetch.format) << 8) | (uint32_t(fetch.dimension) << 4) |
+                  (reason[0] & 0xF);
+  if (reported.insert(kind).second) {
+    REXLOG_WARN("video: texture skipped ({}): format {} dimension {}", reason,
+                uint32_t(fetch.format), uint32_t(fetch.dimension));
+  }
+}
+
 // Descriptor index for a texture fetch constant, 0 if it can't be sampled.
 uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  StageTimer timer(Stage::kTexture);
   bool oneD = fetch.dimension == xenos::DataDimension::k1D;
   if (!oneD && fetch.dimension != xenos::DataDimension::k2DOrStacked) {
-    return 0;  // 3D and cube textures: not yet
+    ReportUnsupportedTexture("3D or cube", fetch);
+    return 0;
   }
   uint32_t base = uint32_t(fetch.base_address) << 12;
 
@@ -864,6 +942,7 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
 
   TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
   if (info.format == RenderFormat::UNKNOWN) {
+    ReportUnsupportedTexture("format", fetch);
     return 0;
   }
   uint32_t width = oneD ? fetch.size_1d.width + 1 : fetch.size_2d.width + 1;
@@ -875,6 +954,7 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
       fetch.tiled ? uint64_t((pitchBlocks + 31) & ~31u) * ((blocksY + 31) & ~31u) * info.bytesPerBlock
                   : ((uint64_t(pitchBlocks) * info.bytesPerBlock + 255) & ~255ull) * blocksY;
   if (guestSize == 0 || base + guestSize > GUEST_MEMORY_SIZE) {
+    ReportUnsupportedTexture("size", fetch);
     return 0;
   }
 
@@ -1033,6 +1113,7 @@ struct PipelineKey {
 
 RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
                             RenderShader* pixelShader) {
+  StageTimer timer(Stage::kPipeline);
   uint64_t hash = XXH3_64bits(&key, sizeof(key));
   auto& pipeline = g_pipelines[hash];
   if (pipeline) {
@@ -1231,6 +1312,7 @@ void FlushPendingDraw() {
 // FlushPendingDraw when the data comes inline.
 void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
           bool indexed, uint32_t startIndex, const InlineData* inlineData = nullptr) {
+  StageTimer timer(Stage::kDraw);
   auto findShader = [](uint32_t object) -> GuestShader* {
     auto it = g_guestShaders.find(object);
     return it != g_guestShaders.end() ? it->second.get() : nullptr;
@@ -1330,22 +1412,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                                 uint32_t(xenos::Endian::k8in32);
   }
 
-  // Vertex data the shaders read: every valid vertex fetch constant (inline
-  // data is synced when it has been written).
-  for (uint32_t i = 0; i < (inlineData ? 95u : 96u); i++) {
-    uint32_t word0 = shared.vertexFetch[i][0];
-    uint32_t word1 = shared.vertexFetch[i][1];
-    if ((word0 & 3) != uint32_t(xenos::FetchConstantType::kVertex)) {
-      continue;
-    }
-    uint32_t address = word0 & 0xFFFFFFFC;
-    uint32_t size = word1 & 0x3FFFFFC;  // size in dwords at bit 2: bytes
-    if (size && size <= (16u << 20)) {
-      SyncGuestMemory(address & 0x1FFFFFFF, size);
-    }
-  }
-
   // Declared vertex elements, from the vertex declaration.
+  uint32_t fetchMask[3] = {vs->entry->vertexFetchMask[0], vs->entry->vertexFetchMask[1],
+                           vs->entry->vertexFetchMask[2]};
   uint32_t declaration = guest::Load32(device + 0x2E24);
   if (declaration && !vs->elements.empty()) {
     uint32_t declCount = guest::Load32(declaration + 24);
@@ -1364,12 +1433,32 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
         uint32_t stride = (inlineData && stream == 0)
                               ? inlineData->stride / 4
                               : guest::Virtual(device + 0x30E8 + stream)[0];
-        shared.vertexElements[slot][0] = 95 - stream;
+        uint32_t fetchSlot = 95 - std::min(stream, 95u);
+        shared.vertexElements[slot][0] = fetchSlot;
         shared.vertexElements[slot][1] = offset / 4;
         shared.vertexElements[slot][2] = stride;
         shared.vertexElements[slot][3] = ElementFlags(type);
+        fetchMask[fetchSlot / 32] |= 1u << (fetchSlot % 32);
         break;
       }
+    }
+  }
+
+  // Vertex data the shader reads (inline data is synced when it has been
+  // written).
+  for (uint32_t i = 0; i < (inlineData ? 95u : 96u); i++) {
+    if (!(fetchMask[i / 32] & (1u << (i % 32)))) {
+      continue;
+    }
+    uint32_t word0 = shared.vertexFetch[i][0];
+    uint32_t word1 = shared.vertexFetch[i][1];
+    if ((word0 & 3) != uint32_t(xenos::FetchConstantType::kVertex)) {
+      continue;
+    }
+    uint32_t address = word0 & 0xFFFFFFFC;
+    uint32_t size = word1 & 0x3FFFFFC;  // size in dwords at bit 2: bytes
+    if (size && size <= (16u << 20)) {
+      SyncGuestMemory(address & 0x1FFFFFFF, size);
     }
   }
 
@@ -1516,6 +1605,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 // Present ---------------------------------------------------------------------
 
 void Present(HostTexture* frontBuffer) {
+  StageTimer timer(Stage::kPresent);
   auto* commandList = CommandList();
 
   g_swapChainValid &= !g_swapChain->needsResize();
@@ -1910,6 +2000,7 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
 void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t destTexture,
                uint32_t destPoint, uint32_t clearColor, float clearZ, uint32_t clearStencil) {
   std::lock_guard lock(g_mutex);
+  StageTimer timer(Stage::kResolve);
   if (!g_device) {
     return;
   }
@@ -2080,6 +2171,7 @@ void OnSwap(uint32_t device, uint32_t frontBuffer) {
     }
   }
   Present(front);
+  ReportProfile();
 }
 
 }  // namespace ng2::video

@@ -13,11 +13,15 @@
 // NG2_PAD_LIVE=<file> drives it while the game runs: each line appended to
 // the file (<button>[+<button>...][:<hold ms>], no time) is pressed as soon
 // as it is read, one after another with a 200 ms release between, so "down"
-// then "a" never land in the same poll.
+// then "a" never land in the same poll. Use a regular file appended with >>
+// (not a FIFO); what it holds when the game starts is skipped, and it may be
+// truncated to start over.
 //
 // Buttons: up down left right start back lthumb rthumb lb rb a b x y, lt rt
 // (triggers fully pressed), lleft lright lup ldown / rleft rright rup rdown
-// (a stick at full throw). Every step is logged as it fires.
+// (a stick at full throw). Times are decimal. Every step is logged as it
+// fires; a step whose window passed while the game wasn't reading the pad
+// (a load) is pressed late for one read rather than dropped.
 //
 // The device is synthetic, so it feeds player one alongside any real pad.
 
@@ -29,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -50,6 +55,12 @@ class ScriptInputDriver : public rex::input::InputDriver {
   ScriptInputDriver(std::string script, std::string livePath)
       : InputDriver(nullptr, 0), livePath_(std::move(livePath)) {
     Parse(script, nullptr);
+    // Lines left from an earlier run are not this run's input.
+    std::error_code ec;
+    if (!livePath_.empty()) {
+      auto size = std::filesystem::file_size(livePath_, ec);
+      consumed_ = ec ? 0 : size_t(size);
+    }
   }
 
   // NG2_PAD_SCRIPT / NG2_PAD_LIVE, or nullptr when neither is set.
@@ -123,12 +134,13 @@ class ScriptInputDriver : public rex::input::InputDriver {
 
     Pad pad;
     for (auto& step : steps_) {
-      if (t < step.at || t >= step.at + step.hold) {
+      bool late = t >= step.at + step.hold;
+      if (t < step.at || (late && step.announced)) {
         continue;
       }
       if (!step.announced) {
         step.announced = true;
-        REXLOG_INFO("pad: t={} ms \"{}\"", t, step.text);
+        REXLOG_INFO("pad: t={} ms \"{}\"{}", t, step.text, late ? " (late)" : "");
       }
       pad.buttons |= step.buttons;
       pad.lt = std::max(pad.lt, step.lt);
@@ -140,7 +152,7 @@ class ScriptInputDriver : public rex::input::InputDriver {
       }
     }
     // Finished steps go, so a long live session never grows the list.
-    std::erase_if(steps_, [t](const Step& s) { return t >= s.at + s.hold; });
+    std::erase_if(steps_, [t](const Step& s) { return s.announced && t >= s.at + s.hold; });
 
     if (pad != last_) {
       last_ = pad;
@@ -181,6 +193,33 @@ class ScriptInputDriver : public rex::input::InputDriver {
              std::memcmp(axes, o.axes, sizeof(axes)) != 0;
     }
   };
+
+  // A decimal millisecount, at most ~11 days so sums cannot wrap.
+  static bool ParseMs(std::string_view text, uint64_t& out) {
+    text = Trim(text);
+    if (text.empty() || text.size() > 9) {
+      return false;
+    }
+    uint64_t value = 0;
+    for (char c : text) {
+      if (c < '0' || c > '9') {
+        return false;
+      }
+      value = value * 10 + uint64_t(c - '0');
+    }
+    out = value;
+    return true;
+  }
+
+  static std::string_view Trim(std::string_view text) {
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+      text.remove_prefix(1);
+    }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+      text.remove_suffix(1);
+    }
+    return text;
+  }
 
   struct Step : Pad {
     uint64_t at = 0, hold = 150;
@@ -245,14 +284,8 @@ class ScriptInputDriver : public rex::input::InputDriver {
       if (next == std::string_view::npos) {
         next = text.size();
       }
-      std::string_view entry = text.substr(pos, next - pos);
+      std::string_view entry = Trim(text.substr(pos, next - pos));
       pos = next + 1;
-      while (!entry.empty() && std::isspace(static_cast<unsigned char>(entry.front()))) {
-        entry.remove_prefix(1);
-      }
-      while (!entry.empty() && std::isspace(static_cast<unsigned char>(entry.back()))) {
-        entry.remove_suffix(1);
-      }
       if (entry.empty()) {
         continue;
       }
@@ -263,10 +296,7 @@ class ScriptInputDriver : public rex::input::InputDriver {
         step.at = *timeless;
       } else {
         size_t colon = entry.find(':');
-        char* parsedEnd = nullptr;
-        std::string at(entry.substr(0, colon));
-        step.at = std::strtoull(at.c_str(), &parsedEnd, 0);
-        if (colon == std::string_view::npos || at.empty() || *parsedEnd) {
+        if (colon == std::string_view::npos || !ParseMs(entry.substr(0, colon), step.at)) {
           REXLOG_WARN("pad: script entry without <ms>: \"{}\"", entry);
           continue;
         }
@@ -274,13 +304,16 @@ class ScriptInputDriver : public rex::input::InputDriver {
       }
       size_t colon = entry.find(':');
       if (colon != std::string_view::npos) {
-        step.hold = std::strtoull(std::string(entry.substr(colon + 1)).c_str(), nullptr, 0);
+        if (!ParseMs(entry.substr(colon + 1), step.hold) || step.hold == 0) {
+          REXLOG_WARN("pad: bad hold time in \"{}\"", step.text);
+          continue;
+        }
         entry = entry.substr(0, colon);
       }
-      bool ok = true;
-      while (!entry.empty()) {
+      bool ok = !Trim(entry).empty();
+      while (ok && !entry.empty()) {
         size_t plus = entry.find('+');
-        std::string_view name = entry.substr(0, plus);
+        std::string_view name = Trim(entry.substr(0, plus));
         if (!AddButton(name, step)) {
           REXLOG_WARN("pad: unknown button \"{}\"", name);
           ok = false;
@@ -288,6 +321,7 @@ class ScriptInputDriver : public rex::input::InputDriver {
         entry = plus == std::string_view::npos ? std::string_view() : entry.substr(plus + 1);
       }
       if (!ok) {
+        REXLOG_WARN("pad: step \"{}\" skipped", step.text);
         continue;
       }
       end = step.at + step.hold;
@@ -309,6 +343,11 @@ class ScriptInputDriver : public rex::input::InputDriver {
     FILE* file = std::fopen(livePath_.c_str(), "rb");
     if (!file) {
       return;
+    }
+    // Truncated or replaced by a shorter file: start over from its beginning.
+    if (std::fseek(file, 0, SEEK_END) == 0 && size_t(std::ftell(file)) < consumed_) {
+      consumed_ = 0;
+      pending_.clear();
     }
     if (std::fseek(file, long(consumed_), SEEK_SET) == 0) {
       char buffer[4096];
@@ -334,7 +373,9 @@ class ScriptInputDriver : public rex::input::InputDriver {
   bool started_ = false;
   std::chrono::steady_clock::time_point start_;
   Pad last_;
-  uint32_t packet_ = 1;
+  // Starts high: InputSystem merges player one's devices by the largest packet
+  // number, and a real pad's must not hide this one's changes.
+  uint32_t packet_ = 0x10000000;
 
   std::string livePath_;
   size_t consumed_ = 0;

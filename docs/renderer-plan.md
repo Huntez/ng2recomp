@@ -48,10 +48,16 @@ NG2_DEBUG_WHITE_TEXTURES=1.
 - Gameplay: test runs can now press buttons (NG2_PAD_SCRIPT/NG2_PAD_LIVE).
   Start, A x3 reaches the Chapter 1 card and the first 3D scene renders;
   next is comparing in-game frames with xenos.
-- The opening movie (aurora12.wmv) ends after ~2 s of black natively but
-  plays its full length on xenos (where its video is black too, only the
-  credits show). Find what the movie player waits on that the null backend
-  answers differently.
+- Performance (2026-10-28): the opening cutscene runs at 60 fps with
+  ~650 draws and ~33 resolves a frame (NG2_PROFILE=1: about 150 ms a second
+  in the renderer on the game thread). Guest memory is synced only for the
+  fetch constants a shader reads (XenosRecomp's per-shader mask plus the
+  declaration's streams), each range checked once a frame. A buffer the
+  CPU rewrites at the same address within one frame would be missed.
+- The xenos plugin draws the in-game cutscene black (only the credits), so
+  in-game frames have no emulated reference; judge them on their own.
+- Seen in the opening: k_24_8_FLOAT textures (depth resolves) skipped; the
+  sky is black and some surfaces look flat (to investigate).
 - Mipmaps, cube and 3D textures, the formats that need conversion
   (5_6_5, 1_5_5_5, 4_4_4_4, 2_10_10_10, 10_11_11, 11_11_10).
 - Depth resolves, scissor (PA_SC_WINDOW_SCISSOR isn't in the device's

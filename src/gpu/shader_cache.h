@@ -17,6 +17,9 @@ struct ShaderCacheEntry {
   const uint32_t spirvOffset;
   const uint32_t spirvSize;
   const uint32_t specConstantsMask;
+  // Vertex fetch constants 0-95 the shader reads directly (vfetchRaw);
+  // declared elements' streams come from the vertex declaration per draw.
+  const uint32_t vertexFetchMask[3];
   struct GuestShader* guestShader;
 };
 
