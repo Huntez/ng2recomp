@@ -1185,6 +1185,8 @@ struct SharedConstants {
   uint32_t vertexFetch[96][2];
   uint32_t vertexElements[16][4];
   float ndcTransform[4];
+  uint32_t alphaFunc;  // RB_COLORCONTROL alpha_func
+  uint32_t padding[3];
 };
 static_assert(offsetof(SharedConstants, samplerIndices) == 512);
 static_assert(offsetof(SharedConstants, booleans) == 640);
@@ -1192,6 +1194,7 @@ static_assert(offsetof(SharedConstants, guestMemoryBase) == 688);
 static_assert(offsetof(SharedConstants, vertexFetch) == 696);
 static_assert(offsetof(SharedConstants, vertexElements) == 1464);
 static_assert(offsetof(SharedConstants, ndcTransform) == 1720);
+static_assert(offsetof(SharedConstants, alphaFunc) == 1736);
 
 // Pipeline state that varies per draw (hashed into the pipeline key).
 struct PipelineKey {
@@ -1207,6 +1210,7 @@ struct PipelineKey {
   uint32_t stencilMasks;
   uint32_t cull;
   uint32_t alphaTest;
+  uint32_t alphaToCoverage;
 };
 
 RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
@@ -1302,6 +1306,7 @@ RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
     desc.stencilReference = stencil.stencilref;
   }
   desc.multisampling.sampleCount = RenderSampleCounts(key.samples);
+  desc.alphaToCoverageEnabled = key.alphaToCoverage != 0;
   RenderSpecConstant specConstant(0, key.alphaTest ? 0x2u : 0u);  // SPEC_CONSTANT_ALPHA_TEST
   desc.specConstants = &specConstant;
   desc.specConstantsCount = 1;
@@ -1517,6 +1522,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   reg::RB_COLORCONTROL colorControl;
   colorControl.value = Register(device, 0x2202);
   shared.alphaThreshold = RegisterFloat(device, 0x210E);
+  shared.alphaFunc = uint32_t(colorControl.alpha_func);
   shared.guestMemoryBase = g_guestMemoryAddress;
   for (uint32_t i = 0; i < 96; i++) {
     shared.vertexFetch[i][0] = guest::Load32(device + 0x480 + i * 8);
@@ -1694,6 +1700,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   key.stencilMasks = Register(device, 0x210D);
   key.cull = mode.value & 0x7;
   key.alphaTest = colorControl.alpha_test_enable;
+  key.alphaToCoverage = colorControl.alpha_to_mask_enable;
   if (Highlighted(vs->entry->hash)) {
     key.pixelShader = 0;  // the debug shader's pipelines
     pixelShader = g_debugShader.get();

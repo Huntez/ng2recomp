@@ -79,6 +79,7 @@ shared constants), as in Unleashed. Shared constants, in bytes:
 | 696 | the 96 vertex fetch constants, 2 dwords each |
 | 1464 | 16 declared vertex elements (uint4): fetch constant, offset and stride in dwords, format flags |
 | 1720 | NDC transform (float4) |
+| 1736 | alpha test function (RB_COLORCONTROL alpha_func) |
 
 The D3D12/DXIL side of the patch is not maintained (Vulkan only).
 
