@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Ninja Gaiden II
+Comment=Ninja Gaiden II (static recompilation)
+Exec=AppRun
+Icon=ng2
+Categories=Game;
+Terminal=false
