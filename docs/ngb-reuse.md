@@ -12,7 +12,7 @@ Worth taking, best first:
    licences. Adapt (names, SDL3). Check ReXGlue builds with mingw first.
 2. AppImage: `packaging/appimage/build.sh` and `Dockerfile` (Ubuntu 22.04,
    static libstdc++, "never bundle" list, patchelf, zsync updates). Adapt:
-   SDL3, no Qt/glib/epoxy, plus what ReXGlue's GTK3 needs.
+   SDL3, no glib/epoxy; keep the Qt dialog layer (no GTK: the user prefers Qt).
 3. Disc install: `src/install.c` (already handles the XGD2 offset, .7z/.zip,
    `.partial` install dirs, zenity/kdialog/GetOpenFileName pickers). Adapt the
    XBE check to an XEX/title ID check (544307D5); replaces

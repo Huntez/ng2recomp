@@ -14,7 +14,8 @@ Boots to the title screen on Linux (Vulkan, xenos plugin). Not playable yet.
 
 ## Build
 
-Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader, GTK3.
+Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader. No GTK
+(ReXGlue's docs list GTK3, but v0.10 does not use it); dialogs will use Qt.
 
 1. Build and install the SDK (pinned at v0.10.0):
 
@@ -28,6 +29,12 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader, GTK3.
        git clone --recursive https://github.com/hedge-dev/XenosRecomp thirdparty/XenosRecomp
        cd thirdparty/XenosRecomp && git checkout 990d03b && git submodule update --init --recursive
        git am ../../patches/xenosrecomp/*.patch
+
+   And plume (Vulkan RHI from Unleashed Recompiled) with Wayland support:
+
+       git clone https://github.com/renderbag/plume thirdparty/plume
+       cd thirdparty/plume && git checkout 1192686 && git submodule update --init contrib/volk contrib/VulkanMemoryAllocator contrib/Vulkan-Headers
+       git am ../../patches/plume/*.patch
 
 3. Extract the disc (World release, title 544307D5) into `game_files/`:
 
@@ -59,4 +66,7 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader, GTK3.
 ## Environment
 
 - `NG2_AUDIO=0`: no audio device; the game's audio still runs.
+- `NG2_RENDERER=native`: the native Vulkan renderer instead of GPU emulation
+  (work in progress: presents a cleared screen). Wayland or X11, whichever
+  SDL uses (`--video_driver=wayland|x11` to choose).
 - `NG2_DUMP_IMAGE=<file>`: write the loaded XEX image for analysis.

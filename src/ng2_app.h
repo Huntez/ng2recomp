@@ -10,6 +10,7 @@
 #include <rex/rex_app.h>
 #include <rex/system/xmemory.h>
 
+#include "gpu/video.h"
 #include "null_audio.h"
 
 class Ng2App : public rex::ReXApp {
@@ -31,12 +32,30 @@ class Ng2App : public rex::ReXApp {
     }
   }
 
-  // NG2_AUDIO=0: run the audio pipeline without an output device.
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    // NG2_RENDERER=native: no GPU emulation, the native renderer presents.
+    if (ng2::video::IsNativeRenderer()) {
+      config.gpu_plugin.clear();
+      REXLOG_INFO("NG2_RENDERER=native: GPU emulation off");
+    }
+
+    // NG2_AUDIO=0: run the audio pipeline without an output device.
     const char* audio = std::getenv("NG2_AUDIO");
     if (audio && audio[0] == '0') {
       config.audio_factory = REX_AUDIO_BACKEND(ng2::NullAudioSystem);
       REXLOG_INFO("NG2_AUDIO=0: sound off (no output device)");
+    }
+  }
+
+  void OnPostSetup() override {
+    if (ng2::video::IsNativeRenderer() && !ng2::video::CreateHostDevice()) {
+      REXLOG_ERROR("native renderer: cannot create the Vulkan device");
+    }
+  }
+
+  void OnShutdown() override {
+    if (ng2::video::IsNativeRenderer()) {
+      ng2::video::DestroyHostDevice();
     }
   }
 

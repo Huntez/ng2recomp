@@ -13,6 +13,7 @@ include(generated/rexglue.cmake)
 # Sources
 set(NG2_SOURCES
     src/main.cpp
+    src/gpu/video.cpp
 )
 
 if(WIN32)
@@ -81,3 +82,12 @@ add_custom_command(
 add_library(ng2_shaders STATIC "${NG2_SHADER_CACHE}")
 target_include_directories(ng2_shaders PUBLIC src/gpu)
 target_link_libraries(ng2 PRIVATE ng2_shaders)
+
+# Native renderer: plume (Unleashed Recompiled's RHI), Vulkan only, with the
+# Wayland surface support from patches/plume.
+add_subdirectory(thirdparty/plume EXCLUDE_FROM_ALL)
+if(UNIX AND NOT APPLE)
+    find_package(X11 REQUIRED)
+    target_link_libraries(plume PUBLIC X11::X11)
+endif()
+target_link_libraries(ng2 PRIVATE plume)
