@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include <rex/rex_app.h>
+#include <rex/system/gpu_plugin.h>
 #include <rex/system/xmemory.h>
 
 #include "gpu/video.h"
@@ -33,10 +34,13 @@ class Ng2App : public rex::ReXApp {
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
-    // NG2_RENDERER=native: no GPU emulation, the native renderer presents.
+    // NG2_RENDERER=native: the native renderer draws and presents. The GPU
+    // plugin's null backend still runs the game's command stream (fences,
+    // interrupts, vblank) so its D3D library works unmodified.
     if (ng2::video::IsNativeRenderer()) {
       config.gpu_plugin.clear();
-      REXLOG_INFO("NG2_RENDERER=native: GPU emulation off");
+      config.graphics = rex::system::LoadGpuPlugin("xenos", "null");
+      REXLOG_INFO("NG2_RENDERER=native: GPU emulation off (null command processor)");
     }
 
     // NG2_AUDIO=0: run the audio pipeline without an output device.

@@ -21,6 +21,7 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader. No GTK
 
        git clone --recursive https://github.com/rexglue/rexglue-sdk thirdparty/rexglue-sdk
        cd thirdparty/rexglue-sdk && git checkout v0.10.0 && git submodule update --init --recursive
+       git am ../../patches/rexglue-sdk/*.patch
        cmake --preset linux-amd64
        cmake --build out/build/linux-amd64 --config Release --target install
 
@@ -67,6 +68,8 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader. No GTK
 
 - `NG2_AUDIO=0`: no audio device; the game's audio still runs.
 - `NG2_RENDERER=native`: the native Vulkan renderer instead of GPU emulation
-  (work in progress: presents a cleared screen). Wayland or X11, whichever
-  SDL uses (`--video_driver=wayland|x11` to choose).
+  (work in progress: presents a cleared screen). The GPU plugin's null
+  backend (patches/rexglue-sdk) keeps the game's D3D library running.
+  Wayland or X11, whichever SDL uses (`--video_driver=wayland|x11` to choose).
 - `NG2_DUMP_IMAGE=<file>`: write the loaded XEX image for analysis.
+- `NG2_D3D_STATS=1`: log D3D draw/clear/resolve/swap counts every second.

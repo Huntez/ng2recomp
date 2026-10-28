@@ -14,6 +14,7 @@ include(generated/rexglue.cmake)
 set(NG2_SOURCES
     src/main.cpp
     src/gpu/video.cpp
+    src/gpu/d3d_hooks.cpp
 )
 
 if(WIN32)
