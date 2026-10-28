@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include <rex/cvar.h>
+#include <rex/input/input_system.h>
 #include <rex/rex_app.h>
 #include <rex/system.h>
 #include <rex/system/gpu_plugin.h>
@@ -15,6 +16,7 @@
 
 #include "gpu/video.h"
 #include "null_audio.h"
+#include "script_input.h"
 
 class Ng2App : public rex::ReXApp {
  public:
@@ -66,6 +68,17 @@ class Ng2App : public rex::ReXApp {
     if (audio && audio[0] == '0') {
       config.audio_factory = REX_AUDIO_BACKEND(ng2::NullAudioSystem);
       REXLOG_INFO("NG2_AUDIO=0: sound off (no output device)");
+    }
+
+    // NG2_PAD_SCRIPT / NG2_PAD_LIVE: a scripted controller for player one.
+    if (std::getenv("NG2_PAD_SCRIPT") || std::getenv("NG2_PAD_LIVE")) {
+      config.input_factory = [](bool tool_mode) -> std::unique_ptr<rex::system::IInputSystem> {
+        auto input = rex::input::CreateDefaultInputSystem(tool_mode);
+        if (auto script = ng2::ScriptInputDriver::FromEnvironment()) {
+          input->AddDriver(std::move(script));
+        }
+        return input;
+      };
     }
   }
 

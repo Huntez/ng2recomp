@@ -68,8 +68,13 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader. No GTK
 
 - `NG2_AUDIO=0`: no audio device; the game's audio still runs.
 - `NG2_RENDERER=native`: the native Vulkan renderer instead of GPU emulation
-  (work in progress: presents a cleared screen). The GPU plugin's null
+  (work in progress: menus and the first chapter render). The GPU plugin's null
   backend (patches/rexglue-sdk) keeps the game's D3D library running.
   Wayland or X11, whichever SDL uses (`--video_driver=wayland|x11` to choose).
 - `NG2_DUMP_IMAGE=<file>`: write the loaded XEX image for analysis.
 - `NG2_D3D_STATS=1`: log D3D draw/clear/resolve/swap counts every second.
+- `NG2_PAD_SCRIPT=12000:start,16000:a,19000:a:400`: a scripted controller for
+  test runs (`<ms>:<button>[+<button>...][:<hold ms>]`, `@file` reads a file);
+  `NG2_PAD_LIVE=<file>` presses each line appended to the file. Buttons and
+  details in src/script_input.h. Add `--headless` so system prompts (storage
+  device) take their defaults.
