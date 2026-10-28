@@ -17,6 +17,7 @@ set(NG2_SOURCES
     src/gpu/d3d_hooks.cpp
     src/movie/movie_hooks.cpp
     src/movie/host_movie.cpp
+    src/debug_waits.cpp
 )
 
 if(WIN32)

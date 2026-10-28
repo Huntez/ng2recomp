@@ -78,12 +78,13 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   (0xEBEB0000, a latent game bug the original layout hides) and the title
   never loads its font and sprites. Full-screen movies (+80, drawn by the
   player itself) are not drawn yet.
-- Opening stall: about 97 s after boot the render thread waits on a
-  per-frame event (tables 0x83BFB504 / 0x83BF2F44, signalled by
-  82339BC8 / 82318EA8) and the main thread spins; same point in time with
-  the xenos plugin, the original player and host movies, so likely not
-  movie related. Not the null audio device either: it happens with real
-  audio too (NG2_TEST_AUDIO=disk in tools/run-headless.sh).
+- Opening stalls (fixed 2026-10-28): (1) ~97 s, the game's job system lost
+  a wake-up: ReXGlue's semaphores gave released units to whoever looked
+  first and SignalAndWait wasn't atomic (patches/rexglue-sdk/0005);
+  NG2_DEBUG_WAITS=1 (src/debug_waits.cpp) found it. (2) ~139 s, a GPU
+  hang: a vertex fetch with a garbage index read past the 512 MB guest
+  memory buffer (page fault, ring timeout); addresses now wrap at 512 MB
+  (patches/xenosrecomp/0003). The opening now plays into gameplay.
 - Movie audio is pushed as it decodes, paced by the video queue (about
   200 ms ahead): a long hitch underruns it and audio then trails video.
 - Resolved textures are never freed (one per address and shape); a later
