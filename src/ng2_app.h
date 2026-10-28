@@ -15,6 +15,7 @@
 #include <rex/system/xmemory.h>
 
 #include "gpu/video.h"
+#include "movie/movie.h"
 #include "null_audio.h"
 #include "script_input.h"
 
@@ -83,6 +84,7 @@ class Ng2App : public rex::ReXApp {
   }
 
   void OnPostSetup() override {
+    ng2::movie::SetGameDataRoot(game_data_root());
     if (ng2::video::IsNativeRenderer() && !ng2::video::CreateHostDevice()) {
       REXLOG_ERROR("native renderer: cannot create the Vulkan device");
     }

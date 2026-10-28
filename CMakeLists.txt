@@ -15,6 +15,8 @@ set(NG2_SOURCES
     src/main.cpp
     src/gpu/video.cpp
     src/gpu/d3d_hooks.cpp
+    src/movie/movie_hooks.cpp
+    src/movie/host_movie.cpp
 )
 
 if(WIN32)
@@ -88,6 +90,11 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 target_link_libraries(ng2_shaders PUBLIC PkgConfig::ZSTD)
 target_link_libraries(ng2 PRIVATE ng2_shaders)
+
+# Movies decoded on the host (src/movie): the game's WMV3/VC-1 and WMA files.
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+    libavformat libavcodec libavutil libswresample libswscale)
+target_link_libraries(ng2 PRIVATE PkgConfig::FFMPEG)
 
 # Native renderer: plume (Unleashed Recompiled's RHI), Vulkan only, with the
 # Wayland surface support from patches/plume.

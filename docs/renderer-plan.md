@@ -70,16 +70,20 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   formats sharing one (2_10_10_10_FLOAT and its AS_16_16_16_16 view, the two
   depth formats) share a texture; the main pass draws through both. Not
   handled: overlapping surfaces of different sizes or host formats.
-- Hang ~100 s into the opening, on xenos too (not the renderer): the main
-  thread spins on 0x84C39440 waiting for the render thread (822F16D0),
-  which waits on a per-frame event while aurora12.wmv plays inside the
-  cutscene; the WMV decoder's threads (838716xx) sit in self-suspend. The
-  decoder is the XDK's GPU-assisted one (its own Xenos shaders for detile,
-  residuals, padding: "decoder_c9e\dxva_pk" paths in the image), so it needs
-  GPU results in guest memory that neither the null backend nor the xenos
-  plugin give it. Options: host decoding of the game's WMV files (FFmpeg)
-  behind the game's movie player API, or make the decoder's GPU work land
-  in guest memory.
+- Movies (src/movie, 2026-10-28): the XMedia2 player is replaced by host
+  decoding (FFmpeg) behind the player's method wrappers; the original's GPU
+  assisted WMV decoder stalled or cut movies short. The stand-in has to
+  make the original's physical allocations at create: without them the
+  title movie's texture setup clears the archive's table of contents
+  (0xEBEB0000, a latent game bug the original layout hides) and the title
+  never loads its font and sprites. Full-screen movies (+80, drawn by the
+  player itself) are not drawn yet.
+- Opening stall: about 97 s after boot the render thread waits on a
+  per-frame event (tables 0x83BFB504 / 0x83BF2F44, signalled by
+  82339BC8 / 82318EA8) and the main thread spins; same point in time with
+  the xenos plugin, the original player and host movies, so likely not
+  movie related (streamed cutscene audio on the null audio device is a
+  candidate).
 - Resolved textures are never freed (one per address and shape); a later
   CPU texture at a once-resolved address keeps sampling the GPU copy.
 - The opening still looks dim and flat; with no emulated reference in-game,
