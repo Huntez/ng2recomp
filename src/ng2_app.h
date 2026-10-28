@@ -1,0 +1,62 @@
+// ng2 - Ninja Gaiden II static recompilation
+//
+// Customize your app by overriding virtual hooks from rex::ReXApp.
+
+#pragma once
+
+#include <cstdio>
+#include <cstdlib>
+
+#include <rex/rex_app.h>
+#include <rex/system/xmemory.h>
+
+#include "null_audio.h"
+
+class Ng2App : public rex::ReXApp {
+ public:
+  using rex::ReXApp::ReXApp;
+
+  static std::unique_ptr<rex::ui::WindowedApp> Create(
+      rex::ui::WindowedAppContext& ctx) {
+    return std::unique_ptr<Ng2App>(new Ng2App(ctx, "ng2",
+        PPCImageConfig));
+  }
+
+  // NG2_CONFIG=<file>: settings file instead of <exe_dir>/ng2.toml (test
+  // runs keep away from the player's settings).
+  void OnConfigurePaths(rex::PathConfig& paths) override {
+    const char* config = std::getenv("NG2_CONFIG");
+    if (config && *config) {
+      paths.config_path = config;
+    }
+  }
+
+  // NG2_AUDIO=0: run the audio pipeline without an output device.
+  void OnPreSetup(rex::RuntimeConfig& config) override {
+    const char* audio = std::getenv("NG2_AUDIO");
+    if (audio && audio[0] == '0') {
+      config.audio_factory = REX_AUDIO_BACKEND(ng2::NullAudioSystem);
+      REXLOG_INFO("NG2_AUDIO=0: sound off (no output device)");
+    }
+  }
+
+  // NG2_DUMP_IMAGE=<path>: write the loaded (decrypted, decompressed) XEX
+  // image for offline analysis, e.g. finding code reached only by pointer.
+  void OnPostLoadXexImage() override {
+    const char* path = std::getenv("NG2_DUMP_IMAGE");
+    if (!path || !*path) {
+      return;
+    }
+    const uint8_t* image =
+        runtime()->memory()->TranslateVirtual<const uint8_t*>(REX_IMAGE_BASE);
+    FILE* f = std::fopen(path, "wb");
+    if (!f) {
+      REXLOG_ERROR("NG2_DUMP_IMAGE: cannot open {}", path);
+      return;
+    }
+    size_t written = std::fwrite(image, 1, REX_IMAGE_SIZE, f);
+    std::fclose(f);
+    REXLOG_INFO("NG2_DUMP_IMAGE: wrote {} of {} bytes to {}", written,
+                REX_IMAGE_SIZE, path);
+  }
+};

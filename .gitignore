@@ -1,0 +1,18 @@
+# game data and everything derived from it
+game_files/
+generated/default/
+*.iso
+*.xex
+
+# build output and logs
+out/
+*.log
+
+# local SDK/source checkouts (pinned as submodules later)
+thirdparty/rexglue-sdk/
+thirdparty/rexglue-wiki/
+thirdparty/UnleashedRecomp/
+
+CMakeUserPresets.json
+
+__pycache__/

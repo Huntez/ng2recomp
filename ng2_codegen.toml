@@ -1,0 +1,22 @@
+# Ninja Gaiden II (544307D5, default.xex 2008-05-09) codegen overrides.
+# Included from ng2_manifest.toml.
+
+# MSVC CRT; libjpeg's error_exit longjmps out of the decoder.
+setjmp_address = 0x83955C50
+longjmp_address = 0x83955930
+
+[functions]
+# this-adjustor thunks (addi r3,r3,N; b ...) the analysis skipped
+0x83759FF8 = { size = 8 }
+0x8375A460 = { size = 8 }
+# ends in a no-return KeBugCheck; SwitchToFiber starts right after it
+0x838191F0 = { size = 0x10 }
+0x83819200 = { name = "SwitchToFiber" }
+
+# XAPI fibers run on the SDK's host fibers.
+[rexcrt]
+ConvertThreadToFiber = 0x8380E418
+ConvertFiberToThread = 0x8380E4A8
+CreateFiber = 0x8380E4F8
+DeleteFiber = 0x8380E5D8
+SwitchToFiber = 0x83819200

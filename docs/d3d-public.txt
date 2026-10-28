@@ -1,0 +1,77 @@
+# Public D3D functions (called from game code), XDK 2.0.6683.
+# n = instructions, callers = game call sites, dev = device offsets touched (decimal, first 10), kernel imports.
+# Regenerate: see docs/renderer-plan.md (tools/callgraph.py).
+83737068 n=  34 callers=  2 dev=[] 
+837370F0 n=  36 callers= 10 dev=[10908, 10912, 12428, 13508, 13512] 
+83737180 n= 217 callers= 29 dev=[10460, 10940, 10943, 11852, 11856, 11860, 11864, 12179, 12432, 12436] 
+837374E8 n= 182 callers= 30 dev=[10368, 10376, 10548, 10560, 10940, 10942, 10943, 11868, 11872, 12179] 
+837377C0 n=  49 callers=  1 dev=[16692, 22252, 22256] 
+83737950 n=  51 callers=  2 dev=[] 
+83737BB8 n=  55 callers=  1 dev=[10880, 10888, 10892, 16712, 22280] 
+83737C98 n=   5 callers=  2 dev=[] 
+83737CB0 n=  21 callers=  7 dev=[] 
+83737D08 n=  16 callers=  2 dev=[10888] 
+83737D48 n=   4 callers=  2 dev=[10888] 
+83737D58 n=  38 callers=  1 dev=[10888, 10942, 11312] RtlEnterCriticalSection RtlLeaveCriticalSection
+83737DF0 n=  34 callers=  1 dev=[10888, 10942] RtlEnterCriticalSection RtlLeaveCriticalSection
+837390C8 n=  47 callers= 21 dev=[] 
+837397E0 n= 102 callers=  2 dev=[10941, 13216, 13500, 14888, 14892, 14900, 14908, 14916, 14920] RtlEnterCriticalSection RtlLeaveCriticalSection
+8373A3D0 n=  63 callers=  4 dev=[10896, 10908, 10940, 10941, 13216] 
+8373A4D0 n=  53 callers=  1 dev=[10896, 10908, 13216] 
+8373A5A8 n=  92 callers=  1 dev=[] 
+8373A7D0 n=  30 callers=  2 dev=[10908, 11000] 
+8373A8C0 n=  21 callers=  1 dev=[] 
+8373A918 n= 280 callers=  2 dev=[10896, 10900, 10908, 10924, 10926, 10952, 14820, 14824, 14880, 14884] VdSetSystemCommandBufferGpuIdentifierAddress MmGetPhysicalAddress VdInitializeRingBuffer VdEnableRingBufferRPtrWriteBack KiApcNormalRoutineNop
+8373B1F8 n=  58 callers= 26 dev=[] 
+8373B2E0 n=  58 callers= 10 dev=[] 
+8373B3C8 n=  68 callers= 20 dev=[] 
+8373B4D8 n= 111 callers= 34 dev=[10908, 10912, 12684, 13508, 13512] 
+8373B790 n=  60 callers= 18 dev=[] 
+8373B880 n= 115 callers= 32 dev=[10908, 10912, 10942, 12688, 13508, 13512] 
+8373BAD8 n=   5 callers=  3 dev=[11812] 
+8373BBE0 n=  33 callers= 12 dev=[] 
+8373BC68 n=  58 callers= 14 dev=[10920, 12708, 13768, 13772, 14800, 14804] 
+8373BD50 n= 296 callers= 49 dev=[10560, 10940, 11824, 12179, 12520, 12688, 13240, 13428, 13432, 13440] 
+8373C1F0 n= 332 callers=  4 dev=[10560, 10940, 11824, 12179, 12520, 12688, 13240, 13428, 13432, 13436] 
+8373C720 n= 250 callers=  3 dev=[10560, 10940, 12179, 13240] 
+8373CB08 n= 263 callers=  6 dev=[10560, 10940, 12179, 12428, 13240] 
+8373D570 n= 914 callers= 42 dev=[10396, 10436, 10440, 10560, 10688, 10776, 10780, 10784, 10788, 10820] 
+8373E5B8 n= 164 callers=  3 dev=[1976, 10888] 
+8373E848 n=  73 callers= 13 dev=[] 
+8373E970 n=  29 callers= 20 dev=[] 
+8373E9E8 n=  32 callers= 40 dev=[] 
+8373EA68 n=  10 callers=  1 dev=[] 
+8373EA90 n=  35 callers=  8 dev=[] 
+8373EB20 n=  50 callers=  2 dev=[] 
+8373EBE8 n=  20 callers=  1 dev=[] 
+8373EC38 n=   4 callers=  1 dev=[] 
+8373EC48 n=  43 callers=  1 dev=[] 
+8373ECF8 n=  18 callers=  1 dev=[] 
+8373ED40 n=   3 callers=  1 dev=[] 
+8373ED50 n=  59 callers=  1 dev=[] 
+8373EE40 n=  78 callers=  1 dev=[] 
+8373EF78 n= 130 callers=  1 dev=[] RtlInitializeCriticalSection RtlEnterCriticalSection RtlLeaveCriticalSection
+8373F180 n=  49 callers=  2 dev=[10941, 13500, 13504, 13508, 13512, 16712] 
+8373FAF8 n=   5 callers=  1 dev=[] 
+8373FB10 n=   9 callers=  1 dev=[13528, 13532, 13536, 21536] 
+83741B08 n= 173 callers=  2 dev=[] VdQueryVideoMode
+83741DC0 n=  39 callers=  2 dev=[14808, 14812, 14816] 
+83744D90 n= 106 callers=  1 dev=[10900, 10941, 11844, 13580] 
+837452C0 n= 454 callers=  1 dev=[10896, 10908, 10941, 10942, 10943, 13528, 13532, 13592, 13596, 14896] VdGetSystemCommandBuffer VdSwap VdSetDisplayMode VdGetCurrentDisplayInformation VdPersistDisplay MmFreePhysicalMemory
+837459D8 n=  82 callers=  2 dev=[14812, 14816] 
+83745B20 n=  40 callers=  2 dev=[] 
+8374C5B8 n=  91 callers=  1 dev=[10932, 10936, 10940, 12179, 12432, 12436, 12440, 12444, 12448, 12700] 
+8374C728 n= 220 callers=  1 dev=[10932, 10936, 10940, 10943, 12179, 12432, 12436, 12440, 12444, 12448] 
+8374CA98 n= 301 callers=  1 dev=[10896, 10932, 10936, 10940, 10943, 11312, 12179, 12432, 12436, 12440] 
+8374CF50 n= 164 callers=  1 dev=[10368, 10548, 10940, 10941, 10943, 12692, 12696, 12712, 12740, 13168] 
+8374D1E0 n= 171 callers=  1 dev=[10896, 10940, 10941, 10943, 11312, 13180, 13360] 
+8374D558 n=  25 callers=  1 dev=[] RtlEnterCriticalSection RtlLeaveCriticalSection
+8374D5C0 n=  25 callers=  7 dev=[] RtlEnterCriticalSection RtlLeaveCriticalSection
+8374D628 n=  21 callers=  1 dev=[] RtlEnterCriticalSection RtlLeaveCriticalSection
+8374D680 n=  42 callers=  1 dev=[] RtlEnterCriticalSection RtlLeaveCriticalSection
+8374D728 n=  23 callers=  1 dev=[] RtlEnterCriticalSection RtlLeaveCriticalSection
+8374D788 n=  22 callers=  1 dev=[] RtlEnterCriticalSection RtlLeaveCriticalSection
+8374D7E0 n=  18 callers=  1 dev=[] RtlEnterCriticalSection RtlLeaveCriticalSection
+8374D828 n=  21 callers=  1 dev=[] RtlEnterCriticalSection RtlLeaveCriticalSection
+8374D880 n=  25 callers=  2 dev=[] RtlEnterCriticalSection RtlLeaveCriticalSection
+8374D8E8 n=   2 callers=  1 dev=[] 
