@@ -73,6 +73,8 @@ struct HostMovie::State {
   bool loop = false;
   double loopOffset = 0.0;  // added to frame times after each pass
   double frameDuration = 1.0 / 30.0;
+  bool constantRate = false;
+  uint64_t passStartFrame = 0;  // framesDecoded when the current pass began
   uint64_t framesDecoded = 0;
   int width = 0, height = 0;
 
@@ -186,9 +188,16 @@ struct HostMovie::State {
     int64_t timestamp = picture->best_effort_timestamp;
     AVRational base = format->streams[videoStream]->time_base;
     // Without a timestamp: one frame after the previous one.
-    frame.time = timestamp == AV_NOPTS_VALUE
-                     ? (framesDecoded ? decodedTime + frameDuration : loopOffset)
-                     : timestamp * av_q2d(base) - startTime + loopOffset;
+    // Constant-rate movies are timed by frame count: the files' timestamps
+    // are whole milliseconds (60 fps frames 16 or 17 ms apart), and movies
+    // shown side by side then changed frames at different moments.
+    if (constantRate) {
+      frame.time = double(framesDecoded - passStartFrame) * frameDuration + loopOffset;
+    } else {
+      frame.time = timestamp == AV_NOPTS_VALUE
+                       ? (framesDecoded ? decodedTime + frameDuration : loopOffset)
+                       : timestamp * av_q2d(base) - startTime + loopOffset;
+    }
     framesDecoded++;
     decodedTime = frame.time;
 
@@ -252,26 +261,67 @@ struct HostMovie::State {
     av_packet_free(&packet);
   }
 
+  static bool SamePicture(const AVFrame* a, const AVFrame* b) {
+    if (a->width != b->width || a->height != b->height || a->format != b->format ||
+        a->format != AV_PIX_FMT_YUV420P) {
+      return false;
+    }
+    for (int p = 0; p < 3; p++) {
+      int width = p ? (a->width + 1) / 2 : a->width;
+      int height = p ? (a->height + 1) / 2 : a->height;
+      for (int y = 0; y < height; y++) {
+        if (std::memcmp(a->data[p] + size_t(y) * a->linesize[p],
+                        b->data[p] + size_t(y) * b->linesize[p], width) != 0) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
   void Decode() {
     AVPacket* packet = av_packet_alloc();
     AVFrame* picture = av_frame_alloc();
-    bool firstFrame = true;
+    // FFmpeg's VC-1 decoder emits the opening picture twice (the title's
+    // side panels), which puts the movie a frame behind others started with
+    // it. The first picture is held until the second shows whether it is a
+    // repeat; the clock starts at the first picture kept.
+    AVFrame* held = nullptr;
+    int decoded = 0;
+    auto push = [&](AVFrame* source) {
+      if (framesDecoded == 0) {
+        int64_t timestamp = source->best_effort_timestamp;
+        startTime = timestamp == AV_NOPTS_VALUE
+                        ? 0.0
+                        : timestamp * av_q2d(format->streams[videoStream]->time_base);
+      }
+      Frame frame = MakeFrame(source);
+      std::unique_lock lock(mutex);
+      wake.wait(lock, [&] { return quit || queue.size() < kQueuedFrames; });
+      if (quit) {
+        return false;
+      }
+      queue.push_back(std::move(frame));
+      return true;
+    };
     auto drain = [&](AVCodecContext* context) {
       while (avcodec_receive_frame(context, picture) == 0) {
-        if (firstFrame) {
-          firstFrame = false;
-          int64_t timestamp = picture->best_effort_timestamp;
-          startTime = timestamp == AV_NOPTS_VALUE
-                          ? 0.0
-                          : timestamp * av_q2d(format->streams[videoStream]->time_base);
+        decoded++;
+        if (decoded == 1) {
+          held = av_frame_clone(picture);
+          continue;
         }
-        Frame frame = MakeFrame(picture);
-        std::unique_lock lock(mutex);
-        wake.wait(lock, [&] { return quit || queue.size() < kQueuedFrames; });
-        if (quit) {
+        if (held) {
+          bool repeat = SamePicture(held, picture);
+          bool ok = repeat || push(held);
+          av_frame_free(&held);
+          if (!ok) {
+            return false;
+          }
+        }
+        if (!push(picture)) {
           return false;
         }
-        queue.push_back(std::move(frame));
       }
       return true;
     };
@@ -295,6 +345,7 @@ struct HostMovie::State {
           break;
         }
         framesAtPassStart = framesDecoded;
+        passStartFrame = framesDecoded;
         // Start over, one frame after the last one shown.
         loopOffset = decodedTime + frameDuration;
         if (av_seek_frame(format, -1, 0, AVSEEK_FLAG_BACKWARD) < 0) {
@@ -309,6 +360,10 @@ struct HostMovie::State {
       }
       av_packet_unref(packet);
     }
+    if (held && running) {
+      push(held);  // a one-frame movie
+    }
+    av_frame_free(&held);
     av_frame_free(&picture);
     av_packet_free(&packet);
     std::lock_guard lock(mutex);
@@ -342,6 +397,7 @@ std::unique_ptr<HostMovie> HostMovie::Open(const std::filesystem::path& path, bo
   AVRational rate = s.format->streams[s.videoStream]->avg_frame_rate;
   if (rate.num > 0 && rate.den > 0) {
     s.frameDuration = av_q2d(av_inv_q(rate));
+    s.constantRate = av_cmp_q(rate, s.format->streams[s.videoStream]->r_frame_rate) == 0;
   }
   if (audio && AudioEnabled() &&
       avformat_open_input(&s.audioFormat, path.string().c_str(), nullptr, nullptr) >= 0 &&
@@ -365,7 +421,20 @@ std::unique_ptr<HostMovie> HostMovie::Open(const std::filesystem::path& path, bo
 
 bool HostMovie::CopyFrame(const Planes& planes) {
   State& s = *state_;
+  // Movies shown together (the title's three panels) are asked one after
+  // another within a game frame: they share one clock reading so they can't
+  // fall on different sides of a frame boundary.
+  static std::mutex clockMutex;
+  static std::chrono::steady_clock::time_point shared;
   auto now = std::chrono::steady_clock::now();
+  {
+    std::lock_guard lock(clockMutex);
+    if (now - shared < std::chrono::milliseconds(4)) {
+      now = shared;
+    } else {
+      shared = now;
+    }
+  }
   if (!s.started) {
     s.started = true;
     s.start = now;
