@@ -250,6 +250,8 @@ struct GuestShader {
   const ShaderCacheEntry* entry = nullptr;
   // Vertex shaders: usage and usage index of each declared element slot.
   std::vector<std::pair<uint8_t, uint8_t>> elements;
+  // Pixel shaders: color outputs written (bit n = oCn).
+  uint32_t colorOutputs = 0;
 };
 std::unordered_map<uint32_t, std::unique_ptr<GuestShader>> g_guestShaders;
 std::unique_ptr<uint8_t[]> g_spirvCache;
@@ -311,13 +313,13 @@ std::unordered_map<uint32_t, HostTexture*> g_lastResolve;
 
 // Framebuffers by attachment.
 struct FramebufferKey {
-  const HostTexture* color;
-  const HostTexture* depth;
+  const HostTexture* colors[4] = {};
+  const HostTexture* depth = nullptr;
   bool operator==(const FramebufferKey&) const = default;
 };
 struct FramebufferKeyHash {
   size_t operator()(const FramebufferKey& k) const {
-    return std::hash<const void*>()(k.color) * 31 ^ std::hash<const void*>()(k.depth);
+    return XXH3_64bits(&k, sizeof(k));
   }
 };
 std::unordered_map<FramebufferKey, std::unique_ptr<RenderFramebuffer>, FramebufferKeyHash>
@@ -330,7 +332,9 @@ const RenderFramebuffer* g_boundFramebuffer = nullptr;
 // Drops cached framebuffers that use a texture about to be freed.
 void ForgetTexture(const HostTexture* texture) {
   for (auto it = g_framebuffers.begin(); it != g_framebuffers.end();) {
-    if (it->first.color == texture || it->first.depth == texture) {
+    const auto& key = it->first;
+    if (std::find(std::begin(key.colors), std::end(key.colors), texture) != std::end(key.colors) ||
+        key.depth == texture) {
       if (g_boundFramebuffer == it->second.get()) {
         g_boundFramebuffer = nullptr;
       }
@@ -506,18 +510,27 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
   return slot.get();
 }
 
-void BindFramebuffer(HostTexture* color, HostTexture* depth) {
-  auto& framebuffer = g_framebuffers[{color, depth}];
+// Binds colors[0..colorCount) (no gaps) and depth.
+void BindFramebuffer(HostTexture* const* colors, uint32_t colorCount, HostTexture* depth) {
+  FramebufferKey key;
+  for (uint32_t i = 0; i < colorCount; i++) {
+    key.colors[i] = colors[i];
+  }
+  key.depth = depth;
+  auto& framebuffer = g_framebuffers[key];
   if (!framebuffer) {
-    const RenderTexture* colors[] = {color ? color->texture.get() : nullptr};
+    const RenderTexture* attachments[4] = {};
+    for (uint32_t i = 0; i < colorCount; i++) {
+      attachments[i] = colors[i]->texture.get();
+    }
     RenderFramebufferDesc desc;
-    desc.colorAttachments = color ? colors : nullptr;
-    desc.colorAttachmentsCount = color ? 1 : 0;
+    desc.colorAttachments = colorCount ? attachments : nullptr;
+    desc.colorAttachmentsCount = colorCount;
     desc.depthAttachment = depth ? depth->texture.get() : nullptr;
     framebuffer = g_device->createFramebuffer(desc);
   }
-  if (color) {
-    Transition(*color, RenderTextureLayout::COLOR_WRITE);
+  for (uint32_t i = 0; i < colorCount; i++) {
+    Transition(*colors[i], RenderTextureLayout::COLOR_WRITE);
   }
   if (depth) {
     Transition(*depth, RenderTextureLayout::DEPTH_WRITE);
@@ -526,6 +539,10 @@ void BindFramebuffer(HostTexture* color, HostTexture* depth) {
     CommandList()->setFramebuffer(framebuffer.get());
     g_boundFramebuffer = framebuffer.get();
   }
+}
+
+void BindFramebuffer(HostTexture* color, HostTexture* depth) {
+  BindFramebuffer(&color, color ? 1 : 0, depth);
 }
 
 uint64_t ResolvedKey(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetch) {
@@ -1126,11 +1143,11 @@ struct PipelineKey {
   uint64_t vertexShader;  // shader cache entry hashes
   uint64_t pixelShader;
   uint32_t primitive;
-  uint32_t colorFormat;
+  uint32_t colorFormats[4];  // RenderFormat::UNKNOWN past the bound targets
   uint32_t depthFormat;
   uint32_t samples;
-  uint32_t blendControl;
-  uint32_t colorMask;
+  uint32_t blendControls[4];
+  uint32_t colorMask;  // RB_COLOR_MASK, 4 bits a target, minus unwritten outputs
   uint32_t depthControl;
   uint32_t stencilMasks;
   uint32_t cull;
@@ -1184,12 +1201,12 @@ RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
   } else if (mode.cull_back) {
     desc.cullMode = mode.face ? RenderCullMode::FRONT : RenderCullMode::BACK;
   }
-  if (key.colorFormat != uint32_t(RenderFormat::UNKNOWN)) {
-    desc.renderTargetFormat[0] = RenderFormat(key.colorFormat);
-    desc.renderTargetCount = 1;
+  for (uint32_t i = 0; i < 4 && key.colorFormats[i] != uint32_t(RenderFormat::UNKNOWN); i++) {
+    desc.renderTargetFormat[i] = RenderFormat(key.colorFormats[i]);
+    desc.renderTargetCount = i + 1;
     reg::RB_BLENDCONTROL blend;
-    blend.value = key.blendControl;
-    auto& target = desc.renderTargetBlend[0];
+    blend.value = key.blendControls[i];
+    auto& target = desc.renderTargetBlend[i];
     target.srcBlend = ConvertBlend(blend.color_srcblend);
     target.dstBlend = ConvertBlend(blend.color_destblend);
     target.blendOp = ConvertBlendOp(blend.color_comb_fcn);
@@ -1201,7 +1218,7 @@ RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
           target.blendOp == RenderBlendOperation::ADD &&
           target.srcBlendAlpha == RenderBlend::ONE && target.dstBlendAlpha == RenderBlend::ZERO &&
           target.blendOpAlpha == RenderBlendOperation::ADD);
-    target.renderTargetWriteMask = uint8_t(key.colorMask & 0xF);
+    target.renderTargetWriteMask = uint8_t((key.colorMask >> (i * 4)) & 0xF);
   }
   desc.depthTargetFormat = RenderFormat(key.depthFormat);
   if (desc.depthTargetFormat != RenderFormat::UNKNOWN) {
@@ -1241,7 +1258,8 @@ RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
 struct DrawRecord {
   RenderPipeline* pipeline = nullptr;
   bool memExport = false;
-  HostTexture* target = nullptr;
+  HostTexture* targets[4] = {};
+  uint32_t targetCount = 0;
   HostTexture* depth = nullptr;
   RenderViewport viewport;
   RenderRect scissor;
@@ -1270,7 +1288,7 @@ struct PendingDraw {
 std::optional<PendingDraw> g_pendingDraw;
 
 void SubmitDraw(DrawRecord& record) {
-  BindFramebuffer(record.target, record.depth);
+  BindFramebuffer(record.targets, record.targetCount, record.depth);
   auto* commandList = CommandList();
   commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
   commandList->setPipeline(record.pipeline);
@@ -1279,8 +1297,14 @@ void SubmitDraw(DrawRecord& record) {
   commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
   commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
   commandList->setGraphicsPushConstants(0, record.pushConstants, 0, sizeof(record.pushConstants));
-  commandList->setViewports(&record.viewport, 1);
-  commandList->setScissors(&record.scissor, 1);
+  // Plume gives a pipeline one viewport per color target.
+  RenderViewport viewports[4];
+  RenderRect scissors[4];
+  uint32_t viewportCount = std::max(record.targetCount, 1u);
+  std::fill_n(viewports, viewportCount, record.viewport);
+  std::fill_n(scissors, viewportCount, record.scissor);
+  commandList->setViewports(viewports, viewportCount);
+  commandList->setScissors(scissors, viewportCount);
   if (record.indexed) {
     commandList->setIndexBuffer(&*record.indexView);
     commandList->drawIndexedInstanced(record.drawCount, 1, 0, int32_t(record.startVertex), 0);
@@ -1351,7 +1375,21 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     return;
   }
 
-  HostTexture* target = GetSurface(guest::Load32(device + guest::device::kRenderTargets), false);
+  // Bound color targets from 0 up, while they match target 0's shape (one
+  // framebuffer).
+  HostTexture* targets[4] = {};
+  uint32_t targetCount = 0;
+  for (uint32_t i = 0; i < 4; i++) {
+    HostTexture* surface =
+        GetSurface(guest::Load32(device + guest::device::kRenderTargets + i * 4), false);
+    if (!surface || (i > 0 && (surface->width != targets[0]->width ||
+                               surface->height != targets[0]->height ||
+                               surface->samples != targets[0]->samples))) {
+      break;
+    }
+    targets[targetCount++] = surface;
+  }
+  HostTexture* target = targets[0];
   HostTexture* depth = GetSurface(guest::Load32(device + guest::device::kDepthStencil), true);
   if (!target && !depth) {
     return;
@@ -1579,11 +1617,22 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   key.vertexShader = vs->entry->hash;
   key.pixelShader = ps->entry->hash;
   key.primitive = primitive;
-  key.colorFormat = uint32_t(target ? target->format : RenderFormat::UNKNOWN);
+  for (uint32_t i = 0; i < 4; i++) {
+    key.colorFormats[i] =
+        uint32_t(i < targetCount ? targets[i]->format : RenderFormat::UNKNOWN);
+  }
   key.depthFormat = uint32_t(depth ? depth->format : RenderFormat::UNKNOWN);
   key.samples = uint32_t(sizeSource->samples);
-  key.blendControl = Register(device, 0x2201);
-  key.colorMask = Register(device, 0x2104) & 0xF;
+  static constexpr uint32_t kBlendControls[4] = {0x2201, 0x2209, 0x220A, 0x220B};
+  for (uint32_t i = 0; i < targetCount; i++) {
+    key.blendControls[i] = Register(device, kBlendControls[i]);
+  }
+  // A target the pixel shader doesn't write keeps its contents.
+  uint32_t written = 0;
+  for (uint32_t i = 0; i < 4; i++) {
+    written |= (ps->colorOutputs >> i & 1) ? 0xFu << (i * 4) : 0;
+  }
+  key.colorMask = Register(device, 0x2104) & written & ((1u << (targetCount * 4)) - 1);
   key.depthControl = Register(device, 0x2200);
   key.stencilMasks = Register(device, 0x210D);
   key.cull = mode.value & 0x7;
@@ -1604,16 +1653,17 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                 shared.vertexFetch[95][0], shared.vertexFetch[95][1], vs->container,
                 ps->container);
     REXLOG_INFO("draw prim {} count {} indexed {} vs {:016X} ps {:016X} target {}x{} fmt {} "
-                "blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {}",
+                "targets {} mask {:#x} blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {}",
                 primitive, count, indexed, vs->entry->hash, ps->entry->hash,
-                sizeSource->width, sizeSource->height, uint32_t(sizeSource->format),
-                key.blendControl, key.depthControl, vte.value, viewport.x, viewport.y,
+                sizeSource->width, sizeSource->height, uint32_t(sizeSource->format), targetCount,
+                key.colorMask, key.blendControls[0], key.depthControl, vte.value, viewport.x, viewport.y,
                 viewport.width, viewport.height);
   }
   DrawRecord record;
   record.pipeline = pipeline;
   record.memExport = memExport;
-  record.target = target;
+  std::copy(targets, targets + targetCount, record.targets);
+  record.targetCount = targetCount;
   record.depth = depth;
   record.viewport = viewport;
   record.scissor = RenderRect(0, 0, int32_t(targetWidth), int32_t(targetHeight));
@@ -1989,8 +2039,11 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
   bool clearColor = (flags & 0x1) && target;
   bool clearDepth = (flags & 0x10) && depth;
   bool clearStencil = (flags & 0x20) && depth;
-  if (!clearColor && !clearDepth && !clearStencil) {
+  if (!clearColor && !(flags & 0xE) && !clearDepth && !clearStencil) {
     return;
+  }
+  if (!target && !depth) {
+    return;  // targets 1-3 without 0: rects can't be clipped; not seen
   }
   // Attachments of different shapes can't share a framebuffer.
   bool together = target && depth && target->width == depth->width &&
@@ -2014,11 +2067,22 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
   const RenderRect* rectData = clearRects.empty() ? nullptr : clearRects.data();
   uint32_t rectDataCount = uint32_t(clearRects.size());
 
+  RenderColor value(float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f,
+                    float(color & 0xFF) / 255.0f, float(color >> 24) / 255.0f);
   if (clearColor) {
     BindFramebuffer(target, together ? depth : nullptr);
-    RenderColor value(float((color >> 16) & 0xFF) / 255.0f, float((color >> 8) & 0xFF) / 255.0f,
-                      float(color & 0xFF) / 255.0f, float(color >> 24) / 255.0f);
     CommandList()->clearColor(0, value, rectData, rectDataCount);
+  }
+  for (uint32_t i = 1; i < 4; i++) {
+    HostTexture* other =
+        (flags & (1u << i))
+            ? GetSurface(guest::Load32(device + guest::device::kRenderTargets + i * 4), false)
+            : nullptr;
+    if (other && (!rectDataCount || (other->width == uint32_t(limitX) &&
+                                     other->height == uint32_t(limitY)))) {
+      BindFramebuffer(other, nullptr);
+      CommandList()->clearColor(0, value, rectData, rectDataCount);
+    }
   }
   if (clearDepth || clearStencil) {
     if (!(clearColor && together)) {
@@ -2126,7 +2190,10 @@ void OnCreateShader(uint32_t object, uint32_t container, bool pixel) {
     REXLOG_WARN("video: {} shader {:016X} at {:#x} is not in the shader cache",
                 pixel ? "pixel" : "vertex", hash, container);
   }
-  if (!pixel) {
+  if (pixel) {
+    uint32_t header = container + guest::Load32(container + 24);
+    shader->colorOutputs = guest::Load32(header + 28) & 0xF;
+  } else {
     // Declared vertex elements (address, usage, usage index) in container order.
     uint32_t header = container + guest::Load32(container + 24);
     uint32_t base = guest::Load32(header + 24);

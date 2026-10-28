@@ -63,8 +63,10 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   R32_FLOAT. Resolved textures are keyed by address and shape (two shadow
   map sizes share an address), with the latest resolve per address as a
   fallback for other views.
-- Next: multiple render targets (the luminance chain draws to three at
-  once), EDRAM aliasing (two formats at EDRAM base 0 in the main pass); the
+- Multiple render targets: targets 0-3 while they match target 0's shape,
+  per-target format, blend and color mask; a target the pixel shader
+  doesn't write keeps its contents. Clear handles targets 1-3.
+- Next: EDRAM aliasing (two formats at EDRAM base 0 in the main pass); the
   scene still looks dim and flat.
 - Mipmaps, cube and 3D textures, the formats that need conversion
   (5_6_5, 1_5_5_5, 4_4_4_4, 2_10_10_10, 10_11_11, 11_11_10).
