@@ -1,4 +1,4 @@
-From e77299f3fc34103ee26c12fa8611c6d210a6f5bf Mon Sep 17 00:00:00 2001
+From f11370af5d36d733e1fa4c85e30d381fe23a4e6b Mon Sep 17 00:00:00 2001
 From: gambuzino24 <gambuzino24@gmail.com>
 Date: Wed, 28 Oct 2026 21:38:40 +0000
 Subject: [PATCH] threading: hand semaphore units to queued waiters, atomic
@@ -13,11 +13,11 @@ Gaiden II's job system then lost a wake-up and stalled a frame forever.
 Semaphore waiters now take a ticket and units go to the oldest tickets;
 SignalAndWait queues before it signals; alertable waits keep one ticket.
 ---
- src/core/threading_posix.cpp | 87 +++++++++++++++++++++++++++++++++---
- 1 file changed, 81 insertions(+), 6 deletions(-)
+ src/core/threading_posix.cpp | 128 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 120 insertions(+), 8 deletions(-)
 
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..454ee89 100644
+index 9ac8d15..e99e607 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -21,6 +21,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -28,7 +28,7 @@ index 9ac8d15..454ee89 100644
  
  #include <pthread.h>
  #include <semaphore.h>
-@@ -288,8 +289,30 @@ class PosixConditionBase {
+@@ -288,8 +289,33 @@ class PosixConditionBase {
    virtual bool Signal() = 0;
  
    WaitResult Wait(std::chrono::milliseconds timeout) {
@@ -42,6 +42,9 @@ index 9ac8d15..454ee89 100644
 +  // objects without one); WaitQueued() waits with it and, if dequeue_on_timeout
 +  // or on success, gives it up; Dequeue() gives it up after a timeout.
 +  uint64_t Enqueue() {
++    if (!uses_tickets()) {
++      return 0;
++    }
 +    std::lock_guard<std::mutex> lock(mutex_);
 +    return enqueue_locked();
 +  }
@@ -60,25 +63,44 @@ index 9ac8d15..454ee89 100644
  #if REX_PLATFORM_LINUX
      auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
      int lock_result = pthread_mutex_lock(native_mutex);
-@@ -313,9 +336,12 @@ class PosixConditionBase {
+@@ -302,6 +328,18 @@ class PosixConditionBase {
+ #else
+     std::unique_lock<std::mutex> lock(mutex_);
+ #endif
++    // The ticket leaves the queue on every way out (including unwinding)
++    // except success, which consumes it, or a timeout told to keep it.
++    struct TicketGuard {
++      PosixConditionBase* self;
++      uint64_t ticket;
++      bool keep = false;
++      ~TicketGuard() {
++        if (ticket && !keep) {
++          self->dequeue_locked(ticket);
++        }
++      }
++    } guard{this, ticket};
+     if (predicate()) {
+       executed = true;
+     } else {
+@@ -313,9 +351,11 @@ class PosixConditionBase {
        }
      }
      if (executed) {
 -      post_execution();
++      guard.keep = true;
 +      post_execution_for(ticket);
        return WaitResult::kSuccess;
      } else {
-+      if (dequeue_on_timeout && ticket) {
-+        dequeue_locked(ticket);
-+      }
++      guard.keep = !dequeue_on_timeout;
        return WaitResult::kTimeout;
      }
    }
-@@ -428,6 +454,11 @@ class PosixConditionBase {
+@@ -428,6 +468,12 @@ class PosixConditionBase {
   protected:
    inline virtual bool signaled() const = 0;
    inline virtual void post_execution() = 0;
 +  // With the mutex held. Objects without a wait queue ignore tickets.
++  virtual bool uses_tickets() const { return false; }
 +  virtual uint64_t enqueue_locked() { return 0; }
 +  virtual void dequeue_locked(uint64_t) {}
 +  virtual bool signaled_for(uint64_t) const { return signaled(); }
@@ -86,7 +108,7 @@ index 9ac8d15..454ee89 100644
    std::condition_variable cond_;
    std::mutex mutex_;
  };
-@@ -491,13 +522,38 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -491,13 +537,39 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
    }
  
   private:
@@ -98,6 +120,7 @@ index 9ac8d15..454ee89 100644
      count_--;
      cond_.notify_all();
    }
++  bool uses_tickets() const override { return true; }
 +  uint64_t enqueue_locked() override {
 +    uint64_t ticket = next_ticket_++;
 +    tickets_.insert(ticket);
@@ -126,7 +149,44 @@ index 9ac8d15..454ee89 100644
  };
  
  template <>
-@@ -1166,15 +1222,23 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
+@@ -887,6 +959,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     }
+   }
+ 
++  bool HasPendingUserCallbacks() const {
++    return has_pending_user_callbacks_.load(std::memory_order_acquire);
++  }
++
+   bool DispatchQueuedUserCallbacks() {
+     if (!has_pending_user_callbacks_.load(std::memory_order_acquire)) {
+       return false;
+@@ -1068,6 +1144,25 @@ bool DispatchCurrentThreadUserCallback() {
+   return current_thread_condition_ && current_thread_condition_->DispatchQueuedUserCallbacks();
+ }
+ 
++// For a ticketed wait: like the kernel, a thread leaves the wait queue
++// before a user callback runs, so the callback can't hold a unit others are
++// owed (or wait behind its own ticket).
++bool DispatchCurrentThreadUserCallback(PosixConditionBase& condition, uint64_t& ticket) {
++  if (!current_thread_condition_) {
++    Thread::GetCurrentThread();
++  }
++  if (!current_thread_condition_ || !current_thread_condition_->HasPendingUserCallbacks()) {
++    return false;
++  }
++  condition.Dequeue(ticket);
++  ticket = 0;
++  if (current_thread_condition_->DispatchQueuedUserCallbacks()) {
++    return true;
++  }
++  ticket = condition.Enqueue();
++  return false;
++}
++
+ namespace {
+ 
+ constexpr auto kAlertablePollSlice = std::chrono::milliseconds(1);
+@@ -1166,15 +1261,22 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
    ScopedAlertableState alertable_state_guard(true);
    auto deadline = ComputeAlertableDeadline(timeout);
  
@@ -134,8 +194,8 @@ index 9ac8d15..454ee89 100644
 +  auto& condition = posix_wait_handle->condition();
 +  uint64_t ticket = condition.Enqueue();
    while (true) {
-     if (DispatchCurrentThreadUserCallback()) {
-+      condition.Dequeue(ticket);
+-    if (DispatchCurrentThreadUserCallback()) {
++    if (DispatchCurrentThreadUserCallback(condition, ticket)) {
        return WaitResult::kUserCallback;
      }
      if (HasAlertableTimeoutElapsed(deadline)) {
@@ -151,7 +211,7 @@ index 9ac8d15..454ee89 100644
        return result;
      }
    }
-@@ -1188,25 +1252,36 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
+@@ -1188,25 +1290,35 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
    if (posix_wait_handle_to_signal == nullptr || posix_wait_handle_to_wait_on == nullptr) {
      return WaitResult::kFailed;
    }
@@ -173,8 +233,8 @@ index 9ac8d15..454ee89 100644
    ScopedAlertableState alertable_state_guard(true);
    auto deadline = ComputeAlertableDeadline(timeout);
    while (true) {
-     if (DispatchCurrentThreadUserCallback()) {
-+      wait_on.Dequeue(ticket);
+-    if (DispatchCurrentThreadUserCallback()) {
++    if (DispatchCurrentThreadUserCallback(wait_on, ticket)) {
        return WaitResult::kUserCallback;
      }
      if (HasAlertableTimeoutElapsed(deadline)) {
