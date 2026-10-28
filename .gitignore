@@ -12,6 +12,7 @@ out/
 thirdparty/rexglue-sdk/
 thirdparty/rexglue-wiki/
 thirdparty/UnleashedRecomp/
+thirdparty/XenosRecomp/
 
 CMakeUserPresets.json
 

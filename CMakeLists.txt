@@ -36,3 +36,48 @@ if(UNIX AND NOT APPLE)
         endif()
     endforeach()
 endif()
+
+# Shaders, translated ahead of time like Unleashed Recompiled does: the
+# shader containers sit in the XEX image, ng2_dump_image extracts that image
+# from the user's default.xex and XenosRecomp (patched for NG2, see
+# docs/shaders.md) turns every container into SPIR-V, embedded as a zstd
+# compressed cache.
+set(NG2_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_files" CACHE PATH
+    "Extracted game files (default.xex is read at build time for its shaders)")
+set(NG2_XENOS_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/XenosRecomp")
+
+add_executable(ng2_dump_image tools/dump_image/main.cpp)
+target_link_libraries(ng2_dump_image PRIVATE rex::runtime)
+
+include(ExternalProject)
+ExternalProject_Add(xenos_recomp
+    SOURCE_DIR "${NG2_XENOS_RECOMP_DIR}"
+    BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp"
+    CMAKE_ARGS
+        -G Ninja
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+        -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -DXENOS_RECOMP_DXIL=OFF
+    BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+    INSTALL_COMMAND ""
+    BUILD_ALWAYS ON)
+
+set(NG2_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+set(NG2_SHADER_CACHE "${NG2_SHADER_DIR}/ng2_shader_cache.cpp")
+add_custom_command(
+    OUTPUT "${NG2_SHADER_CACHE}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${NG2_SHADER_DIR}/input"
+    COMMAND ng2_dump_image "${NG2_GAME_DIR}" default.xex "${NG2_SHADER_DIR}/input/default.img"
+    COMMAND "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+        "${NG2_SHADER_DIR}/input" "${NG2_SHADER_CACHE}"
+        "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
+    DEPENDS ng2_dump_image xenos_recomp "${NG2_GAME_DIR}/default.xex"
+        "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+        "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
+    COMMENT "Translating NG2 shaders with XenosRecomp"
+    VERBATIM)
+
+add_library(ng2_shaders STATIC "${NG2_SHADER_CACHE}")
+target_include_directories(ng2_shaders PUBLIC src/gpu)
+target_link_libraries(ng2 PRIVATE ng2_shaders)

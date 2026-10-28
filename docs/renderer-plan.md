@@ -36,12 +36,10 @@ rest; the 74 public functions are the hook list to complete.
 
 1. Map the 74 public D3D functions to their D3D9 names (signatures, device
    fields touched, PM4 packets written) and fill `GuestDevice` offsets.
-2. Shaders. Unleashed translates its game's shader archive offline with
-   XenosRecomp (HLSL, then DXC). NG2's shaders are created at runtime from
-   microcode (CreateVertexShader/CreatePixelShader); find where the microcode
-   lives (.ng2 archives or the XEX). Options: dump all microcode once and
-   run XenosRecomp offline like Unleashed, or translate at load time with the
-   SPIR-V translator already in ReXGlue's xenos plugin. Decide after step 1.
+2. Shaders: done ahead of time with XenosRecomp, see docs/shaders.md. The
+   renderer has to follow that file's shared-constant layout and vertex
+   input locations, and keep vertex data in one GPU buffer laid out like
+   guest physical memory (skinning writes there with memexport).
 3. Port video.cpp: plume Vulkan backend, render command queue, resource
    types, texture upload (tiling, endian swap, formats), render targets and
    resolves (EDRAM semantics), present. Drop D3D12 and Metal paths.

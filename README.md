@@ -23,16 +23,23 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader, GTK3.
        cmake --preset linux-amd64
        cmake --build out/build/linux-amd64 --config Release --target install
 
-2. Extract the disc (World release, title 544307D5) into `game_files/`:
+2. Get XenosRecomp (shader translator) with the NG2 patch:
+
+       git clone --recursive https://github.com/hedge-dev/XenosRecomp thirdparty/XenosRecomp
+       cd thirdparty/XenosRecomp && git checkout 990d03b && git submodule update --init --recursive
+       git am ../../patches/xenosrecomp/*.patch
+
+3. Extract the disc (World release, title 544307D5) into `game_files/`:
 
        python3 tools/xdvdfs_extract.py "Ninja Gaiden II (World).iso" game_files
 
-3. Build (runs codegen first, ~560 MB of generated C++):
+4. Build (runs codegen, ~560 MB of generated C++, and translates the
+   game's shaders, see docs/shaders.md):
 
        cmake --preset linux-amd64-release
        cmake --build out/build/linux-amd64-release
 
-4. Run:
+5. Run:
 
        out/build/linux-amd64-release/ng2 --gpu_plugin=xenos --game_data_root=game_files
 
@@ -44,6 +51,8 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader, GTK3.
 - `ng2_pointer_funcs.toml`: functions only reached through pointers, found by
   `tools/find_pointer_funcs.py` on an image dumped with `NG2_DUMP_IMAGE=<file>`.
 - `src/`: the host application.
+- `patches/xenosrecomp/`: XenosRecomp changes for NG2's shaders.
+- `docs/`: renderer plan, shader pipeline, D3D function table, NGB reuse notes.
 - `tools/run-headless.sh`: silent test runs in a headless gamescope
   (`NG2_SHOTS="30 60"` takes screenshots, `NG2_WRAP` runs under gdb).
 
