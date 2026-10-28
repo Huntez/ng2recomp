@@ -274,12 +274,19 @@ std::unordered_map<uint64_t, CachedTexture> g_textures;
 std::vector<std::unique_ptr<HostTexture>> g_garbage[NUM_FRAMES];
 uint64_t g_frameCount = 0;
 
-// NG2_TRACE_FRAME=<n>: log what frame n draws.
+// NG2_TRACE_FRAME=<n>: log what frame n draws; t<seconds>: the first frame
+// that starts that long after the first draw.
 bool Tracing() {
-  static const int64_t frame = [] {
-    const char* v = std::getenv("NG2_TRACE_FRAME");
-    return v ? std::strtoll(v, nullptr, 10) : -1ll;
-  }();
+  static const char* spec = std::getenv("NG2_TRACE_FRAME");
+  static const bool byTime = spec && spec[0] == 't';
+  static int64_t frame = spec && !byTime ? std::strtoll(spec, nullptr, 10) : -1ll;
+  if (byTime && frame < 0) {
+    static const auto start = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - start >=
+        std::chrono::duration<double>(std::strtod(spec + 1, nullptr))) {
+      frame = int64_t(g_frameCount) + 1;
+    }
+  }
   return int64_t(g_frameCount) == frame;
 }
 

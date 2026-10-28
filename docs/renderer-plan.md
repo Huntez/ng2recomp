@@ -85,6 +85,15 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   hang: a vertex fetch with a garbage index read past the 512 MB guest
   memory buffer (page fault, ring timeout); addresses now wrap at 512 MB
   (patches/xenosrecomp/0003). The opening now plays into gameplay.
+- Gameplay (Chapter 1 start): HUD, level and combat (hit counter, blood)
+  work, but characters don't show: only thin red streaks where Ryu and
+  the enemies should be, as if their skinned meshes collapse. No memexport
+  shaders run in these frames (nor in cutscenes, where characters do
+  draw); no textures are skipped. Next: find the character draws (e.g. a
+  debug switch that tints one vertex shader's draws) and compare their
+  bone constants and vertex fetches with a cutscene's.
+- The xenos plugin draws the in-game 3D black (only the HUD shows), so it
+  is no reference for gameplay either.
 - Movie audio is pushed as it decodes, paced by the video queue (about
   200 ms ahead): a long hitch underruns it and audio then trails video.
 - Resolved textures are never freed (one per address and shape); a later
