@@ -58,10 +58,16 @@ struct HostMovie::State {
   AVFormatContext* format = nullptr;
   AVCodecContext* video = nullptr;
   AVCodecContext* audio = nullptr;
+  // Audio reads its own handle to the file on its own thread, keeping about
+  // half a second queued for SDL: paced by the video queue it starved
+  // whenever the game hitched.
+  AVFormatContext* audioFormat = nullptr;
+  std::thread audioThread;
   int videoStream = -1, audioStream = -1;
   SwsContext* scaler = nullptr;
   SwrContext* resampler = nullptr;
   SDL_AudioStream* audioOut = nullptr;
+  int outputChannels = 2;
   double startTime = 0.0;  // the first video frame's timestamp
   double decodedTime = 0.0;  // the latest decoded frame's time
   bool loop = false;
@@ -92,6 +98,9 @@ struct HostMovie::State {
     if (thread.joinable()) {
       thread.join();
     }
+    if (audioThread.joinable()) {
+      audioThread.join();
+    }
     if (audioOut) {
       SDL_DestroyAudioStream(audioOut);
     }
@@ -99,11 +108,12 @@ struct HostMovie::State {
     sws_freeContext(scaler);
     avcodec_free_context(&audio);
     avcodec_free_context(&video);
+    avformat_close_input(&audioFormat);
     avformat_close_input(&format);
   }
 
-  AVCodecContext* OpenDecoder(int stream) {
-    const AVCodecParameters* parameters = format->streams[stream]->codecpar;
+  AVCodecContext* OpenDecoder(AVFormatContext* source, int stream) {
+    const AVCodecParameters* parameters = source->streams[stream]->codecpar;
     const AVCodec* codec = avcodec_find_decoder(parameters->codec_id);
     if (!codec) {
       REXLOG_ERROR("movie: {}: no decoder for {}", name, avcodec_get_name(parameters->codec_id));
@@ -124,14 +134,25 @@ struct HostMovie::State {
       REXLOG_WARN("movie: {}: no audio ({})", name, SDL_GetError());
       return false;
     }
-    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-    if (swr_alloc_set_opts2(&resampler, &stereo, AV_SAMPLE_FMT_FLT, 48000, &audio->ch_layout,
+    // Mono, stereo and 5.1 go out as they are (SDL's channel order matches
+    // FFmpeg's), so the system mixes them for its speakers; anything else
+    // becomes stereo.
+    AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
+    AVChannelLayout mono = AV_CHANNEL_LAYOUT_MONO, surround = AV_CHANNEL_LAYOUT_5POINT1_BACK;
+    if (!av_channel_layout_compare(&audio->ch_layout, &mono) ||
+        !av_channel_layout_compare(&audio->ch_layout, &surround)) {
+      layout = audio->ch_layout;
+    } else if (audio->ch_layout.nb_channels == 1) {
+      layout = mono;  // an unspecified single channel
+    }
+    outputChannels = layout.nb_channels;
+    if (swr_alloc_set_opts2(&resampler, &layout, AV_SAMPLE_FMT_FLT, 48000, &audio->ch_layout,
                             audio->sample_fmt, audio->sample_rate, 0, nullptr) < 0 ||
         swr_init(resampler) < 0) {
       REXLOG_WARN("movie: {}: cannot convert its audio", name);
       return false;
     }
-    SDL_AudioSpec spec{SDL_AUDIO_F32, 2, 48000};
+    SDL_AudioSpec spec{SDL_AUDIO_F32, outputChannels, 48000};
     audioOut =
         SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (!audioOut) {
@@ -146,13 +167,14 @@ struct HostMovie::State {
     if (samples <= 0) {
       return;
     }
-    std::vector<float> buffer(size_t(samples) * 2);
+    std::vector<float> buffer(size_t(samples) * outputChannels);
     uint8_t* out = reinterpret_cast<uint8_t*>(buffer.data());
     int converted = swr_convert(resampler, &out, samples,
                                 const_cast<const uint8_t**>(frame->extended_data),
                                 frame->nb_samples);
     if (converted > 0) {
-      SDL_PutAudioStreamData(audioOut, buffer.data(), converted * 2 * int(sizeof(float)));
+      SDL_PutAudioStreamData(audioOut, buffer.data(),
+                             converted * outputChannels * int(sizeof(float)));
     }
   }
 
@@ -190,16 +212,52 @@ struct HostMovie::State {
     return frame;
   }
 
+  bool Quitting() {
+    std::lock_guard lock(mutex);
+    return quit;
+  }
+
+  void DecodeAudio() {
+    const int kAhead = 48000 / 2 * outputChannels * int(sizeof(float));  // 0.5 s
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* samples = av_frame_alloc();
+    auto drain = [&] {
+      while (avcodec_receive_frame(audio, samples) == 0) {
+        PushAudio(samples);
+      }
+    };
+    bool decodedAny = false;
+    while (!Quitting()) {
+      if (SDL_GetAudioStreamQueued(audioOut) > kAhead) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;
+      }
+      if (av_read_frame(audioFormat, packet) < 0) {
+        avcodec_send_packet(audio, nullptr);
+        drain();
+        if (!loop || !decodedAny || av_seek_frame(audioFormat, -1, 0, AVSEEK_FLAG_BACKWARD) < 0) {
+          break;
+        }
+        avcodec_flush_buffers(audio);
+        decodedAny = false;
+        continue;
+      }
+      if (packet->stream_index == audioStream && avcodec_send_packet(audio, packet) == 0) {
+        decodedAny = true;
+        drain();
+      }
+      av_packet_unref(packet);
+    }
+    av_frame_free(&samples);
+    av_packet_free(&packet);
+  }
+
   void Decode() {
     AVPacket* packet = av_packet_alloc();
     AVFrame* picture = av_frame_alloc();
     bool firstFrame = true;
     auto drain = [&](AVCodecContext* context) {
       while (avcodec_receive_frame(context, picture) == 0) {
-        if (context == audio) {
-          PushAudio(picture);
-          continue;
-        }
         if (firstFrame) {
           firstFrame = false;
           int64_t timestamp = picture->best_effort_timestamp;
@@ -243,14 +301,9 @@ struct HostMovie::State {
           break;
         }
         avcodec_flush_buffers(video);
-        if (audio) {
-          avcodec_flush_buffers(audio);
-        }
         continue;
       }
-      AVCodecContext* context = packet->stream_index == videoStream ? video
-                                : (packet->stream_index == audioStream && audioOut) ? audio
-                                                                                     : nullptr;
+      AVCodecContext* context = packet->stream_index == videoStream ? video : nullptr;
       if (context && avcodec_send_packet(context, packet) == 0) {
         running = drain(context);
       }
@@ -280,7 +333,7 @@ std::unique_ptr<HostMovie> HostMovie::Open(const std::filesystem::path& path, bo
   }
   avformat_find_stream_info(s.format, nullptr);
   s.videoStream = av_find_best_stream(s.format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-  if (s.videoStream < 0 || !(s.video = s.OpenDecoder(s.videoStream))) {
+  if (s.videoStream < 0 || !(s.video = s.OpenDecoder(s.format, s.videoStream))) {
     REXLOG_ERROR("movie: {}: no playable video stream", s.name);
     return nullptr;
   }
@@ -290,9 +343,12 @@ std::unique_ptr<HostMovie> HostMovie::Open(const std::filesystem::path& path, bo
   if (rate.num > 0 && rate.den > 0) {
     s.frameDuration = av_q2d(av_inv_q(rate));
   }
-  if (audio && AudioEnabled()) {
-    s.audioStream = av_find_best_stream(s.format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-    if (s.audioStream >= 0 && (s.audio = s.OpenDecoder(s.audioStream)) && !s.OpenAudioOutput()) {
+  if (audio && AudioEnabled() &&
+      avformat_open_input(&s.audioFormat, path.string().c_str(), nullptr, nullptr) >= 0 &&
+      avformat_find_stream_info(s.audioFormat, nullptr) >= 0) {
+    s.audioStream = av_find_best_stream(s.audioFormat, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (s.audioStream >= 0 && (s.audio = s.OpenDecoder(s.audioFormat, s.audioStream)) &&
+        !s.OpenAudioOutput()) {
       SDL_DestroyAudioStream(s.audioOut);
       s.audioOut = nullptr;
     }
@@ -301,6 +357,9 @@ std::unique_ptr<HostMovie> HostMovie::Open(const std::filesystem::path& path, bo
               avcodec_get_name(s.video->codec_id), s.audioOut ? " with audio" : "",
               loop ? ", looping" : "");
   s.thread = std::thread([&s] { s.Decode(); });
+  if (s.audioOut) {
+    s.audioThread = std::thread([&s] { s.DecodeAudio(); });
+  }
   return movie;
 }
 
