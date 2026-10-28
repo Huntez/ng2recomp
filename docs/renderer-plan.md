@@ -33,35 +33,30 @@ the Xenos GPU. `NG2_RENDERER=native` selects it; ReXGlue's xenos plugin
 - **Presentation**: Vulkan device and swapchain on the game window through
   plume (patched for Wayland, patches/plume), Wayland or X11.
 
-## Steps
+## Status (2026-10-28)
 
-1. Map the D3D library (0x83732250-0x8374D558; XAudio follows): done in
-   docs/d3d-map-a.md, -b.md, -c.md. Most textures are XGSetTextureHeader
-   headers on game memory (8385CF58), not CreateTexture, so textures are
-   taken from the fetch constants at draw time. -c.md also decodes the
-   device's pending masks.
-2. Present from Swap instead of a free-running thread; the frame = the work
-   between two swaps. Review notes for that rewrite: acquire with a finite
-   timeout (a hidden Wayland window can block FIFO acquire/present forever,
-   hanging shutdown); take the window size from the UI thread's resize
-   events instead of SDL_GetWindowSizeInPixels on the render thread; get the
-   SDL window from ReXGlue's WindowSDL rather than SDL_GetWindows()[0]; no
-   joinable global std::thread at exit.
-3. Render targets and EDRAM: surfaces (RB_COLOR_INFO/RB_DEPTH_INFO, EDRAM
-   base and pitch) become host render targets; Clear clears them; Resolve
-   copies them to the destination texture's guest address, kept on the GPU
-   (guest address -> host texture), as Unleashed links resolved surfaces.
-4. Draws: pipeline state from registers (blend, depth/stencil, cull, fill,
-   primitive type, viewport/scissor), vertex input from the vertex
-   declaration + vertex fetch constants, shaders from the cache, constants
-   uploaded per draw (shared-constant layout in docs/shaders.md), vertex and
-   index data copied from guest memory into the guest-physical GPU buffer.
-5. Textures: from texture fetch constants (address, format, size, tiling,
-   endianness, mips), untiled and uploaded, cached by address with
-   invalidation on CPU writes (lock/unlock hooks).
-6. GPU passes with memory export (skinning): run them with the guest memory
-   buffer bound so their output feeds later draws.
-7. Compare against `--gpu_plugin=xenos` screenshots throughout.
+The title screen renders natively and matches the xenos reference:
+render targets, Clear, Resolve (copy, MSAA resolve, format conversion by
+draw), Swap/present, draws (DrawVertices, DrawIndexedVertices, inline
+BeginVertices/BeginIndexedVertices), shaders from the ahead-of-time cache,
+2D/1D textures (base level), rect lists (geometry shader), quad lists.
+Debug aids: NG2_TRACE_FRAME=<n>, NG2_DUMP_TEXTURES=<dir>,
+NG2_DEBUG_WHITE_TEXTURES=1.
+
+## Next
+
+- Gameplay: needs input in test runs (pad scripting, see docs/ngb-reuse.md).
+- Mipmaps, cube and 3D textures, the formats that need conversion
+  (5_6_5, 1_5_5_5, 4_4_4_4, 2_10_10_10, 10_11_11, 11_11_10).
+- Depth resolves, scissor (PA_SC_WINDOW_SCISSOR isn't in the device's
+  register shadows; find D3D's scissor storage), polygon offset, MSAA
+  alpha-to-coverage, gamma (k_8_8_8_8_GAMMA, PWL ramp).
+- EDRAM aliasing between surfaces that share EDRAM (Xenia's render target
+  cache is the reference).
+- Performance: present on a render thread like Unleashed; cheaper guest
+  memory and texture invalidation than per-frame hashing.
+- Review notes for the present path (window size on the UI thread, acquire
+  timeout, window handle from ReXGlue).
 
 Audio: ReXGlue's SDL3 output with its XMA decoder (libavcodec); Unleashed's
 SDL driver only if this turns out worse.
