@@ -12,6 +12,7 @@
 
 #include "video.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -45,6 +46,8 @@ extern const uint8_t g_present_ps[];
 extern const size_t g_present_ps_size;
 extern const uint8_t g_rect_list_gs[];
 extern const size_t g_rect_list_gs_size;
+extern const uint8_t g_copy_ps[];
+extern const size_t g_copy_ps_size;
 
 namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();
@@ -134,6 +137,10 @@ std::unique_ptr<RenderShader> g_fullscreenShader;
 std::unique_ptr<RenderShader> g_presentShader;
 std::unique_ptr<RenderPipeline> g_presentPipeline;
 std::unique_ptr<RenderShader> g_rectListShader;
+std::unique_ptr<RenderShader> g_copyShader;
+std::unordered_map<RenderFormat, std::unique_ptr<RenderPipeline>> g_copyPipelines;
+// Single-sample copies of MSAA render targets, for converting resolves.
+std::unordered_map<const void*, std::unique_ptr<HostTexture>> g_resolveTemps;
 
 // Guest physical memory as the GPU sees it (512 MB): vertex data read by the
 // shaders and memory export targets, addressed like the console.
@@ -169,6 +176,7 @@ struct Upload {
 
 // Shaders created by the game, by guest object.
 struct GuestShader {
+  uint32_t container = 0;
   const ShaderCacheEntry* entry = nullptr;
   std::unique_ptr<RenderShader> shader;
   // Vertex shaders: usage and usage index of each declared element slot.
@@ -178,6 +186,31 @@ std::unordered_map<uint32_t, std::unique_ptr<GuestShader>> g_guestShaders;
 std::unique_ptr<uint8_t[]> g_spirvCache;
 
 std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> g_pipelines;
+
+// Guest textures by fetch constant, with the hash of their memory when last
+// uploaded (checked once per frame).
+struct CachedTexture {
+  std::unique_ptr<HostTexture> host;
+  uint64_t contentHash = 0;
+  uint64_t checkedFrame = ~0ull;
+};
+std::unordered_map<uint64_t, CachedTexture> g_textures;
+// Host textures replaced while a frame may still use them: freed once that
+// frame's fence has passed.
+std::vector<std::unique_ptr<HostTexture>> g_garbage[NUM_FRAMES];
+uint64_t g_frameCount = 0;
+
+// NG2_TRACE_FRAME=<n>: log what frame n draws.
+bool Tracing() {
+  static const int64_t frame = [] {
+    const char* v = std::getenv("NG2_TRACE_FRAME");
+    return v ? std::strtoll(v, nullptr, 10) : -1ll;
+  }();
+  return int64_t(g_frameCount) == frame;
+}
+
+std::unordered_map<uint64_t, std::pair<uint32_t, std::unique_ptr<RenderSampler>>> g_samplers;
+uint32_t g_nextSampler = SAMPLER_FIRST_FREE;
 
 // Render targets by EDRAM placement and shape.
 struct SurfaceKey {
@@ -298,6 +331,10 @@ RenderCommandList* CommandList() {
   if (!g_recording) {
     WaitForFrame(g_frame);
     g_uploads[g_frame].Reset();
+    for (auto& texture : g_garbage[g_frame]) {
+      g_descriptors.Free(texture->descriptor);
+    }
+    g_garbage[g_frame].clear();
     g_commandLists[g_frame]->begin();
     g_recording = true;
   }
@@ -425,6 +462,13 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
   return slot.get();
 }
 
+// Texture objects keep CPU virtual addresses in their fetch constant; the
+// device's fetch constants (SetTexture) hold physical ones. Same conversion
+// as D3D's (docs/d3d-map-c.md).
+uint32_t PhysicalAddress(uint32_t address) {
+  return (address & 0x1FFFFFFF) + (address >= 0xE0000000 ? 0x1000 : 0);
+}
+
 xenos::xe_gpu_texture_fetch_t ReadTextureFetch(uint32_t texture) {
   xenos::xe_gpu_texture_fetch_t fetch;
   uint32_t* dwords = &fetch.dword_0;
@@ -434,6 +478,63 @@ xenos::xe_gpu_texture_fetch_t ReadTextureFetch(uint32_t texture) {
   return fetch;
 }
 
+
+
+// Copies [x1, y1, x2, y2) of a render target to (dx, dy) in a resolve
+// destination, converting the format with a draw.
+void ResolveByDraw(HostTexture& source, HostTexture& dest, int32_t x1, int32_t y1, int32_t x2,
+                   int32_t y2, uint32_t dx, uint32_t dy) {
+  HostTexture* readable = &source;
+  if (source.samples != RenderSampleCount::COUNT_1) {
+    auto& temp = g_resolveTemps[&source];
+    if (!temp) {
+      temp = std::make_unique<HostTexture>();
+      temp->width = source.width;
+      temp->height = source.height;
+      temp->format = source.format;
+      temp->texture = g_device->createTexture(RenderTextureDesc::Texture2D(
+          source.width, source.height, 1, source.format, RenderTextureFlag::RENDER_TARGET));
+    }
+    Transition(source, RenderTextureLayout::RESOLVE_SOURCE);
+    Transition(*temp, RenderTextureLayout::RESOLVE_DEST);
+    RenderRect rect(x1, y1, x2, y2);
+    CommandList()->resolveTextureRegion(temp->texture.get(), x1, y1, source.texture.get(), &rect);
+    readable = temp.get();
+  }
+  SetDescriptor(*readable);
+  if (!readable->descriptor) {
+    return;
+  }
+  Transition(*readable, RenderTextureLayout::SHADER_READ);
+
+  auto& pipeline = g_copyPipelines[dest.format];
+  if (!pipeline) {
+    RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = g_pipelineLayout.get();
+    desc.vertexShader = g_fullscreenShader.get();
+    desc.pixelShader = g_copyShader.get();
+    desc.renderTargetFormat[0] = dest.format;
+    desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+    desc.renderTargetCount = 1;
+    pipeline = g_device->createGraphicsPipeline(desc);
+  }
+
+  BindFramebuffer(&dest, nullptr);
+  auto* commandList = CommandList();
+  RenderViewport viewport(float(dx), float(dy), float(x2 - x1), float(y2 - y1));
+  RenderRect scissor(int32_t(dx), int32_t(dy), int32_t(dx) + (x2 - x1), int32_t(dy) + (y2 - y1));
+  int32_t constants[3] = {int32_t(readable->descriptor), x1 - int32_t(dx), y1 - int32_t(dy)};
+  commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
+  commandList->setPipeline(pipeline.get());
+  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+  commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+  commandList->setGraphicsPushConstants(0, constants, 0, sizeof(constants));
+  commandList->setViewports(&viewport, 1);
+  commandList->setScissors(&scissor, 1);
+  commandList->drawInstanced(3, 1, 0, 0);
+}
 
 // Uploads ----------------------------------------------------------------------
 
@@ -511,6 +612,255 @@ RenderShader* GetHostShader(GuestShader& shader) {
     }
   }
   return shader.shader.get();
+}
+
+
+// Textures --------------------------------------------------------------------
+
+struct TextureFormatInfo {
+  RenderFormat format = RenderFormat::UNKNOWN;
+  uint32_t blockSize = 1;      // texels per block side
+  uint32_t bytesPerBlock = 0;
+};
+
+TextureFormatInfo GetTextureFormatInfo(xenos::TextureFormat format) {
+  using F = xenos::TextureFormat;
+  switch (format) {
+    case F::k_8: return {RenderFormat::R8_UNORM, 1, 1};
+    case F::k_8_8: return {RenderFormat::R8G8_UNORM, 1, 2};
+    case F::k_8_8_8_8:
+    case F::k_8_8_8_8_A:
+    case F::k_8_8_8_8_AS_16_16_16_16: return {RenderFormat::R8G8B8A8_UNORM, 1, 4};
+    case F::k_16: return {RenderFormat::R16_UNORM, 1, 2};
+    case F::k_16_16: return {RenderFormat::R16G16_UNORM, 1, 4};
+    case F::k_16_16_16_16: return {RenderFormat::R16G16B16A16_UNORM, 1, 8};
+    case F::k_16_FLOAT: return {RenderFormat::R16_FLOAT, 1, 2};
+    case F::k_16_16_FLOAT: return {RenderFormat::R16G16_FLOAT, 1, 4};
+    case F::k_16_16_16_16_FLOAT: return {RenderFormat::R16G16B16A16_FLOAT, 1, 8};
+    case F::k_32_FLOAT: return {RenderFormat::R32_FLOAT, 1, 4};
+    case F::k_32_32_FLOAT: return {RenderFormat::R32G32_FLOAT, 1, 8};
+    case F::k_32_32_32_32_FLOAT: return {RenderFormat::R32G32B32A32_FLOAT, 1, 16};
+    case F::k_DXT1: return {RenderFormat::BC1_UNORM, 4, 8};
+    case F::k_DXT2_3: return {RenderFormat::BC2_UNORM, 4, 16};
+    case F::k_DXT4_5: return {RenderFormat::BC3_UNORM, 4, 16};
+    case F::k_DXN: return {RenderFormat::BC5_UNORM, 4, 16};
+    case F::k_DXT5A: return {RenderFormat::BC4_UNORM, 4, 8};
+    default: return {};
+  }
+}
+
+// Address of block (x, y) in a tiled 2D texture, from Xenia
+// (texture_util.cc, after UModel's UnTexture.cpp).
+int32_t TiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bytesPerBlockLog2) {
+  pitch = (pitch + 31) & ~31u;
+  int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (bytesPerBlockLog2 + 7);
+  int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << bytesPerBlockLog2;
+  int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+
+void EndianSwap(uint8_t* data, size_t size, xenos::Endian endian) {
+  switch (endian) {
+    case xenos::Endian::k8in16:
+      for (size_t i = 0; i + 1 < size; i += 2) {
+        std::swap(data[i], data[i + 1]);
+      }
+      break;
+    case xenos::Endian::k8in32:
+      for (size_t i = 0; i + 3 < size; i += 4) {
+        std::swap(data[i], data[i + 3]);
+        std::swap(data[i + 1], data[i + 2]);
+      }
+      break;
+    case xenos::Endian::k16in32:
+      for (size_t i = 0; i + 3 < size; i += 4) {
+        std::swap(data[i], data[i + 2]);
+        std::swap(data[i + 1], data[i + 3]);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+RenderSwizzle ConvertSwizzle(uint32_t component) {
+  switch (component) {
+    case 0: return RenderSwizzle::R;
+    case 1: return RenderSwizzle::G;
+    case 2: return RenderSwizzle::B;
+    case 3: return RenderSwizzle::A;
+    case 4: return RenderSwizzle::ZERO;
+    default: return RenderSwizzle::ONE;
+  }
+}
+
+RenderTextureAddressMode ConvertClamp(xenos::ClampMode mode) {
+  switch (mode) {
+    case xenos::ClampMode::kRepeat: return RenderTextureAddressMode::WRAP;
+    case xenos::ClampMode::kMirroredRepeat: return RenderTextureAddressMode::MIRROR;
+    case xenos::ClampMode::kMirrorClampToEdge:
+    case xenos::ClampMode::kMirrorClampToHalfway: return RenderTextureAddressMode::MIRROR_ONCE;
+    case xenos::ClampMode::kClampToBorder:
+    case xenos::ClampMode::kMirrorClampToBorder: return RenderTextureAddressMode::BORDER;
+    default: return RenderTextureAddressMode::CLAMP;
+  }
+}
+
+uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  RenderSamplerDesc desc;
+  desc.addressU = ConvertClamp(fetch.clamp_x);
+  desc.addressV = ConvertClamp(fetch.clamp_y);
+  desc.addressW = ConvertClamp(fetch.clamp_z);
+  desc.magFilter = fetch.mag_filter == xenos::TextureFilter::kPoint ? RenderFilter::NEAREST
+                                                                    : RenderFilter::LINEAR;
+  desc.minFilter = fetch.min_filter == xenos::TextureFilter::kPoint ? RenderFilter::NEAREST
+                                                                    : RenderFilter::LINEAR;
+  desc.mipmapMode = fetch.mip_filter == xenos::TextureFilter::kLinear ? RenderMipmapMode::LINEAR
+                                                                       : RenderMipmapMode::NEAREST;
+  desc.maxLOD = 0.0f;  // base level only for now
+  uint64_t hash = XXH3_64bits(&desc, sizeof(desc));
+  auto& sampler = g_samplers[hash];
+  if (!sampler.second) {
+    if (g_nextSampler >= SAMPLER_DESCRIPTOR_COUNT) {
+      return SAMPLER_LINEAR_CLAMP;
+    }
+    sampler.first = g_nextSampler++;
+    sampler.second = g_device->createSampler(desc);
+    g_samplerDescriptorSet->setSampler(sampler.first, sampler.second.get());
+  }
+  return sampler.first;
+}
+
+// Uploads the base level of a guest texture: endian swap, untile.
+std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                           const TextureFormatInfo& info, uint32_t width,
+                                           uint32_t height, const uint8_t* guestData,
+                                           uint32_t guestSize) {
+  uint32_t blocksX = (width + info.blockSize - 1) / info.blockSize;
+  uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
+  uint32_t pitchBlocks = std::max((uint32_t(fetch.pitch) << 5) / info.blockSize, blocksX);
+  uint32_t bppLog2 = uint32_t(std::countr_zero(info.bytesPerBlock));
+
+  std::vector<uint8_t> swapped(guestData, guestData + guestSize);
+  EndianSwap(swapped.data(), swapped.size(), fetch.endianness);
+
+  uint64_t rowBytes = uint64_t(blocksX) * info.bytesPerBlock;
+  Upload upload = Allocate(rowBytes * blocksY, 16);
+  uint64_t linearRowBytes = (uint64_t(pitchBlocks) * info.bytesPerBlock + 255) & ~255ull;
+  for (uint32_t y = 0; y < blocksY; y++) {
+    uint8_t* row = upload.data + y * rowBytes;
+    if (fetch.tiled) {
+      for (uint32_t x = 0; x < blocksX; x++) {
+        int32_t offset = TiledOffset2D(int32_t(x), int32_t(y), pitchBlocks, bppLog2);
+        if (offset >= 0 && uint64_t(offset) + info.bytesPerBlock <= guestSize) {
+          std::memcpy(row + x * info.bytesPerBlock, swapped.data() + offset, info.bytesPerBlock);
+        }
+      }
+    } else if ((y + 1) * linearRowBytes <= guestSize) {
+      std::memcpy(row, swapped.data() + y * linearRowBytes, rowBytes);
+    }
+  }
+
+  // NG2_DUMP_TEXTURES=<dir>: write decoded 8-bit and 8888 textures (PGM/PAM).
+  static const char* dumpDir = std::getenv("NG2_DUMP_TEXTURES");
+  if (dumpDir && (info.format == RenderFormat::R8_UNORM ||
+                  info.format == RenderFormat::R8G8B8A8_UNORM)) {
+    bool gray = info.format == RenderFormat::R8_UNORM;
+    std::string path = fmt::format("{}/{:08x}_{}x{}.{}", dumpDir,
+                                   uint32_t(fetch.base_address) << 12, width, height,
+                                   gray ? "pgm" : "pam");
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+      if (gray) {
+        std::fprintf(f, "P5\n%u %u\n255\n", width, height);
+      } else {
+        std::fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
+                     width, height);
+      }
+      for (uint32_t y = 0; y < height; y++) {
+        std::fwrite(upload.data + y * rowBytes, 1, width * info.bytesPerBlock, f);
+      }
+      std::fclose(f);
+    }
+  }
+
+  auto host = std::make_unique<HostTexture>();
+  host->width = width;
+  host->height = height;
+  host->format = info.format;
+  host->texture =
+      g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, info.format));
+  Transition(*host, RenderTextureLayout::COPY_DEST);
+  CommandList()->copyTextureRegion(
+      RenderTextureCopyLocation::Subresource(host->texture.get()),
+      RenderTextureCopyLocation::PlacedFootprint(upload.buffer, info.format, width, height, 1,
+                                                 blocksX * info.blockSize, upload.offset));
+
+  RenderTextureViewDesc viewDesc;
+  viewDesc.format = info.format;
+  viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
+  viewDesc.mipLevels = 1;
+  viewDesc.componentMapping = RenderComponentMapping(
+      ConvertSwizzle(fetch.swizzle & 7), ConvertSwizzle((fetch.swizzle >> 3) & 7),
+      ConvertSwizzle((fetch.swizzle >> 6) & 7), ConvertSwizzle((fetch.swizzle >> 9) & 7));
+  host->view = host->texture->createTextureView(viewDesc);
+  host->descriptor = g_descriptors.Allocate();
+  if (host->descriptor) {
+    g_textureDescriptorSet->setTexture(host->descriptor, host->texture.get(),
+                                       RenderTextureLayout::SHADER_READ, host->view.get());
+  }
+  return host;
+}
+
+// Descriptor index for a texture fetch constant, 0 if it can't be sampled.
+uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  bool oneD = fetch.dimension == xenos::DataDimension::k1D;
+  if (!oneD && fetch.dimension != xenos::DataDimension::k2DOrStacked) {
+    return 0;  // 3D and cube textures: not yet
+  }
+  uint32_t base = uint32_t(fetch.base_address) << 12;
+
+  // Render-to-texture results live on the GPU.
+  if (auto it = g_resolvedTextures.find(base); it != g_resolvedTextures.end()) {
+    Transition(*it->second, RenderTextureLayout::SHADER_READ);
+    return it->second->descriptor;
+  }
+
+  TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
+  if (info.format == RenderFormat::UNKNOWN) {
+    return 0;
+  }
+  uint32_t width = oneD ? fetch.size_1d.width + 1 : fetch.size_2d.width + 1;
+  uint32_t height = oneD ? 1 : fetch.size_2d.height + 1;
+  uint32_t blocksX = (width + info.blockSize - 1) / info.blockSize;
+  uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
+  uint32_t pitchBlocks = std::max((uint32_t(fetch.pitch) << 5) / info.blockSize, blocksX);
+  uint64_t guestSize =
+      fetch.tiled ? uint64_t((pitchBlocks + 31) & ~31u) * ((blocksY + 31) & ~31u) * info.bytesPerBlock
+                  : ((uint64_t(pitchBlocks) * info.bytesPerBlock + 255) & ~255ull) * blocksY;
+  if (guestSize == 0 || base + guestSize > GUEST_MEMORY_SIZE) {
+    return 0;
+  }
+
+  // Shape and view: dwords 0-2 and the swizzle; sampler fields don't matter.
+  uint32_t keyData[4] = {fetch.dword_0 & ~0x3FFFFFu, fetch.dword_1, fetch.dword_2,
+                         uint32_t(fetch.swizzle)};
+  uint64_t key = XXH3_64bits(keyData, sizeof(keyData));
+  auto& cached = g_textures[key];
+  if (cached.checkedFrame != g_frameCount) {
+    cached.checkedFrame = g_frameCount;
+    const uint8_t* data = guest::Physical(base);
+    uint64_t hash = XXH3_64bits(data, guestSize);
+    if (!cached.host || hash != cached.contentHash) {
+      if (cached.host) {
+        g_garbage[g_frame].push_back(std::move(cached.host));
+      }
+      cached.host = CreateTexture(fetch, info, width, height, data, uint32_t(guestSize));
+      cached.contentHash = hash;
+    }
+  }
+  Transition(*cached.host, RenderTextureLayout::SHADER_READ);
+  return cached.host->descriptor;
 }
 
 // Device state ----------------------------------------------------------------
@@ -743,8 +1093,104 @@ RenderPipeline* GetPipeline(const PipelineKey& key) {
   return pipeline.get();
 }
 
+// A draw with everything captured, ready to record.
+struct DrawRecord {
+  RenderPipeline* pipeline = nullptr;
+  HostTexture* target = nullptr;
+  HostTexture* depth = nullptr;
+  RenderViewport viewport;
+  RenderRect scissor;
+  uint64_t pushConstants[3] = {};
+  bool indexed = false;
+  std::optional<RenderIndexBufferView> indexView;
+  uint32_t drawCount = 0;
+  uint32_t startVertex = 0;
+};
+
+// BeginVertices / BeginIndexedVertices hand the game a pointer into the
+// command ring and the game writes the data after the call: the draw is
+// captured at Begin and recorded at the next hooked call.
+struct InlineData {
+  uint32_t vertexAddress = 0;  // guest virtual
+  uint32_t vertexBytes = 0;
+  uint32_t stride = 0;         // bytes
+  uint32_t indexAddress = 0;   // guest virtual, 0 if not indexed
+  uint32_t indexCount = 0;
+  bool wideIndices = false;
+};
+struct PendingDraw {
+  DrawRecord record;
+  InlineData data;
+};
+std::optional<PendingDraw> g_pendingDraw;
+
+void SubmitDraw(DrawRecord& record) {
+  BindFramebuffer(record.target, record.depth);
+  auto* commandList = CommandList();
+  commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
+  commandList->setPipeline(record.pipeline);
+  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+  commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+  commandList->setGraphicsPushConstants(0, record.pushConstants, 0, sizeof(record.pushConstants));
+  commandList->setViewports(&record.viewport, 1);
+  commandList->setScissors(&record.scissor, 1);
+  if (record.indexed) {
+    commandList->setIndexBuffer(&*record.indexView);
+    commandList->drawIndexedInstanced(record.drawCount, 1, 0, int32_t(record.startVertex), 0);
+  } else {
+    commandList->drawInstanced(record.drawCount, 1, record.startVertex, 0);
+  }
+  // Memory export results feed later draws.
+  commandList->barriers(RenderBarrierStage::GRAPHICS,
+                        RenderBufferBarrier(g_guestMemory.get(),
+                                            RenderBufferAccess::READ | RenderBufferAccess::WRITE));
+}
+
+template <typename T>
+void SwapIndices(uint8_t* out, const uint8_t* in, uint32_t count) {
+  for (uint32_t i = 0; i < count; i++) {
+    reinterpret_cast<T*>(out)[i] = rex::byte_swap(reinterpret_cast<const T*>(in)[i]);
+  }
+}
+
+void FlushPendingDraw() {
+  if (!g_pendingDraw) {
+    return;
+  }
+  PendingDraw pending = std::move(*g_pendingDraw);
+  g_pendingDraw.reset();
+  auto& data = pending.data;
+  SyncGuestMemory(PhysicalAddress(data.vertexAddress), data.vertexBytes);
+  if (Tracing()) {
+    const uint32_t* v = reinterpret_cast<const uint32_t*>(guest::Virtual(data.vertexAddress));
+    REXLOG_INFO("  inline vertices at {:#x} ({} bytes): {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                data.vertexAddress, data.vertexBytes, rex::byte_swap(v[0]), rex::byte_swap(v[1]),
+                rex::byte_swap(v[2]), rex::byte_swap(v[3]), rex::byte_swap(v[4]),
+                rex::byte_swap(v[5]));
+  }
+  if (data.indexAddress) {
+    uint32_t indexSize = data.wideIndices ? 4 : 2;
+    Upload indices = Allocate(uint64_t(data.indexCount) * indexSize, 16);
+    const uint8_t* source = guest::Virtual(data.indexAddress);
+    if (data.wideIndices) {
+      SwapIndices<uint32_t>(indices.data, source, data.indexCount);
+    } else {
+      SwapIndices<uint16_t>(indices.data, source, data.indexCount);
+    }
+    pending.record.indexView = RenderIndexBufferView(
+        RenderBufferReference(indices.buffer, indices.offset), data.indexCount * indexSize,
+        data.wideIndices ? RenderFormat::R32_UINT : RenderFormat::R16_UINT);
+    pending.record.indexed = true;
+  }
+  SubmitDraw(pending.record);
+}
+
+// Captures a draw from the device state; records it now, or keeps it for
+// FlushPendingDraw when the data comes inline.
 void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
-          bool indexed, uint32_t startIndex) {
+          bool indexed, uint32_t startIndex, const InlineData* inlineData = nullptr) {
   auto findShader = [](uint32_t object) -> GuestShader* {
     auto it = g_guestShaders.find(object);
     return it != g_guestShaders.end() ? it->second.get() : nullptr;
@@ -790,6 +1236,30 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   for (uint32_t i = 0; i < 8; i++) {
     shared.booleans[i] = guest::Load32(device + 0x2780 + i * 4);
   }
+  // Textures: the 32 fetch constants that hold one (24 bytes each).
+  for (uint32_t slot = 0; slot < 32; slot++) {
+    if ((guest::Load32(device + 0x480 + slot * 24) & 3) !=
+        uint32_t(xenos::FetchConstantType::kTexture)) {
+      continue;
+    }
+    xenos::xe_gpu_texture_fetch_t fetch;
+    uint32_t* dwords = &fetch.dword_0;
+    for (uint32_t i = 0; i < 6; i++) {
+      dwords[i] = guest::Load32(device + 0x480 + slot * 24 + i * 4);
+    }
+    uint32_t descriptor = GetTexture(fetch);
+    if (Tracing()) {
+      REXLOG_INFO("  tex {} fmt {} {}x{} base {:#x} tiled {} endian {} dim {} -> {}", slot,
+                  uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
+                  uint32_t(fetch.base_address) << 12, uint32_t(fetch.tiled),
+                  uint32_t(fetch.endianness), uint32_t(fetch.dimension), descriptor);
+    }
+    if (descriptor) {
+      shared.textureIndices[0][slot] = descriptor;  // 2D
+      shared.textureIndices[3][slot] = descriptor;  // 1D (sampled as Nx1 2D)
+      shared.samplerIndices[slot] = GetSampler(fetch);
+    }
+  }
   reg::RB_COLORCONTROL colorControl;
   colorControl.value = Register(device, 0x2202);
   shared.alphaThreshold = RegisterFloat(device, 0x210E);
@@ -798,9 +1268,18 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     shared.vertexFetch[i][0] = guest::Load32(device + 0x480 + i * 8);
     shared.vertexFetch[i][1] = guest::Load32(device + 0x480 + i * 8 + 4);
   }
+  if (inlineData) {
+    // Inline data is stream 0; D3D puts its fetch constant in the command
+    // stream, not in the device.
+    shared.vertexFetch[95][0] = PhysicalAddress(inlineData->vertexAddress) |
+                                uint32_t(xenos::FetchConstantType::kVertex);
+    shared.vertexFetch[95][1] = ((inlineData->vertexBytes / 4) << 2) |
+                                uint32_t(xenos::Endian::k8in32);
+  }
 
-  // Vertex data the shaders read: every valid vertex fetch constant.
-  for (uint32_t i = 0; i < 96; i++) {
+  // Vertex data the shaders read: every valid vertex fetch constant (inline
+  // data is synced when it has been written).
+  for (uint32_t i = 0; i < (inlineData ? 95u : 96u); i++) {
     uint32_t word0 = shared.vertexFetch[i][0];
     uint32_t word1 = shared.vertexFetch[i][1];
     if ((word0 & 3) != uint32_t(xenos::FetchConstantType::kVertex)) {
@@ -829,7 +1308,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
         }
         uint32_t stream = streamOffset >> 16;
         uint32_t offset = streamOffset & 0xFFFF;
-        uint32_t stride = guest::Load32(device + 0x30E8 + (stream & ~3)) >> (24 - 8 * (stream & 3)) & 0xFF;
+        uint32_t stride = (inlineData && stream == 0)
+                              ? inlineData->stride / 4
+                              : guest::Virtual(device + 0x30E8 + stream)[0];
         shared.vertexElements[slot][0] = 95 - stream;
         shared.vertexElements[slot][1] = offset / 4;
         shared.vertexElements[slot][2] = stride;
@@ -854,8 +1335,11 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                               2.0f * std::fabs(xScale), 2.0f * std::fabs(yScale),
                               std::min(zOffset, zOffset + zScale),
                               std::max(zOffset, zOffset + zScale));
+    // The viewport above is always top-down; mirror here instead when the
+    // guest's scales are negative (vertex shaders are compiled with
+    // -fvk-invert-y, which matches a positive Y scale).
     shared.ndcTransform[0] = xScale < 0 ? -1.0f : 1.0f;
-    shared.ndcTransform[1] = yScale > 0 ? -1.0f : 1.0f;
+    shared.ndcTransform[1] = yScale < 0 ? -1.0f : 1.0f;
   } else {
     // Window coordinates: map pixels to NDC over the whole target.
     shared.ndcTransform[0] = 2.0f / targetWidth;
@@ -882,7 +1366,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   uint32_t drawCount = count;
   std::optional<RenderIndexBufferView> indexView;
   auto primitiveType = xenos::PrimitiveType(primitive);
-  if (indexed) {
+  if (inlineData && indexed) {
+    // Indices arrive later (FlushPendingDraw).
+  } else if (indexed) {
     uint32_t indexBuffer = guest::Load32(device + 0x308C);
     if (!indexBuffer) {
       return;
@@ -893,15 +1379,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     Upload indices = Allocate(uint64_t(count) * indexSize, 16);
     const uint8_t* source = guest::Physical(address + startIndex * indexSize);
     if (wide) {
-      for (uint32_t i = 0; i < count; i++) {
-        reinterpret_cast<uint32_t*>(indices.data)[i] =
-            rex::byte_swap(reinterpret_cast<const uint32_t*>(source)[i]);
-      }
+      SwapIndices<uint32_t>(indices.data, source, count);
     } else {
-      for (uint32_t i = 0; i < count; i++) {
-        reinterpret_cast<uint16_t*>(indices.data)[i] =
-            rex::byte_swap(reinterpret_cast<const uint16_t*>(source)[i]);
-      }
+      SwapIndices<uint16_t>(indices.data, source, count);
     }
     indexView = RenderIndexBufferView(RenderBufferReference(indices.buffer, indices.offset),
                                       count * indexSize,
@@ -942,29 +1422,41 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     return;
   }
 
-  BindFramebuffer(target, depth);
-  auto* commandList = CommandList();
-  RenderRect scissor(0, 0, int32_t(targetWidth), int32_t(targetHeight));
-  uint64_t pushConstants[3] = {vsConstants.address, psConstants.address, sharedUpload.address};
-  commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
-  commandList->setPipeline(pipeline);
-  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
-  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
-  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
-  commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
-  commandList->setGraphicsPushConstants(0, pushConstants, 0, sizeof(pushConstants));
-  commandList->setViewports(&viewport, 1);
-  commandList->setScissors(&scissor, 1);
-  if (indexed) {
-    commandList->setIndexBuffer(&*indexView);
-    commandList->drawIndexedInstanced(drawCount, 1, 0, int32_t(startVertex), 0);
-  } else {
-    commandList->drawInstanced(drawCount, 1, startVertex, 0);
+  if (Tracing()) {
+    for (size_t slot = 0; slot < vs->elements.size(); slot++) {
+      REXLOG_INFO("  element {} usage {}/{}: fetch {} offset {} stride {} flags {:#x}", slot,
+                  vs->elements[slot].first, vs->elements[slot].second,
+                  shared.vertexElements[slot][0], shared.vertexElements[slot][1],
+                  shared.vertexElements[slot][2], shared.vertexElements[slot][3]);
+    }
+    REXLOG_INFO("  fetch95 {:08x} {:08x} vs container {:#x} ps container {:#x}",
+                shared.vertexFetch[95][0], shared.vertexFetch[95][1], vs->container,
+                ps->container);
+    REXLOG_INFO("draw prim {} count {} indexed {} vs {:016X} ps {:016X} target {}x{} fmt {} "
+                "blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {}",
+                primitive, count, indexed, vs->entry->hash, ps->entry->hash,
+                sizeSource->width, sizeSource->height, uint32_t(sizeSource->format),
+                key.blendControl, key.depthControl, vte.value, viewport.x, viewport.y,
+                viewport.width, viewport.height);
   }
-  // Memory export results feed later draws.
-  commandList->barriers(RenderBarrierStage::GRAPHICS,
-                        RenderBufferBarrier(g_guestMemory.get(),
-                                            RenderBufferAccess::READ | RenderBufferAccess::WRITE));
+  DrawRecord record;
+  record.pipeline = pipeline;
+  record.target = target;
+  record.depth = depth;
+  record.viewport = viewport;
+  record.scissor = RenderRect(0, 0, int32_t(targetWidth), int32_t(targetHeight));
+  record.pushConstants[0] = vsConstants.address;
+  record.pushConstants[1] = psConstants.address;
+  record.pushConstants[2] = sharedUpload.address;
+  record.indexed = indexed;
+  record.indexView = indexView;
+  record.drawCount = drawCount;
+  record.startVertex = startVertex;
+  if (inlineData) {
+    g_pendingDraw = PendingDraw{std::move(record), *inlineData};
+  } else {
+    SubmitDraw(record);
+  }
 }
 
 // Present ---------------------------------------------------------------------
@@ -1055,6 +1547,7 @@ void Present(HostTexture* frontBuffer) {
   }
 
   g_frame = (g_frame + 1) % NUM_FRAMES;
+  g_frameCount++;
 }
 
 // Setup -----------------------------------------------------------------------
@@ -1193,6 +1686,7 @@ void CreatePipelines() {
   g_presentPipeline = g_device->createGraphicsPipeline(desc);
 
   g_rectListShader = CreateShader(g_rect_list_gs, g_rect_list_gs_size);
+  g_copyShader = CreateShader(g_copy_ps, g_copy_ps_size);
 
   g_guestMemory = g_device->createBuffer(RenderBufferDesc::DefaultBuffer(
       GUEST_MEMORY_SIZE, RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE));
@@ -1260,10 +1754,18 @@ void DestroyHostDevice() {
   }
   g_pipelines.clear();
   g_guestShaders.clear();
+  g_textures.clear();
+  for (auto& garbage : g_garbage) {
+    garbage.clear();
+  }
+  g_samplers.clear();
   for (auto& allocator : g_uploads) {
     allocator.chunks.clear();
   }
   g_guestMemory.reset();
+  g_resolveTemps.clear();
+  g_copyPipelines.clear();
+  g_copyShader.reset();
   g_rectListShader.reset();
   g_framebuffers.clear();
   g_surfaces.clear();
@@ -1302,6 +1804,7 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
   if (!g_device) {
     return;
   }
+  FlushPendingDraw();
   HostTexture* target = GetSurface(guest::Load32(device + guest::device::kRenderTargets), false);
   HostTexture* depth = GetSurface(guest::Load32(device + guest::device::kDepthStencil), true);
   // 360 flags: 0x1-0x8 render targets 0-3, 0x10 Z, 0x20 stencil.
@@ -1354,17 +1857,25 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
   if (!g_device) {
     return;
   }
+  FlushPendingDraw();
   uint32_t source = flags & 7;
   bool depth = source == 4;
   uint32_t surface = depth ? guest::Load32(device + guest::device::kDepthStencil)
                            : guest::Load32(device + guest::device::kRenderTargets + source * 4);
   HostTexture* target = GetSurface(surface, depth);
+  if (Tracing()) {
+    REXLOG_INFO("resolve flags {:#x} from {} to {:#x}", flags,
+                target ? fmt::format("{}x{} fmt {}", target->width, target->height,
+                                     uint32_t(target->format))
+                       : std::string("none"),
+                destTexture ? uint32_t(ReadTextureFetch(destTexture).base_address) << 12 : 0u);
+  }
 
   if (target && destTexture && !depth) {
     auto fetch = ReadTextureFetch(destTexture);
-    uint32_t address = uint32_t(fetch.base_address) << 12;
+    uint32_t address = PhysicalAddress(uint32_t(fetch.base_address) << 12);
     HostTexture* dest = GetResolveDestination(address, fetch);
-    if (dest && dest->format == target->format) {
+    if (dest) {
       int32_t x1 = 0, y1 = 0, x2 = int32_t(target->width), y2 = int32_t(target->height);
       if (sourceRect) {
         x1 = guest::LoadS32(sourceRect);
@@ -1382,7 +1893,9 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
       } else {
         x2 = x1;
       }
-      if (x2 > x1 && y2 > y1) {
+      if (x2 > x1 && y2 > y1 && dest->format != target->format) {
+        ResolveByDraw(*target, *dest, x1, y1, x2, y2, dx, dy);
+      } else if (x2 > x1 && y2 > y1) {
         if (target->samples != RenderSampleCount::COUNT_1) {
           Transition(*target, RenderTextureLayout::RESOLVE_SOURCE);
           Transition(*dest, RenderTextureLayout::RESOLVE_DEST);
@@ -1397,12 +1910,6 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
               RenderTextureCopyLocation::Subresource(dest->texture.get()),
               RenderTextureCopyLocation::Subresource(target->texture.get()), dx, dy, 0, &box);
         }
-      }
-    } else if (dest) {
-      static bool warned = false;
-      if (!warned) {
-        warned = true;
-        REXLOG_WARN("video: resolve between different formats not done yet");
       }
     }
   }
@@ -1434,6 +1941,7 @@ void OnCreateShader(uint32_t object, uint32_t container, bool pixel) {
   uint32_t size = guest::Load32(container + 4) + guest::Load32(container + 8);
   uint64_t hash = XXH3_64bits(guest::Virtual(container), size);
   auto shader = std::make_unique<GuestShader>();
+  shader->container = container;
   shader->entry = FindShaderCacheEntry(hash);
   if (!shader->entry) {
     REXLOG_WARN("video: {} shader {:016X} at {:#x} is not in the shader cache",
@@ -1458,7 +1966,40 @@ void OnDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t 
   if (!g_device) {
     return;
   }
+  FlushPendingDraw();
   Draw(device, primitive, startVertex, count, indexed, startIndex);
+}
+
+void OnBeginVertices(uint32_t device, uint32_t primitive, uint32_t vertexCount, uint32_t stride,
+                     uint32_t vertexData) {
+  std::lock_guard lock(g_mutex);
+  if (!g_device || !vertexData) {
+    return;
+  }
+  FlushPendingDraw();
+  InlineData data;
+  data.vertexAddress = vertexData;
+  data.vertexBytes = vertexCount * stride;
+  data.stride = stride;
+  Draw(device, primitive, 0, vertexCount, false, 0, &data);
+}
+
+void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseVertex,
+                            uint32_t vertexCount, uint32_t indexCount, bool wideIndices,
+                            uint32_t stride, uint32_t indexData, uint32_t vertexData) {
+  std::lock_guard lock(g_mutex);
+  if (!g_device || !vertexData || !indexData) {
+    return;
+  }
+  FlushPendingDraw();
+  InlineData data;
+  data.vertexAddress = vertexData;
+  data.vertexBytes = vertexCount * stride;
+  data.stride = stride;
+  data.indexAddress = indexData;
+  data.indexCount = indexCount;
+  data.wideIndices = wideIndices;
+  Draw(device, primitive, baseVertex, indexCount, true, 0, &data);
 }
 
 void OnSwap(uint32_t device, uint32_t frontBuffer) {
@@ -1467,10 +2008,11 @@ void OnSwap(uint32_t device, uint32_t frontBuffer) {
   if (!g_device) {
     return;
   }
+  FlushPendingDraw();
   HostTexture* front = nullptr;
   if (frontBuffer) {
     auto fetch = ReadTextureFetch(frontBuffer);
-    auto it = g_resolvedTextures.find(uint32_t(fetch.base_address) << 12);
+    auto it = g_resolvedTextures.find(PhysicalAddress(uint32_t(fetch.base_address) << 12));
     if (it != g_resolvedTextures.end()) {
       front = it->second.get();
     }

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <rex/cvar.h>
 #include <rex/rex_app.h>
 #include <rex/system.h>
 #include <rex/system/gpu_plugin.h>
@@ -31,6 +32,15 @@ class Ng2App : public rex::ReXApp {
     const char* config = std::getenv("NG2_CONFIG");
     if (config && *config) {
       paths.config_path = config;
+    }
+  }
+
+  // Game-specific defaults (from Xenia's compatibility notes for 544307D5),
+  // unless the user set them: the game reads the zero page.
+  void OnPostInitLogging() override {
+    const auto* info = rex::cvar::GetFlagInfo("protect_zero");
+    if (info && info->source == rex::cvar::Source::kDefault) {
+      rex::cvar::SetFlagByName("protect_zero", "false");
     }
   }
 

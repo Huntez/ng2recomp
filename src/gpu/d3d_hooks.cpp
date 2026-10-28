@@ -76,7 +76,11 @@ REX_HOOK_RAW(sub_8373CB08) {
 REX_EXTERN(__imp__sub_8373BD50);
 REX_HOOK_RAW(sub_8373BD50) {
   g_counters.draws++;
+  uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
   __imp__sub_8373BD50(ctx, base);
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::video::OnBeginVertices(device, primitive, count, stride, ctx.r3.u32);
+  }
 }
 
 // BeginIndexedVertices(dev, prim type, base vertex, vertex count, index
@@ -84,7 +88,17 @@ REX_HOOK_RAW(sub_8373BD50) {
 REX_EXTERN(__imp__sub_8373C1F0);
 REX_HOOK_RAW(sub_8373C1F0) {
   g_counters.draws++;
+  uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, baseVertex = ctx.r5.u32;
+  uint32_t vertexCount = ctx.r6.u32, indexCount = ctx.r7.u32, indexFormat = ctx.r8.u32;
+  uint32_t stride = ctx.r9.u32, indexDataOut = ctx.r10.u32;
+  uint32_t vertexDataOut = ng2::guest::Load32(ctx.r1.u32 + 84);  // 9th argument
   __imp__sub_8373C1F0(ctx, base);
+  if (ng2::video::IsNativeRenderer() && ctx.r3.s32 >= 0 && indexDataOut && vertexDataOut) {
+    ng2::video::OnBeginIndexedVertices(device, primitive, baseVertex, vertexCount, indexCount,
+                                       (indexFormat & 4) != 0, stride,
+                                       ng2::guest::Load32(indexDataOut),
+                                       ng2::guest::Load32(vertexDataOut));
+  }
 }
 
 // CreateVertexShader(const DWORD* function) -> D3DVertexShader*

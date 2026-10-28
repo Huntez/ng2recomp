@@ -28,5 +28,12 @@ void OnSwap(uint32_t device, uint32_t frontBuffer);
 void OnCreateShader(uint32_t object, uint32_t container, bool pixel);
 void OnDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
             bool indexed, uint32_t startIndex);
+// Immediate-mode draws: the game writes the data into the returned memory
+// after the call; the draw is recorded at the next hooked call.
+void OnBeginVertices(uint32_t device, uint32_t primitive, uint32_t vertexCount, uint32_t stride,
+                     uint32_t vertexData);
+void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseVertex,
+                            uint32_t vertexCount, uint32_t indexCount, bool wideIndices,
+                            uint32_t stride, uint32_t indexData, uint32_t vertexData);
 
 }  // namespace ng2::video
