@@ -1,4 +1,4 @@
-From f9422ec2636600b6fa53facb727c31f42455d85d Mon Sep 17 00:00:00 2001
+From b2abde9acc967e78d2883c642524b2a80372fc33 Mon Sep 17 00:00:00 2001
 From: gambuzino24 <gambuzino24@gmail.com>
 Date: Wed, 28 Oct 2026 14:18:02 +0000
 Subject: [PATCH] Support Ninja Gaiden II shaders
@@ -22,10 +22,10 @@ Subject: [PATCH] Support Ninja Gaiden II shaders
 The DXIL (D3D12) path is not updated for the new shared constant layout.
 ---
  XenosRecomp/main.cpp              |  18 +-
- XenosRecomp/shader_common.h       | 345 ++++++++++++++++++++++++++++--
- XenosRecomp/shader_recompiler.cpp | 206 ++++++++++++++++--
+ XenosRecomp/shader_common.h       | 346 ++++++++++++++++++++++++++++--
+ XenosRecomp/shader_recompiler.cpp | 209 ++++++++++++++++--
  XenosRecomp/shader_recompiler.h   |   5 +
- 4 files changed, 544 insertions(+), 30 deletions(-)
+ 4 files changed, 548 insertions(+), 30 deletions(-)
 
 diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
 index d015145..3d16fc4 100644
@@ -73,10 +73,18 @@ index d015145..3d16fc4 100644
  
          StringBuffer f;
 diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
-index 1c74034..eac681a 100644
+index 1c74034..ba90b4c 100644
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -26,10 +26,27 @@ struct PushConstants
+@@ -3,6 +3,7 @@
+ 
+ #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
+ #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
++#define SPEC_CONSTANT_MEMEXPORT         (1 << 5)
+ 
+ #ifdef UNLEASHED_RECOMP
+     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
+@@ -26,10 +27,27 @@ struct PushConstants
  
  [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
  
@@ -108,7 +116,7 @@ index 1c74034..eac681a 100644
  
  [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
  
-@@ -38,15 +55,23 @@ struct PushConstants
+@@ -38,15 +56,23 @@ struct PushConstants
  #else
  
  #define DEFINE_SHARED_CONSTANTS() \
@@ -136,7 +144,7 @@ index 1c74034..eac681a 100644
  Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
  Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
  TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
-@@ -62,7 +87,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+@@ -62,7 +88,13 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
  float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
  {
      Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
@@ -151,7 +159,7 @@ index 1c74034..eac681a 100644
  }
  
  float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
-@@ -135,17 +166,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+@@ -135,17 +167,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
      float h1y = h1(fy);
  
      float4 r =
@@ -174,7 +182,7 @@ index 1c74034..eac681a 100644
  }
  
  struct CubeMapData
-@@ -156,7 +187,7 @@ struct CubeMapData
+@@ -156,7 +188,7 @@ struct CubeMapData
  
  float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
  {
@@ -183,7 +191,7 @@ index 1c74034..eac681a 100644
  }
  
  float4 tfetchR11G11B10(uint4 value)
-@@ -217,6 +248,290 @@ float computeMipLevel(float2 pixelCoord)
+@@ -217,6 +249,290 @@ float computeMipLevel(float2 pixelCoord)
      return max(0.0, 0.5 * log2(deltaMaxSqr));
  }
  
@@ -475,7 +483,7 @@ index 1c74034..eac681a 100644
  
  #endif
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..3e6f57c 100644
+index 698a418..21a0bd6 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -75,6 +75,7 @@ struct DeclUsageLocation
@@ -616,7 +624,7 @@ index 698a418..3e6f57c 100644
      case TextureDimension::Texture2D:
          print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
          break;
-@@ -360,6 +441,25 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+@@ -360,6 +441,28 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
      }
  }
  
@@ -630,6 +638,9 @@ index 698a418..3e6f57c 100644
 +        return "";
 +
 +    hasMemExport = true;
++    // Bit 5 of the spec constants mask (unused by the shaders) tells the
++    // renderer the shader writes memory.
++    specConstantsMask |= SPEC_CONSTANT_MEMEXPORT;
 +    indent();
 +    if (exportRegister == 32)
 +        out += "memExport(eA, eM0, eM1, eM2, eM3, eM4, eMWritten); eMWritten = 0;\n";
@@ -642,7 +653,7 @@ index 698a418..3e6f57c 100644
  void ShaderRecompiler::recompile(const AluInstruction& instr)
  {
      if (instr.isPredicated)
-@@ -599,6 +699,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -599,6 +702,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
              case ExportRegister::PSDepth:
                  exportRegister = "oDepth";
                  break;
@@ -652,7 +663,7 @@ index 698a418..3e6f57c 100644
              }
          }
          else
-@@ -625,6 +728,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -625,6 +731,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
  
              default:
              {
@@ -663,7 +674,7 @@ index 698a418..3e6f57c 100644
                  auto findResult = interpolators.find(instr.vectorDest);
                  assert(findResult != interpolators.end());
                  exportRegister = findResult->second;
-@@ -1105,6 +1212,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1105,6 +1215,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
      assert(shaderContainer->constantTableOffset != NULL);
  
@@ -674,7 +685,7 @@ index 698a418..3e6f57c 100644
      out += include;
      out += '\n';
  
-@@ -1174,11 +1285,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1174,11 +1288,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
              {
                  println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
@@ -688,7 +699,7 @@ index 698a418..3e6f57c 100644
  
              samplers.emplace(constantInfo->registerIndex, constantName);
              break;
-@@ -1187,6 +1298,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1187,6 +1301,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          }
      }
  
@@ -706,7 +717,7 @@ index 698a418..3e6f57c 100644
      out += "\n#else\n\n";
  
      println("cbuffer {}ShaderConstants : register(b{}, space4)", isPixelShader ? "Pixel" : "Vertex", isPixelShader ? 1 : 0);
-@@ -1254,8 +1376,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1254,8 +1379,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          if (constantInfo->registerSet == RegisterSet::Bool)
          {
              const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
@@ -718,7 +729,7 @@ index 698a418..3e6f57c 100644
          }
      }
  
-@@ -1301,7 +1424,24 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1301,7 +1427,24 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      }
      else
      {
@@ -743,7 +754,7 @@ index 698a418..3e6f57c 100644
          for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
          {
              union
-@@ -1338,6 +1478,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1338,6 +1481,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
              vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
          }
@@ -751,7 +762,7 @@ index 698a418..3e6f57c 100644
  
      #ifdef UNLEASHED_RECOMP
          if (hasIndexCount)
-@@ -1345,6 +1486,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1345,6 +1489,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              out += "\tin uint iVertexId : SV_VertexID,\n";
              out += "\tin uint iInstanceId : SV_InstanceID,\n";
          }
@@ -760,7 +771,7 @@ index 698a418..3e6f57c 100644
      #endif
  
          out += "\tout float4 oPos : SV_Position";
-@@ -1471,6 +1614,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1471,6 +1617,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              {
                  out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
              }
@@ -773,7 +784,7 @@ index 698a418..3e6f57c 100644
          #endif
              else
              {
-@@ -1482,6 +1631,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1482,6 +1634,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      out += "\tint a0 = 0;\n";
      out += "\tint aL = 0;\n";
      out += "\tbool p0 = false;\n";
@@ -784,7 +795,7 @@ index 698a418..3e6f57c 100644
      out += "\tfloat ps = 0.0;\n";
      if (isPixelShader)
      {
-@@ -1630,7 +1783,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1630,7 +1786,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  address = cfInstr.condExec.address;
                  count = cfInstr.condExec.count;
                  sequence = cfInstr.condExec.sequence;
@@ -793,7 +804,7 @@ index 698a418..3e6f57c 100644
                  break;
  
              case ControlFlowOpcode::CondExecPred:
-@@ -1694,11 +1847,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1694,11 +1850,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                      }
                      else
                      {
@@ -807,7 +818,7 @@ index 698a418..3e6f57c 100644
                      }
  
                      if (simpleControlFlow)
-@@ -1719,6 +1869,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1719,6 +1872,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
              }
              }
  
@@ -831,7 +842,7 @@ index 698a418..3e6f57c 100644
              auto instructionCode = code + address * 3;
              
              for (uint32_t i = 0; i < count; i++)
-@@ -1792,6 +1959,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1792,6 +1962,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  instructionCode += 3;
              }
  
@@ -845,7 +856,7 @@ index 698a418..3e6f57c 100644
              if (shouldReturn)
              {
                  if (isPixelShader)
-@@ -1830,12 +2004,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1830,12 +2007,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                  {
                  #ifdef UNLEASHED_RECOMP
                      if (!hasMtxProjection)

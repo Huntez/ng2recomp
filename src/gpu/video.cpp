@@ -154,6 +154,7 @@ std::unordered_map<uint64_t, uint64_t> g_guestMemoryHashes;
 constexpr uint64_t UPLOAD_CHUNK_SIZE = 32ull << 20;
 struct UploadChunk {
   std::unique_ptr<RenderBuffer> buffer;
+  uint64_t size = 0;
   uint8_t* data = nullptr;
   uint64_t address = 0;
 };
@@ -178,12 +179,14 @@ struct Upload {
 struct GuestShader {
   uint32_t container = 0;
   const ShaderCacheEntry* entry = nullptr;
-  std::unique_ptr<RenderShader> shader;
   // Vertex shaders: usage and usage index of each declared element slot.
   std::vector<std::pair<uint8_t, uint8_t>> elements;
 };
 std::unordered_map<uint32_t, std::unique_ptr<GuestShader>> g_guestShaders;
 std::unique_ptr<uint8_t[]> g_spirvCache;
+// Host shaders by cache entry: they live as long as the device, so pipelines
+// can refer to them.
+std::unordered_map<const ShaderCacheEntry*, std::unique_ptr<RenderShader>> g_hostShaders;
 
 std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> g_pipelines;
 
@@ -245,6 +248,25 @@ struct FramebufferKeyHash {
 };
 std::unordered_map<FramebufferKey, std::unique_ptr<RenderFramebuffer>, FramebufferKeyHash>
     g_framebuffers;
+
+// The framebuffer last set on the command list (plume resumes it after
+// barriers and copies end the render pass).
+const RenderFramebuffer* g_boundFramebuffer = nullptr;
+
+// Drops cached framebuffers that use a texture about to be freed.
+void ForgetTexture(const HostTexture* texture) {
+  for (auto it = g_framebuffers.begin(); it != g_framebuffers.end();) {
+    if (it->first.color == texture || it->first.depth == texture) {
+      if (g_boundFramebuffer == it->second.get()) {
+        g_boundFramebuffer = nullptr;
+      }
+      it = g_framebuffers.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 
 // Formats ---------------------------------------------------------------------
 
@@ -330,9 +352,11 @@ void WaitForGPU() {
 RenderCommandList* CommandList() {
   if (!g_recording) {
     WaitForFrame(g_frame);
+    g_boundFramebuffer = nullptr;
     g_uploads[g_frame].Reset();
     for (auto& texture : g_garbage[g_frame]) {
       g_descriptors.Free(texture->descriptor);
+      ForgetTexture(texture.get());
     }
     g_garbage[g_frame].clear();
     g_commandLists[g_frame]->begin();
@@ -422,7 +446,10 @@ void BindFramebuffer(HostTexture* color, HostTexture* depth) {
   if (depth) {
     Transition(*depth, RenderTextureLayout::DEPTH_WRITE);
   }
-  CommandList()->setFramebuffer(framebuffer.get());
+  if (g_boundFramebuffer != framebuffer.get()) {
+    CommandList()->setFramebuffer(framebuffer.get());
+    g_boundFramebuffer = framebuffer.get();
+  }
 }
 
 // Host texture backing a guest texture written by resolves.
@@ -445,6 +472,8 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
     }
     WaitForGPU();
     g_descriptors.Free(slot->descriptor);
+    ForgetTexture(slot.get());
+    g_resolveTemps.erase(slot.get());
     slot.reset();
   }
   if (!slot) {
@@ -541,15 +570,18 @@ void ResolveByDraw(HostTexture& source, HostTexture& dest, int32_t x1, int32_t y
 Upload Allocate(uint64_t size, uint64_t alignment = 256) {
   auto& allocator = g_uploads[g_frame];
   allocator.offset = (allocator.offset + alignment - 1) & ~(alignment - 1);
-  if (allocator.chunk < allocator.chunks.size() &&
-      allocator.offset + size > UPLOAD_CHUNK_SIZE) {
+  // Move on while the current chunk can't hold it (chunks can be bigger
+  // than UPLOAD_CHUNK_SIZE for big uploads).
+  while (allocator.chunk < allocator.chunks.size() &&
+         allocator.offset + size > allocator.chunks[allocator.chunk].size) {
     allocator.chunk++;
     allocator.offset = 0;
   }
   if (allocator.chunk >= allocator.chunks.size()) {
     UploadChunk chunk;
+    chunk.size = std::max(UPLOAD_CHUNK_SIZE, size);
     chunk.buffer = g_device->createBuffer(RenderBufferDesc::UploadBuffer(
-        std::max(UPLOAD_CHUNK_SIZE, size),
+        chunk.size,
         RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE | RenderBufferFlag::INDEX));
     chunk.data = static_cast<uint8_t*>(chunk.buffer->map());
     chunk.address = chunk.buffer->getDeviceAddress();
@@ -597,21 +629,25 @@ const ShaderCacheEntry* FindShaderCacheEntry(uint64_t hash) {
   return (it != end && it->hash == hash) ? it : nullptr;
 }
 
-RenderShader* GetHostShader(GuestShader& shader) {
-  if (!shader.shader && shader.entry) {
+RenderShader* GetHostShader(GuestShader& guestShader) {
+  if (!guestShader.entry) {
+    return nullptr;
+  }
+  auto& host = g_hostShaders[guestShader.entry];
+  if (!host) {
     if (!g_spirvCache) {
       g_spirvCache = std::make_unique<uint8_t[]>(g_spirvCacheDecompressedSize);
       ZSTD_decompress(g_spirvCache.get(), g_spirvCacheDecompressedSize, g_compressedSpirvCache,
                       g_spirvCacheCompressedSize);
     }
-    const uint8_t* encoded = g_spirvCache.get() + shader.entry->spirvOffset;
-    size_t size = smolv::GetDecodedBufferSize(encoded, shader.entry->spirvSize);
+    const uint8_t* encoded = g_spirvCache.get() + guestShader.entry->spirvOffset;
+    size_t size = smolv::GetDecodedBufferSize(encoded, guestShader.entry->spirvSize);
     std::vector<uint8_t> spirv(size);
-    if (smolv::Decode(encoded, shader.entry->spirvSize, spirv.data(), size)) {
-      shader.shader = g_device->createShader(spirv.data(), size, "main", RenderShaderFormat::SPIRV);
+    if (smolv::Decode(encoded, guestShader.entry->spirvSize, spirv.data(), size)) {
+      host = g_device->createShader(spirv.data(), size, "main", RenderShaderFormat::SPIRV);
     }
   }
-  return shader.shader.get();
+  return host.get();
 }
 
 
@@ -981,8 +1017,8 @@ static_assert(offsetof(SharedConstants, ndcTransform) == 1720);
 
 // Pipeline state that varies per draw (hashed into the pipeline key).
 struct PipelineKey {
-  const RenderShader* vertexShader;
-  const RenderShader* pixelShader;
+  uint64_t vertexShader;  // shader cache entry hashes
+  uint64_t pixelShader;
   uint32_t primitive;
   uint32_t colorFormat;
   uint32_t depthFormat;
@@ -995,7 +1031,8 @@ struct PipelineKey {
   uint32_t alphaTest;
 };
 
-RenderPipeline* GetPipeline(const PipelineKey& key) {
+RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
+                            RenderShader* pixelShader) {
   uint64_t hash = XXH3_64bits(&key, sizeof(key));
   auto& pipeline = g_pipelines[hash];
   if (pipeline) {
@@ -1003,8 +1040,8 @@ RenderPipeline* GetPipeline(const PipelineKey& key) {
   }
   RenderGraphicsPipelineDesc desc;
   desc.pipelineLayout = g_pipelineLayout.get();
-  desc.vertexShader = key.vertexShader;
-  desc.pixelShader = key.pixelShader;
+  desc.vertexShader = vertexShader;
+  desc.pixelShader = pixelShader;
   if (key.primitive == uint32_t(xenos::PrimitiveType::kRectangleList)) {
     desc.geometryShader = g_rectListShader.get();
     desc.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
@@ -1096,6 +1133,7 @@ RenderPipeline* GetPipeline(const PipelineKey& key) {
 // A draw with everything captured, ready to record.
 struct DrawRecord {
   RenderPipeline* pipeline = nullptr;
+  bool memExport = false;
   HostTexture* target = nullptr;
   HostTexture* depth = nullptr;
   RenderViewport viewport;
@@ -1143,9 +1181,11 @@ void SubmitDraw(DrawRecord& record) {
     commandList->drawInstanced(record.drawCount, 1, record.startVertex, 0);
   }
   // Memory export results feed later draws.
-  commandList->barriers(RenderBarrierStage::GRAPHICS,
-                        RenderBufferBarrier(g_guestMemory.get(),
-                                            RenderBufferAccess::READ | RenderBufferAccess::WRITE));
+  if (record.memExport) {
+    commandList->barriers(RenderBarrierStage::GRAPHICS,
+                          RenderBufferBarrier(g_guestMemory.get(),
+                                              RenderBufferAccess::READ | RenderBufferAccess::WRITE));
+  }
 }
 
 template <typename T>
@@ -1208,16 +1248,29 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   if (!target && !depth) {
     return;
   }
-  if (target && depth &&
-      (target->width != depth->width || target->height != depth->height ||
-       target->samples != depth->samples)) {
-    depth = nullptr;  // can't share a framebuffer
+  // A framebuffer's attachments may differ in size (the area is the
+  // smallest); samples must match.
+  if (target && depth && (depth->width < target->width || depth->height < target->height ||
+                          target->samples != depth->samples)) {
+    depth = nullptr;
   }
 
+  // Shaders that write memory (bit 5 of the entry's mask, set by
+  // XenosRecomp) must run even when nothing is rasterized.
+  bool memExport = (vs->entry->specConstantsMask & 0x20) != 0;
   reg::PA_SU_SC_MODE_CNTL mode;
   mode.value = Register(device, 0x2205);
+  bool rectList = xenos::PrimitiveType(primitive) == xenos::PrimitiveType::kRectangleList;
+  if (rectList) {
+    mode.cull_front = 0;  // Xenia never culls rectangle lists
+    mode.cull_back = 0;
+  }
   if (mode.cull_front && mode.cull_back) {
-    return;
+    if (!memExport) {
+      return;
+    }
+    mode.cull_front = 0;
+    mode.cull_back = 0;
   }
 
   // Shared constants.
@@ -1335,11 +1388,11 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                               2.0f * std::fabs(xScale), 2.0f * std::fabs(yScale),
                               std::min(zOffset, zOffset + zScale),
                               std::max(zOffset, zOffset + zScale));
-    // The viewport above is always top-down; mirror here instead when the
-    // guest's scales are negative (vertex shaders are compiled with
-    // -fvk-invert-y, which matches a positive Y scale).
+    // The host viewport is always top-down with positive sizes. D3D's usual
+    // negative Y scale is what -fvk-invert-y (on every translated vertex
+    // shader) expects; mirror only the unusual signs.
     shared.ndcTransform[0] = xScale < 0 ? -1.0f : 1.0f;
-    shared.ndcTransform[1] = yScale < 0 ? -1.0f : 1.0f;
+    shared.ndcTransform[1] = yScale < 0 ? 1.0f : -1.0f;
   } else {
     // Window coordinates: map pixels to NDC over the whole target.
     shared.ndcTransform[0] = 2.0f / targetWidth;
@@ -1374,7 +1427,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
       return;
     }
     bool wide = guest::Load32(indexBuffer) & 0x80000000;
-    uint32_t address = guest::Load32(indexBuffer + 24) & 0x1FFFFFFF;
+    uint32_t address = PhysicalAddress(guest::Load32(indexBuffer + 24));
     uint32_t indexSize = wide ? 4 : 2;
     Upload indices = Allocate(uint64_t(count) * indexSize, 16);
     const uint8_t* source = guest::Physical(address + startIndex * indexSize);
@@ -1405,8 +1458,8 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   }
 
   PipelineKey key = {};
-  key.vertexShader = vertexShader;
-  key.pixelShader = pixelShader;
+  key.vertexShader = vs->entry->hash;
+  key.pixelShader = ps->entry->hash;
   key.primitive = primitive;
   key.colorFormat = uint32_t(target ? target->format : RenderFormat::UNKNOWN);
   key.depthFormat = uint32_t(depth ? depth->format : RenderFormat::UNKNOWN);
@@ -1417,7 +1470,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   key.stencilMasks = Register(device, 0x210D);
   key.cull = mode.value & 0x7;
   key.alphaTest = colorControl.alpha_test_enable;
-  RenderPipeline* pipeline = GetPipeline(key);
+  RenderPipeline* pipeline = GetPipeline(key, vertexShader, pixelShader);
   if (!pipeline) {
     return;
   }
@@ -1441,6 +1494,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   }
   DrawRecord record;
   record.pipeline = pipeline;
+  record.memExport = memExport;
   record.target = target;
   record.depth = depth;
   record.viewport = viewport;
@@ -1501,6 +1555,7 @@ void Present(HostTexture* frontBuffer) {
     commandList->barriers(RenderBarrierStage::GRAPHICS,
                           RenderTextureBarrier(target, RenderTextureLayout::COLOR_WRITE));
     commandList->setFramebuffer(framebuffer.get());
+    g_boundFramebuffer = framebuffer.get();
     commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
 
     if (frontBuffer && frontBuffer->descriptor) {
@@ -1754,6 +1809,7 @@ void DestroyHostDevice() {
   }
   g_pipelines.clear();
   g_guestShaders.clear();
+  g_hostShaders.clear();
   g_textures.clear();
   for (auto& garbage : g_garbage) {
     garbage.clear();

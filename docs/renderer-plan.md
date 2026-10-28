@@ -57,6 +57,19 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   memory and texture invalidation than per-frame hashing.
 - Review notes for the present path (window size on the UI thread, acquire
   timeout, window handle from ReXGlue).
+- From the draw path review (2026-10-28), not done yet:
+  - guest memory sync: only the fetch constants the shader reads, dirty-page
+    tracking instead of hashing, ranges written by memory export owned by
+    the GPU (a CPU upload must not overwrite skinning results);
+  - textures: eviction, cheaper invalidation than hashing every frame,
+    resolved textures should honour the fetch's swizzle/format, depth
+    resolves, Resolve's level/slice arguments (r8/r9);
+  - blend constant color, alpha test function, RB_STENCILREFMASK_BF,
+    stencil reference out of the pipeline key, quad strips and indexed quad
+    lists, signed texture components, packed mip tails;
+  - Present holds the renderer mutex through swapchain acquire;
+  - pipelines are created on the game thread (hitches until a pipeline
+    cache exists).
 
 Audio: ReXGlue's SDL3 output with its XMA decoder (libavcodec); Unleashed's
 SDL driver only if this turns out worse.
