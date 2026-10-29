@@ -60,3 +60,17 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
 - Cheapest native path found so far: reuse existing pages in "recomp mode",
   rewriting their strings in place (same padded slot sizes) and mapping our
   settings onto the rows' values, restoring both on leaving.
+
+## Options state (10-29)
+
+- 0x83CEB414: the selected category (0 Game Settings, 1 Controller, 2
+  Camera, ...); 0x83CEB418 + 4 * category: that page's cursor row.
+- Option values are not in the image's data: changing 1st/3rd-Person Camera
+  Controls or Subtitles changed no word there; heap and physical diffs
+  showed no clean candidate either (they may live in widget objects, or be
+  committed on leaving the page).
+- Page layouts: Camera Settings has two four-choice rows (Default /
+  Vertical Inverted / Horizontal Inverted / All Inverted) and two sliders;
+  Game Settings has a language list, a two-choice row and five On/Off-style
+  rows; Screen Settings: Aspect Ratio, Video Adjustment, "???"; Audio: three
+  sliders, Speaker Output (5.1 / Stereo), "???".
