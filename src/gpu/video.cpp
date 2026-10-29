@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <unordered_set>
@@ -301,10 +302,14 @@ uint64_t g_frameCount = 0;
 // NG2_DEBUG_HIGHLIGHT=<vs hash>: that vertex shader's draws in magenta.
 // =cycle:<seconds>: from that long after the first draw, each vertex shader
 // seen in turn for 2 s (logged), to find which draws are which.
+// =all: every skinned vertex shader in its own color (DebugColor, logged).
 bool Highlighted(uint64_t vertexShader) {
   static const char* spec = std::getenv("NG2_DEBUG_HIGHLIGHT");
   if (!spec) {
     return false;
+  }
+  if (std::strcmp(spec, "all") == 0) {
+    return true;
   }
   static const bool cycle = std::strncmp(spec, "cycle:", 6) == 0;
   if (!cycle) {
@@ -328,6 +333,27 @@ bool Highlighted(uint64_t vertexShader) {
     REXLOG_INFO("video: highlighting vs {:016X} ({} of {})", seen[index], index, seen.size());
   }
   return vertexShader == seen[index];
+}
+
+// The highlight color for a vertex shader: magenta, or with
+// NG2_DEBUG_HIGHLIGHT=all one from its hash, logged the first time.
+void DebugColor(uint64_t vertexShader, float color[4]) {
+  static const char* spec = std::getenv("NG2_DEBUG_HIGHLIGHT");
+  if (!spec || std::strcmp(spec, "all") != 0) {
+    color[0] = 1.0f, color[1] = 0.0f, color[2] = 1.0f, color[3] = 1.0f;
+    return;
+  }
+  uint64_t mixed = XXH3_64bits(&vertexShader, sizeof(vertexShader));
+  uint32_t rgb[3] = {uint32_t(mixed & 0xFF), uint32_t((mixed >> 8) & 0xFF),
+                     uint32_t((mixed >> 16) & 0xFF)};
+  static std::unordered_set<uint64_t> logged;
+  if (logged.insert(vertexShader).second) {
+    REXLOG_INFO("video: vs {:016X} color {} {} {}", vertexShader, rgb[0], rgb[1], rgb[2]);
+  }
+  for (int i = 0; i < 3; i++) {
+    color[i] = float(rgb[i]) / 255.0f;
+  }
+  color[3] = 1.0f;
 }
 
 // NG2_TRACE_FRAME=<n>: log what frame n draws; t<seconds>: the first frame
@@ -1048,6 +1074,40 @@ uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   return sampler.first;
 }
 
+// Where a texture's base level lies in guest memory, in blocks (Xenia's
+// texture_util::GetGuestTextureLayout and GetPackedMipOffset, level 0).
+struct BaseLevelLayout {
+  uint32_t pitchBlocks;     // row pitch: the fetch constant's, aligned to a 32-block tile
+  uint32_t offsetX, offsetY;  // within the packed mip tail, for textures of 16 or less
+  uint64_t size;            // bytes the level spans
+};
+
+BaseLevelLayout GetBaseLevelLayout(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                   const TextureFormatInfo& info, uint32_t width,
+                                   uint32_t height) {
+  BaseLevelLayout layout = {};
+  uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
+  uint32_t pitchTexels = std::max(uint32_t(fetch.pitch) << 5, width);
+  layout.pitchBlocks = ((pitchTexels + info.blockSize - 1) / info.blockSize + 31) & ~31u;
+  // Small textures with packed mips keep the base level in the mip tail: 16
+  // texels across, or down for wide ones.
+  auto log2Ceil = [](uint32_t value) { return uint32_t(std::bit_width(value - 1)); };
+  uint32_t log2Width = log2Ceil(width), log2Height = log2Ceil(height);
+  // (1D textures don't pack their mips: Xenia ignores the flag there.)
+  if (fetch.packed_mips && fetch.dimension != xenos::DataDimension::k1D &&
+      std::min(log2Width, log2Height) <= 4) {
+    bool wide = log2Width > std::max(log2Height, 1u);
+    layout.offsetX = wide ? 0 : 16 / info.blockSize;
+    layout.offsetY = wide ? 16 / info.blockSize : 0;
+  }
+  uint32_t rows = blocksY + layout.offsetY;
+  if (fetch.tiled) {
+    rows = (rows + 31) & ~31u;
+  }
+  layout.size = uint64_t(layout.pitchBlocks) * rows * info.bytesPerBlock;
+  return layout;
+}
+
 // Uploads the base level of a guest texture: endian swap, untile.
 std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
                                            const TextureFormatInfo& info, uint32_t width,
@@ -1055,7 +1115,7 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
                                            uint32_t guestSize) {
   uint32_t blocksX = (width + info.blockSize - 1) / info.blockSize;
   uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
-  uint32_t pitchBlocks = std::max((uint32_t(fetch.pitch) << 5) / info.blockSize, blocksX);
+  BaseLevelLayout layout = GetBaseLevelLayout(fetch, info, width, height);
   uint32_t bppLog2 = uint32_t(std::countr_zero(info.bytesPerBlock));
 
   std::vector<uint8_t> swapped(guestData, guestData + guestSize);
@@ -1063,23 +1123,52 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
 
   uint64_t rowBytes = uint64_t(blocksX) * info.bytesPerBlock;
   Upload upload = Allocate(rowBytes * blocksY, 16);
-  uint64_t linearRowBytes = (uint64_t(pitchBlocks) * info.bytesPerBlock + 255) & ~255ull;
+  uint64_t linearRowBytes = uint64_t(layout.pitchBlocks) * info.bytesPerBlock;
   for (uint32_t y = 0; y < blocksY; y++) {
     uint8_t* row = upload.data + y * rowBytes;
+    uint32_t guestY = y + layout.offsetY;
     if (fetch.tiled) {
       for (uint32_t x = 0; x < blocksX; x++) {
-        int32_t offset = TiledOffset2D(int32_t(x), int32_t(y), pitchBlocks, bppLog2);
+        int32_t offset = TiledOffset2D(int32_t(x + layout.offsetX), int32_t(guestY),
+                                       layout.pitchBlocks, bppLog2);
         if (offset >= 0 && uint64_t(offset) + info.bytesPerBlock <= guestSize) {
           std::memcpy(row + x * info.bytesPerBlock, swapped.data() + offset, info.bytesPerBlock);
         }
       }
-    } else if ((y + 1) * linearRowBytes <= guestSize) {
-      std::memcpy(row, swapped.data() + y * linearRowBytes, rowBytes);
+    } else {
+      uint64_t start = guestY * linearRowBytes + uint64_t(layout.offsetX) * info.bytesPerBlock;
+      if (start + rowBytes <= guestSize) {
+        std::memcpy(row, swapped.data() + start, rowBytes);
+      }
     }
   }
 
   // NG2_DUMP_TEXTURES=<dir>: write decoded 8-bit and 8888 textures (PGM/PAM).
   static const char* dumpDir = std::getenv("NG2_DUMP_TEXTURES");
+  // Block-compressed textures as DDS (DXT1/DXT3/DXT5).
+  if (dumpDir && (info.format == RenderFormat::BC1_UNORM ||
+                  info.format == RenderFormat::BC2_UNORM ||
+                  info.format == RenderFormat::BC3_UNORM)) {
+    std::string path = fmt::format("{}/{:08x}_{}x{}.dds", dumpDir,
+                                   uint32_t(fetch.base_address) << 12, width, height);
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+      uint32_t header[32] = {};
+      header[0] = 0x20534444;  // "DDS "
+      header[1] = 124;
+      header[2] = 0x1007;  // caps, height, width, pixel format
+      header[3] = height;
+      header[4] = width;
+      header[19] = 32;
+      header[20] = 4;  // FOURCC
+      header[21] = info.format == RenderFormat::BC1_UNORM   ? 0x31545844   // DXT1
+                   : info.format == RenderFormat::BC2_UNORM ? 0x33545844   // DXT3
+                                                            : 0x35545844;  // DXT5
+      header[27] = 0x1000;
+      std::fwrite(header, 4, 32, f);
+      std::fwrite(upload.data, 1, rowBytes * blocksY, f);
+      std::fclose(f);
+    }
+  }
   if (dumpDir && (info.format == RenderFormat::R8_UNORM ||
                   info.format == RenderFormat::R8G8B8A8_UNORM)) {
     bool gray = info.format == RenderFormat::R8_UNORM;
@@ -1169,20 +1258,17 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   }
   uint32_t width = oneD ? fetch.size_1d.width + 1 : fetch.size_2d.width + 1;
   uint32_t height = oneD ? 1 : fetch.size_2d.height + 1;
-  uint32_t blocksX = (width + info.blockSize - 1) / info.blockSize;
-  uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
-  uint32_t pitchBlocks = std::max((uint32_t(fetch.pitch) << 5) / info.blockSize, blocksX);
-  uint64_t guestSize =
-      fetch.tiled ? uint64_t((pitchBlocks + 31) & ~31u) * ((blocksY + 31) & ~31u) * info.bytesPerBlock
-                  : ((uint64_t(pitchBlocks) * info.bytesPerBlock + 255) & ~255ull) * blocksY;
+  uint64_t guestSize = GetBaseLevelLayout(fetch, info, width, height).size;
   if (guestSize == 0 || base + guestSize > GUEST_MEMORY_SIZE) {
     ReportUnsupportedTexture("size", fetch);
     return 0;
   }
 
-  // Shape and view: dwords 0-2 and the swizzle; sampler fields don't matter.
-  uint32_t keyData[4] = {fetch.dword_0 & ~0x3FFFFFu, fetch.dword_1, fetch.dword_2,
-                         uint32_t(fetch.swizzle)};
+  // Shape and view: dwords 0-2, the swizzle, and the dimension and packed
+  // mips bits of dword 5 (they move the base level); sampler fields don't
+  // matter.
+  uint32_t keyData[5] = {fetch.dword_0 & ~0x3FFFFFu, fetch.dword_1, fetch.dword_2,
+                         uint32_t(fetch.swizzle), fetch.dword_5 & 0xE00};
   uint64_t key = XXH3_64bits(keyData, sizeof(keyData));
   auto& cached = g_textures[key];
   if (cached.checkedFrame != g_frameCount) {
@@ -1310,7 +1396,8 @@ struct SharedConstants {
   uint32_t vertexElements[16][4];
   float ndcTransform[4];
   uint32_t alphaFunc;  // RB_COLORCONTROL alpha_func
-  uint32_t padding[3];
+  uint32_t padding[1];
+  float debugColor[4];  // NG2_DEBUG_HIGHLIGHT
 };
 static_assert(offsetof(SharedConstants, samplerIndices) == 512);
 static_assert(offsetof(SharedConstants, booleans) == 640);
@@ -1319,6 +1406,7 @@ static_assert(offsetof(SharedConstants, vertexFetch) == 696);
 static_assert(offsetof(SharedConstants, vertexElements) == 1464);
 static_assert(offsetof(SharedConstants, ndcTransform) == 1720);
 static_assert(offsetof(SharedConstants, alphaFunc) == 1736);
+static_assert(offsetof(SharedConstants, debugColor) == 1744);
 
 // Pipeline state that varies per draw (hashed into the pipeline key).
 struct PipelineKey {
@@ -1376,13 +1464,15 @@ RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
   }
   reg::PA_SU_SC_MODE_CNTL mode;
   mode.value = key.cull;
-  // D3D on the 360: front faces are clockwise unless PA_SU_SC_MODE_CNTL.face.
+  // Front faces are counter-clockwise unless PA_SU_SC_MODE_CNTL.face (as
+  // Xenia sets VkPipelineRasterizationStateCreateInfo.frontFace); plume's
+  // pipelines take clockwise as front, so a culled side is the other one.
   if (mode.cull_front && mode.cull_back) {
     desc.cullMode = RenderCullMode::NONE;  // everything culled: drawn as nothing below
   } else if (mode.cull_front) {
-    desc.cullMode = mode.face ? RenderCullMode::BACK : RenderCullMode::FRONT;
-  } else if (mode.cull_back) {
     desc.cullMode = mode.face ? RenderCullMode::FRONT : RenderCullMode::BACK;
+  } else if (mode.cull_back) {
+    desc.cullMode = mode.face ? RenderCullMode::BACK : RenderCullMode::FRONT;
   }
   for (uint32_t i = 0; i < 4 && key.colorFormats[i] != uint32_t(RenderFormat::UNKNOWN); i++) {
     desc.renderTargetFormat[i] = RenderFormat(key.colorFormats[i]);
@@ -1831,9 +1921,14 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   key.cull = mode.value & 0x7;
   key.alphaTest = colorControl.alpha_test_enable;
   key.alphaToCoverage = ps && colorControl.alpha_to_mask_enable;  // needs a fragment shader
-  if (Highlighted(vs->entry->hash)) {
+  // =all colors the skinned draws only (bones in fetch slot 94): other
+  // shaders include full-screen passes that would cover them.
+  bool skinned = (vs->entry->vertexFetchMask[2] >> 30) & 1;
+  if (Highlighted(vs->entry->hash) &&
+      (skinned || std::strcmp(std::getenv("NG2_DEBUG_HIGHLIGHT"), "all") != 0)) {
     key.pixelShader = 0;  // the debug shader's pipelines
     pixelShader = g_debugShader.get();
+    DebugColor(vs->entry->hash, reinterpret_cast<SharedConstants*>(sharedUpload.data)->debugColor);
   }
   RenderPipeline* pipeline = GetPipeline(key, vertexShader, pixelShader);
   if (!pipeline) {
@@ -1852,12 +1947,13 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                 ps ? ps->container : 0);
     REXLOG_INFO("draw prim {} count {} indexed {} vs {:016X} ps {:016X} target {}x{} fmt {} "
                 "targets {} mask {:#x} blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {} "
-                "base {} indx_offset {:#x} min/max {:#x}/{:#x}",
+                "base {} indx_offset {:#x} min/max {:#x}/{:#x} colorcontrol {:#x} bools {:08x}",
                 primitive, count, indexed, vs->entry->hash, ps ? ps->entry->hash : 0,
                 sizeSource->width, sizeSource->height, uint32_t(sizeSource->format), targetCount,
                 key.colorMask, key.blendControls[0], key.depthControl, vte.value, viewport.x, viewport.y,
                 viewport.width, viewport.height, startVertex, Register(device, 0x2102),
-                Register(device, 0x2101), Register(device, 0x2100));
+                Register(device, 0x2101), Register(device, 0x2100), colorControl.value,
+                shared.booleans[4]);
   }
   DrawRecord record;
   record.pipeline = pipeline;
