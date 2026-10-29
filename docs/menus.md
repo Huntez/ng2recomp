@@ -144,9 +144,19 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
 - Graphics also has Anti-Aliasing (antialiasing: 0, 2, 4, 8 samples for
   the targets the game multisamples, its 1120x584 main picture at 2x;
   stepped down to what the device supports; list made at Game page +0xA60).
-- In gameplay, Back opens "IN-GAME MANUAL AND OPTIONS" (one list: manual,
-  camera and game settings, Quit Game, Return to Game); Start the
-  inventory. Not mapped yet.
+- In gameplay, Back opens "IN-GAME MANUAL AND OPTIONS"; Start the
+  inventory. The list's strings are table 4 (0x40000 + index: 0 View
+  In-Game Manual ... 22 Quit Game, 23 NINJA CINEMA, 24 Return to Game).
+  Builder sub_836722A8 (vtable slot 11 of 0x82280D04; object 0x8530BB80 in
+  a run): 12 row pointers at +0x08..+0x34, row 0 the manual (with its
+  topic list), choice rows set up by sub_8366FCA0(row, label, choice ids,
+  count, flag), sliders at rows 3-4, Quit Game +0x4B40, Return to Game
+  +0x4DA0. Handler sub_823E84F8: state 0x83CEB3B4 (6 leaves, 2 the
+  manual, 1 Quit Game's confirmation), cursor 0x83CEB3C4 + 4 * state;
+  values to the settings object, shown through sub_8366E238(row, value);
+  model 0x8530B8B0. String tables: sub_823E0E60(*0x83BBC138, language,
+  table << 16 | index); table 2 Options, 3 inventory, 4 this list, 8
+  Xbox LIVE messages, 12/13 item texts.
 - show_fps (src/perf_overlay.cpp): a text item (sprite + text part, as the
   arrow lists' value text) in guest memory, given UI package 0's resource
   0xA (a text frame like package 0x78's 0x2A, which only Options loads),
