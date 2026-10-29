@@ -51,6 +51,10 @@ extern const uint8_t g_rect_list_gs[];
 extern const size_t g_rect_list_gs_size;
 extern const uint8_t g_copy_ps[];
 extern const size_t g_copy_ps_size;
+extern const uint8_t g_copy_7e3_ps[];
+extern const size_t g_copy_7e3_ps_size;
+extern const uint8_t g_copy_7e3_ms_ps[];
+extern const size_t g_copy_7e3_ms_ps_size;
 extern const uint8_t g_depth_copy_ps[];
 extern const size_t g_depth_copy_ps_size;
 extern const uint8_t g_depth_copy_ms_ps[];
@@ -96,6 +100,7 @@ struct HostTexture {
   RenderSampleCounts samples = RenderSampleCount::COUNT_1;
   std::unique_ptr<RenderTextureView> view;  // for the texture heap
   uint32_t descriptor = 0;                    // in the texture heap, 0 = none
+  bool float7e3 = false;  // a color target last bound as 2_10_10_10_FLOAT
 };
 
 struct DescriptorAllocator {
@@ -147,6 +152,8 @@ std::unique_ptr<RenderShader> g_presentShader;
 std::unique_ptr<RenderPipeline> g_presentPipeline;
 std::unique_ptr<RenderShader> g_rectListShader;
 std::unique_ptr<RenderShader> g_copyShader;
+std::unique_ptr<RenderShader> g_copy7e3Shader;
+std::unique_ptr<RenderShader> g_copy7e3MsShader;
 std::unique_ptr<RenderShader> g_debugShader;
 std::unique_ptr<RenderShader> g_depthCopyShader;
 std::unique_ptr<RenderShader> g_depthCopyMsShader;
@@ -298,6 +305,9 @@ std::unordered_map<uint64_t, CachedTexture> g_textures;
 // frame's fence has passed.
 std::vector<std::unique_ptr<HostTexture>> g_garbage[NUM_FRAMES];
 uint64_t g_frameCount = 0;
+// The display gamma table (UpdateGammaTable).
+std::unique_ptr<HostTexture> g_gammaTable;
+uint64_t g_gammaTableHash = 0;
 
 // NG2_DEBUG_HIGHLIGHT=<vs hash>: that vertex shader's draws in magenta.
 // =cycle:<seconds>: from that long after the first draw, each vertex shader
@@ -616,6 +626,8 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
                 key.width, key.height, key.edramBase, guestFormat, key.msaa);
     slot = std::move(host);
   }
+  // 2_10_10_10_FLOAT and its 16_16_16_16 view hold 7e3 color (ResolveByDraw).
+  slot->float7e3 = !depth && (guestFormat == 3 || guestFormat == 12);
   return slot.get();
 }
 
@@ -742,11 +754,14 @@ xenos::xe_gpu_texture_fetch_t ReadTextureFetch(uint32_t texture) {
 void ResolveByDraw(HostTexture& source, HostTexture& dest, int32_t x1, int32_t y1, int32_t x2,
                    int32_t y2, uint32_t dx, uint32_t dy, bool depth = false) {
   HostTexture* readable = &source;
+  bool multisampled = source.samples != RenderSampleCount::COUNT_1;
   RenderShader* shader = g_copyShader.get();
   if (depth) {
-    shader = source.samples != RenderSampleCount::COUNT_1 ? g_depthCopyMsShader.get()
-                                                          : g_depthCopyShader.get();
-  } else if (source.samples != RenderSampleCount::COUNT_1) {
+    shader = multisampled ? g_depthCopyMsShader.get() : g_depthCopyShader.get();
+  } else if (source.float7e3) {
+    // Each sample is rounded before averaging, so no hardware resolve.
+    shader = multisampled ? g_copy7e3MsShader.get() : g_copy7e3Shader.get();
+  } else if (multisampled) {
     auto& temp = g_resolveTemps[&source];
     if (!temp) {
       temp = std::make_unique<HostTexture>();
@@ -1072,7 +1087,22 @@ uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
                                          : std::max(uint32_t(fetch.mip_min_level), 1u));
   desc.maxLOD = fetch.mip_filter == xenos::TextureFilter::kBaseMap ? desc.minLOD : FLT_MAX;
   desc.mipLODBias = std::clamp(float(fetch.lod_bias) / 32.0f, -15.0f, 15.0f);
-  uint64_t hash = XXH3_64bits(&desc, sizeof(desc));
+  // Anisotropy as the fetch constant asks (1x-16x), for filtered mipmapped
+  // sampling like Xenia's; it implies linear filtering.
+  uint32_t aniso = uint32_t(fetch.aniso_filter);
+  if (aniso >= 2 && aniso <= 5 && fetch.mip_filter != xenos::TextureFilter::kBaseMap &&
+      desc.minFilter == RenderFilter::LINEAR && desc.magFilter == RenderFilter::LINEAR) {
+    desc.anisotropyEnabled = true;
+    desc.maxAnisotropy = 1u << (aniso - 1);
+  }
+  // By field: the desc has padding bytes.
+  float lod[3] = {desc.minLOD, desc.maxLOD, desc.mipLODBias};
+  uint32_t keyData[10] = {uint32_t(desc.addressU), uint32_t(desc.addressV),
+                          uint32_t(desc.addressW), uint32_t(desc.magFilter),
+                          uint32_t(desc.minFilter), uint32_t(desc.mipmapMode),
+                          desc.anisotropyEnabled ? desc.maxAnisotropy : 0u};
+  std::memcpy(&keyData[7], lod, sizeof(lod));
+  uint64_t hash = XXH3_64bits(keyData, sizeof(keyData));
   auto& sampler = g_samplers[hash];
   if (!sampler.second) {
     if (g_nextSampler >= SAMPLER_DESCRIPTOR_COUNT) {
@@ -2211,7 +2241,8 @@ void Present(HostTexture* frontBuffer) {
       RenderViewport viewport((windowWidth - width) / 2, (windowHeight - height) / 2, width,
                               height);
       RenderRect scissor(0, 0, int32_t(windowWidth), int32_t(windowHeight));
-      uint32_t constants[2] = {frontBuffer->descriptor, SAMPLER_LINEAR_CLAMP};
+      uint32_t constants[3] = {frontBuffer->descriptor, SAMPLER_LINEAR_CLAMP,
+                               g_gammaTable ? g_gammaTable->descriptor : 0u};
       commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
       commandList->setPipeline(g_presentPipeline.get());
       commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
@@ -2384,6 +2415,8 @@ void CreatePipelines() {
 
   g_rectListShader = CreateShader(g_rect_list_gs, g_rect_list_gs_size);
   g_copyShader = CreateShader(g_copy_ps, g_copy_ps_size);
+  g_copy7e3Shader = CreateShader(g_copy_7e3_ps, g_copy_7e3_ps_size);
+  g_copy7e3MsShader = CreateShader(g_copy_7e3_ms_ps, g_copy_7e3_ms_ps_size);
   g_debugShader = CreateShader(g_debug_ps, g_debug_ps_size);
   g_depthCopyShader = CreateShader(g_depth_copy_ps, g_depth_copy_ps_size);
   g_depthCopyMsShader = CreateShader(g_depth_copy_ms_ps, g_depth_copy_ms_ps_size);
@@ -2472,9 +2505,12 @@ void DestroyHostDevice() {
   g_resolveTemps.clear();
   g_copyPipelines.clear();
   g_copyShader.reset();
+  g_copy7e3Shader.reset();
+  g_copy7e3MsShader.reset();
   g_rectListShader.reset();
   g_framebuffers.clear();
   g_surfaces.clear();
+  g_gammaTable.reset();
   g_lastResolve.clear();
   g_resolvedTextures.clear();
   g_resolvedMemory.clear();
@@ -2624,7 +2660,7 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
                       uint32_t(fetch.format));
         }
       }
-      if (x2 > x1 && y2 > y1 && (depth || dest->format != target->format)) {
+      if (x2 > x1 && y2 > y1 && (depth || target->float7e3 || dest->format != target->format)) {
         ResolveByDraw(*target, *dest, x1, y1, x2, y2, dx, dy, depth);
       } else if (x2 > x1 && y2 > y1) {
         if (target->samples != RenderSampleCount::COUNT_1) {
@@ -2736,13 +2772,70 @@ void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseVe
   Draw(device, primitive, baseVertex, indexCount, true, 0, &data);
 }
 
+// The display's gamma table, as D3D's SetGammaRamp leaves it at dev+0x3A8C:
+// 256 16-bit entries for red, then green, then blue (DC_LUT_SEQ_COLOR, low
+// 6 bits zero), already adjusted for the display gamma the kernel reports
+// (VdGetCurrentDisplayGamma, BT.709). The console applies it on scan-out, as
+// Xenia's presenter does; even an identity game ramp darkens the picture.
+// Kept as a 256x1 texture for the present shader.
+void UpdateGammaTable(uint32_t device) {
+  // With a 10-bit front buffer (D3DFORMAT 0x28280136 at dev+0x3518) D3D keeps
+  // the same bytes as 128 PWL {base, delta} pairs instead: not handled yet.
+  if (guest::Load32(device + 0x3518) == 0x28280136) {
+    if (g_gammaTable) {
+      g_garbage[g_frame].push_back(std::move(g_gammaTable));  // a frame may still read it
+    }
+    return;
+  }
+  uint16_t table[3][256];
+  bool any = false;
+  for (uint32_t c = 0; c < 3; c++) {
+    for (uint32_t i = 0; i < 256; i++) {
+      table[c][i] = guest::Load16(device + 0x3A8C + (c * 256 + i) * 2);
+      any |= table[c][i] != 0;
+    }
+  }
+  if (!any) {
+    return;  // not set up yet: present unchanged
+  }
+  uint64_t hash = XXH3_64bits(table, sizeof(table));
+  if (g_gammaTable && hash == g_gammaTableHash) {
+    return;
+  }
+  g_gammaTableHash = hash;
+  if (!g_gammaTable) {
+    g_gammaTable = std::make_unique<HostTexture>();
+    g_gammaTable->width = 256;
+    g_gammaTable->height = 1;
+    g_gammaTable->format = RenderFormat::R16G16B16A16_UNORM;
+    g_gammaTable->texture = g_device->createTexture(
+        RenderTextureDesc::Texture2D(256, 1, 1, RenderFormat::R16G16B16A16_UNORM));
+    SetDescriptor(*g_gammaTable);
+  }
+  Upload upload = Allocate(256 * 8, 16);
+  auto* texels = reinterpret_cast<uint16_t*>(upload.data);
+  for (uint32_t i = 0; i < 256; i++) {
+    // 10-bit values in the high bits: 1023 << 6 must read as 1.0.
+    for (uint32_t c = 0; c < 3; c++) {
+      texels[i * 4 + c] = uint16_t(table[c][i] | (table[c][i] >> 10));
+    }
+    texels[i * 4 + 3] = 0xFFFF;
+  }
+  Transition(*g_gammaTable, RenderTextureLayout::COPY_DEST);
+  CommandList()->copyTextureRegion(
+      RenderTextureCopyLocation::Subresource(g_gammaTable->texture.get()),
+      RenderTextureCopyLocation::PlacedFootprint(upload.buffer, RenderFormat::R16G16B16A16_UNORM,
+                                                 256, 1, 1, 256, upload.offset));
+  Transition(*g_gammaTable, RenderTextureLayout::SHADER_READ);
+}
+
 void OnSwap(uint32_t device, uint32_t frontBuffer) {
-  (void)device;
   std::lock_guard lock(g_mutex);
   if (!g_device) {
     return;
   }
   FlushPendingDraw();
+  UpdateGammaTable(device);
   HostTexture* front = nullptr;
   if (frontBuffer) {
     auto fetch = ReadTextureFetch(frontBuffer);

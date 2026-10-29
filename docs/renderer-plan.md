@@ -40,7 +40,7 @@ render targets, Clear, Resolve (copy, MSAA resolve, format conversion by
 draw), Swap/present, draws (DrawVertices, DrawIndexedVertices, inline
 BeginVertices/BeginIndexedVertices), shaders from the ahead-of-time cache,
 2D/1D textures (base level), rect lists (geometry shader), quad lists.
-Debug aids: NG2_TRACE_FRAME=<n>[+count], NG2_DUMP_TEXTURES=<dir> (DXT as DDS),
+Debug aids: NG2_TRACE_FRAME=<n>[+count] (ng2.log rotates at 5 MB: read ng2.1.log first), NG2_DUMP_TEXTURES=<dir> (DXT as DDS),
 NG2_DEBUG_WHITE_TEXTURES=1.
 
 ## Next
@@ -106,6 +106,13 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   (Xenia's GetTiledAddressUpperBound2D). Not done: anisotropy (not enabled
   on the device) and per-fetch LOD overrides (XenosRecomp samples with
   implicit LOD).
+- Brightness (10-29): the whole picture was brighter than Xenia (menu
+  included) because the display gamma table was never applied. D3D's
+  SetGammaRamp leaves it at dev+0x3A8C (3 x 256 u16, already adjusted for the
+  BT.709 display the kernel reports); the present shader applies it. 7e3
+  render targets resolve through a shader that clamps and rounds to 7e3 and
+  2-bit alpha (no visible change here). Not done: the PWL form of the table
+  (10-bit front buffers), blend constants (plume pipelines keep them at 0).
 - The xenos plugin draws the in-game 3D black (only the HUD shows), so it
   is no reference for gameplay either.
 - Movie audio is pushed as it decodes, paced by the video queue (about
