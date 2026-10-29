@@ -24,9 +24,11 @@ mkdir -p "$out/xdg/data" "$out/xdg/config" "$out/xdg/cache" "$out/user" "$out/ho
 unset $(compgen -e | grep '^REX') 2>/dev/null || true
 
 # Runs inside gamescope: start the game, take the requested screenshots.
+# The game gets its own time limit: one that hangs would otherwise outlive
+# gamescope, orphaned under its reaper.
 inner='
-shots=$1 out=$2; shift 2
-"$@" &
+shots=$1 out=$2 secs=$3; shift 3
+timeout --kill-after=5 "$secs" "$@" &
 pid=$!
 t=0
 for s in $shots; do
@@ -59,6 +61,6 @@ exec env -u WAYLAND_DISPLAY -u DISPLAY HOME="$out/home" NG2_CONFIG="$out/ng2.tom
   XDG_DATA_HOME="$out/xdg/data" XDG_CONFIG_HOME="$out/xdg/config" XDG_CACHE_HOME="$out/xdg/cache" \
   timeout --kill-after=10 "$secs" \
   gamescope --backend headless "${gamescope_flags[@]}" -W 1280 -H 720 -w 1280 -h 720 -- \
-  bash -c "$inner" inner "${NG2_SHOTS:-}" "$out" \
+  bash -c "$inner" inner "${NG2_SHOTS:-}" "$out" "$secs" \
   ${NG2_WRAP:-} "$bin" --game_data_root="$root/game_files" --user_data_root="$out/user" \
   --input_backend=none --log_file="$out/ng2.log" "$@"
