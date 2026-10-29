@@ -507,6 +507,95 @@ REX_EXTERN(__imp__sub_82429DA8);  // a menu sound: (id), f1
 REX_EXTERN(__imp__sub_83682750);  // a menu transition: (n, flag)
 REX_EXTERN(__imp__sub_83681830);  // the page's state into the menu model
 
+// The title menu's entries (sub_8364CBE8): 0x140 bytes each, from
+// 0x85387600; at +0x124 the action, +0x128 the row's place, +0x130 "needs
+// Xbox LIVE" (shown greyed while signed out). LEADERBOARDS (action 3) goes,
+// the entries below move up into the rows above, and ours isn't greyed.
+constexpr uint32_t kTitleEntries = 0x85387600;
+constexpr uint32_t kTitleEntrySize = 0x140;
+constexpr uint32_t kTitleEntryCount = 0x85388500;
+constexpr uint32_t kEntryAction = 0x124, kEntryPlace = 0x128, kEntryOnline = 0x130;
+constexpr uint32_t kLeaderboards = 3, kMarketplace = 6;
+// A new last entry quits the game: action 7, which the title menu doesn't
+// handle; its picture (table 0x83A93700, by language and action) is the
+// atlas's EXIT DEMO band, redrawn as EXIT GAME (src/gpu/menu_label.cpp).
+constexpr uint32_t kExitAction = 7;
+constexpr uint32_t kEntryStoragePrompt = 0x12C;
+constexpr uint32_t kTitleEntryCapacity = 12;
+constexpr uint32_t kTitleCursor = 0x85388504;
+constexpr uint32_t kPadPressed = 0x83BF1F78;  // + pad * 0x44: newly pressed buttons
+constexpr uint32_t kConfirmButtons = 0x150;
+
+REX_EXTERN(__imp__sub_8364CBE8);
+REX_HOOK_RAW(sub_8364CBE8) {
+  __imp__sub_8364CBE8(ctx, base);
+  using ng2::guest::Load32;
+  uint32_t count = Load32(kTitleEntryCount);
+  if (count > 8) {
+    return;
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t entry = kTitleEntries + i * kTitleEntrySize;
+    if (Load32(entry + kEntryAction) == kMarketplace) {
+      Store32(entry + kEntryOnline, 0);
+    }
+  }
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t entry = kTitleEntries + i * kTitleEntrySize;
+    if (Load32(entry + kEntryAction) != kLeaderboards) {
+      continue;
+    }
+    for (uint32_t j = i; j + 1 < count; j++) {
+      uint32_t to = kTitleEntries + j * kTitleEntrySize;
+      uint32_t place = Load32(to + kEntryPlace);
+      std::memcpy(ng2::guest::Virtual(to), ng2::guest::Virtual(to + kTitleEntrySize),
+                  kTitleEntrySize);
+      Store32(to + kEntryPlace, place);
+    }
+    Store32(kTitleEntryCount, --count);
+    break;
+  }
+  if (count >= 1 && count < kTitleEntryCapacity) {
+    uint32_t last = kTitleEntries + (count - 1) * kTitleEntrySize;
+    uint32_t exit = last + kTitleEntrySize;
+    std::memcpy(ng2::guest::Virtual(exit), ng2::guest::Virtual(last), kTitleEntrySize);
+    Store32(exit + kEntryAction, kExitAction);
+    Store32(exit + kEntryPlace,
+            Load32(last + kEntryPlace) * 2 - Load32(last - kTitleEntrySize + kEntryPlace));
+    Store32(exit + kEntryStoragePrompt, 0);
+    Store32(exit + kEntryOnline, 0);
+    Store32(kTitleEntryCount, count + 1);
+  }
+}
+
+// The title menu's "signed in" check: ours always takes the signed-out path,
+// whose message sub_8364CFC8 turns into our screen.
+REX_EXTERN(__imp__sub_8364CA08);
+REX_HOOK_RAW(sub_8364CA08) {
+  uint32_t index = ctx.r3.u32;
+  if (index < ng2::guest::Load32(kTitleEntryCount) &&
+      ng2::guest::Load32(kTitleEntries + index * kTitleEntrySize + kEntryAction) == kMarketplace) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_8364CA08(ctx, base);
+}
+
+// The title menu's input: Confirm on the exit entry quits.
+REX_EXTERN(__imp__sub_8364D0C0);
+REX_HOOK_RAW(sub_8364D0C0) {
+  __imp__sub_8364D0C0(ctx, base);
+  using ng2::guest::Load32;
+  uint32_t player = *ng2::guest::Virtual(kPlayerPad);
+  uint32_t cursor = Load32(kTitleCursor);
+  if ((Load32(kPadPressed + player * 0x44) & kConfirmButtons) && cursor < Load32(kTitleEntryCount) &&
+      Load32(kTitleEntries + cursor * kTitleEntrySize + kEntryAction) == kExitAction &&
+      g_appContext) {
+    REXLOG_INFO("title menu: exit");
+    g_appContext->RequestDeferredQuit();
+  }
+}
+
 // Opening a screen: the Marketplace message becomes the Options screen with
 // our settings in it.
 REX_EXTERN(__imp__sub_8364CFC8);

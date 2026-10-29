@@ -1318,6 +1318,7 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   EndianSwap(mips.data(), mips.size(), fetch.endianness);
 
   std::vector<Upload> uploads;
+  uint32_t labelRows = 0;  // rows of the base level a menu label rewrote
   for (size_t i = 0; i < layout.levels.size(); i++) {
     const LevelLayout& level = layout.levels[i];
     uint64_t bytes = uint64_t((level.width + info.blockSize - 1) / info.blockSize) *
@@ -1327,12 +1328,27 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
     if (i == 0) {
       CopyLevel(fetch, info, level, base.data(), base.size(), upload.data);
       if (info.format == RenderFormat::R8_UNORM &&
-          RewriteMenuLabel(level.width, level.height, upload.data) == LabelResult::kRetry &&
+          RewriteMenuLabel(level.width, level.height, upload.data, &labelRows) ==
+              LabelResult::kRetry &&
           retry) {
         *retry = true;
       }
     } else {
       CopyLevel(fetch, info, level, mips.data(), mips.size(), upload.data);
+      // The rewritten rows' mips: 2x2 averages of the level above.
+      const LevelLayout& above = layout.levels[i - 1];
+      uint32_t rows = std::min((labelRows + (1u << i) - 1) >> i, level.height);
+      for (uint32_t y = 0; labelRows && y < rows; y++) {
+        for (uint32_t x = 0; x < level.width; x++) {
+          uint32_t sum = 0;
+          for (uint32_t k = 0; k < 4; k++) {
+            uint32_t sx = std::min(2 * x + (k & 1), above.width - 1);
+            uint32_t sy = std::min(2 * y + (k >> 1), above.height - 1);
+            sum += uploads[i - 1].data[sy * above.width + sx];
+          }
+          upload.data[y * level.width + x] = uint8_t((sum + 2) / 4);
+        }
+      }
     }
     uploads.push_back(upload);
   }
