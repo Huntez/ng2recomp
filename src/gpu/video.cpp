@@ -164,7 +164,7 @@ struct Profile {
     return v && v[0] == '1';
   }();
   uint64_t nanoseconds[size_t(Stage::kCount)] = {};
-  uint64_t hashedBytes = 0, uploadedBytes = 0, frames = 0;
+  uint64_t comparedBytes = 0, uploadedBytes = 0, frames = 0;
   std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 } g_profile;
 
@@ -199,8 +199,8 @@ void ReportProfile() {
   for (size_t i = 0; i < size_t(Stage::kCount); i++) {
     line += fmt::format(" {} {:.1f}", kStageNames[i], g_profile.nanoseconds[i] / 1e6);
   }
-  REXLOG_INFO("video: {} frames, ms:{}; hashed {:.1f} MB, uploaded {:.1f} MB", g_profile.frames,
-              line, g_profile.hashedBytes / 1048576.0, g_profile.uploadedBytes / 1048576.0);
+  REXLOG_INFO("video: {} frames, ms:{}; compared {:.1f} MB, uploaded {:.1f} MB", g_profile.frames,
+              line, g_profile.comparedBytes / 1048576.0, g_profile.uploadedBytes / 1048576.0);
   g_profile = Profile{};
   g_profile.last = now;
 }
@@ -210,17 +210,38 @@ void ReportProfile() {
 constexpr uint64_t GUEST_MEMORY_SIZE = 512ull << 20;
 std::unique_ptr<RenderBuffer> g_guestMemory;
 uint64_t g_guestMemoryAddress = 0;
-// Ranges uploaded to it: the hash of their contents then, the frame they were
-// last checked in and the frame they last changed in. A range that hasn't
-// changed for a frame is checked once a frame; one that has (a dynamic buffer
-// the game fills in batches, which the null backend never stalls) is checked
-// on every draw.
+// What g_guestMemory holds, byte for byte, as of the uploads recorded so far
+// (calloc: untouched pages cost nothing). Ranges compare the guest's memory
+// with it rather than with their own last contents: draws with different
+// ranges over the same memory (a ring buffer reused with other sizes)
+// overwrite each other's uploads.
+uint8_t* g_guestMemoryShadow = nullptr;
+
+// Ranges synced: the frame they were last checked in and the frame they last
+// changed in. A range that hasn't changed for a frame is checked once a
+// frame; one that has (a dynamic buffer the game fills in batches, which the
+// null backend never stalls) is checked on every draw.
+//
+// Some buffers are written after the draw that reads them: the game's jobs
+// fill bone matrices while the render thread goes on, since the console's
+// GPU reads them only after the frame is kicked off. A range found changed
+// at the end of a frame it was drawn in becomes late: its copy is still
+// recorded at its first draw in a frame, but filled from guest memory just
+// before the frame is submitted.
 struct GuestMemoryRange {
-  uint64_t hash = 0;
   uint64_t checkedFrame = ~0ull;
   uint64_t changedFrame = 0;
+  uint64_t lateFrame = ~0ull;  // frame its late copy was recorded in
+  bool late = false;
 };
 std::unordered_map<uint64_t, GuestMemoryRange> g_guestMemoryRanges;
+struct FrameRange {
+  uint32_t address, size;
+  GuestMemoryRange* range;
+  uint8_t* lateCopy;  // upload memory to fill, if late
+};
+// Ranges drawn with this frame, each once.
+std::vector<FrameRange> g_frameRanges;
 
 // Per-frame upload memory for constants and copies.
 constexpr uint64_t UPLOAD_CHUNK_SIZE = 32ull << 20;
@@ -352,6 +373,17 @@ std::unordered_map<uint64_t, std::unique_ptr<HostTexture>> g_resolvedTextures;
 // The latest resolve to each address, for a texture that views it with
 // another shape or format.
 std::unordered_map<uint32_t, HostTexture*> g_lastResolve;
+// Resolves don't write guest memory, so the memory a resolve targets keeps
+// its old bytes. When the CPU later writes there (a texture loaded into memory
+// that was once a render target), the resolved textures for that address are
+// stale and the guest texture is read instead.
+struct ResolvedMemory {
+  uint32_t size = 0;
+  uint64_t hash = 0;
+  uint64_t checkedFrame = ~0ull;
+  bool stale = false;
+};
+std::unordered_map<uint32_t, ResolvedMemory> g_resolvedMemory;
 
 // Framebuffers by attachment.
 struct FramebufferKey {
@@ -628,7 +660,30 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
     slot = std::move(host);
   }
   g_lastResolve[address] = slot.get();
+  auto& memory = g_resolvedMemory[address];
+  memory.size = uint32_t(std::min<uint64_t>(uint64_t(width) * height * RenderFormatSize(format),
+                                            GUEST_MEMORY_SIZE - address));
+  memory.hash = XXH3_64bits(guest::Physical(address), memory.size);
+  memory.checkedFrame = g_frameCount;
+  memory.stale = false;
   return slot.get();
+}
+
+// False once the CPU has overwritten the memory resolved to address.
+bool ResolveCurrent(uint32_t address) {
+  auto it = g_resolvedMemory.find(address);
+  if (it == g_resolvedMemory.end()) {
+    return true;
+  }
+  auto& memory = it->second;
+  if (!memory.stale && memory.checkedFrame != g_frameCount) {
+    memory.checkedFrame = g_frameCount;
+    memory.stale = XXH3_64bits(guest::Physical(address), memory.size) != memory.hash;
+    if (memory.stale && Tracing()) {
+      REXLOG_INFO("video: resolve memory {:#x} overwritten", address);
+    }
+  }
+  return !memory.stale;
 }
 
 // Texture objects keep CPU virtual addresses in their fetch constant; the
@@ -741,31 +796,7 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
   return upload;
 }
 
-// Makes guest physical [address, address + size) current in g_guestMemory.
-// always: inline vertex data in the ring buffer, rewritten at any time.
-void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false) {
-  if (!size || uint64_t(address) + size > GUEST_MEMORY_SIZE) {
-    return;
-  }
-  StageTimer timer(Stage::kSync);
-  auto& range = g_guestMemoryRanges[(uint64_t(address) << 32) | size];
-  bool first = range.checkedFrame == ~0ull;
-  bool stable = !first && range.changedFrame + 1 < g_frameCount;
-  if (!always && stable && range.checkedFrame == g_frameCount) {
-    return;
-  }
-  range.checkedFrame = g_frameCount;
-  const uint8_t* source = guest::Physical(address);
-  uint64_t hash = XXH3_64bits(source, size);
-  g_profile.hashedBytes += size;
-  if (!first && range.hash == hash) {
-    return;
-  }
-  range.hash = hash;
-  range.changedFrame = g_frameCount;
-  g_profile.uploadedBytes += size;
-  Upload upload = Allocate(size, 16);
-  std::memcpy(upload.data, source, size);
+void RecordGuestMemoryCopy(uint32_t address, const Upload& upload, uint32_t size) {
   auto* commandList = CommandList();
   commandList->barriers(RenderBarrierStage::COPY,
                         RenderBufferBarrier(g_guestMemory.get(), RenderBufferAccess::WRITE));
@@ -774,6 +805,97 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false) {
   commandList->barriers(RenderBarrierStage::GRAPHICS,
                         RenderBufferBarrier(g_guestMemory.get(),
                                             RenderBufferAccess::READ | RenderBufferAccess::WRITE));
+}
+
+// Makes guest physical [address, address + size) current in g_guestMemory.
+// always: inline vertex data in the ring buffer, rewritten at any time.
+void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false) {
+  if (!size || uint64_t(address) + size > GUEST_MEMORY_SIZE) {
+    return;
+  }
+  StageTimer timer(Stage::kSync);
+  auto& range = g_guestMemoryRanges[(uint64_t(address) << 32) | size];
+  if (range.late) {
+    if (range.lateFrame != g_frameCount) {
+      range.lateFrame = g_frameCount;
+      Upload upload = Allocate(size, 16);
+      RecordGuestMemoryCopy(address, upload, size);
+      g_frameRanges.push_back({address, size, &range, upload.data});
+    }
+    return;
+  }
+  bool first = range.checkedFrame == ~0ull;
+  if (!always && range.checkedFrame != g_frameCount) {
+    g_frameRanges.push_back({address, size, &range, nullptr});
+  }
+  bool stable = !first && range.changedFrame + 1 < g_frameCount;
+  if (!always && stable && range.checkedFrame == g_frameCount) {
+    return;
+  }
+  range.checkedFrame = g_frameCount;
+  const uint8_t* source = guest::Physical(address);
+  uint8_t* shadow = g_guestMemoryShadow + address;
+  g_profile.comparedBytes += size;
+  // Upload only the span between the first and last block that differ.
+  uint32_t begin = 0, end = size;
+  if (!first) {
+    if (std::memcmp(source, shadow, size) == 0) {
+      return;
+    }
+    constexpr uint32_t kBlock = 256;
+    while (begin < size &&
+           std::memcmp(source + begin, shadow + begin, std::min(kBlock, size - begin)) == 0) {
+      begin += kBlock;
+    }
+    while (end > begin) {
+      uint32_t blockStart = std::max(begin, (end - 1) / kBlock * kBlock);
+      if (std::memcmp(source + blockStart, shadow + blockStart, end - blockStart) != 0) {
+        break;
+      }
+      end = blockStart;
+    }
+  }
+  uint32_t length = end - begin;
+  range.changedFrame = g_frameCount;
+  g_profile.uploadedBytes += length;
+  std::memcpy(shadow + begin, source + begin, length);
+  Upload upload = Allocate(length, 16);
+  std::memcpy(upload.data, source + begin, length);
+  RecordGuestMemoryCopy(address + begin, upload, length);
+}
+
+// End of frame, before submitting: fills the late ranges' copies and finds
+// the ranges written after their draws.
+void FinishGuestMemory() {
+  // Find the ranges written after their draws first, against the shadow
+  // before the late copies below change it.
+  for (auto& frameRange : g_frameRanges) {
+    auto& range = *frameRange.range;
+    if (frameRange.lateCopy ||
+        std::memcmp(guest::Physical(frameRange.address),
+                    g_guestMemoryShadow + frameRange.address, frameRange.size) == 0) {
+      continue;
+    }
+    if (range.changedFrame + 1 >= g_frameCount) {
+      // Checked at every draw this frame and still written after the last.
+      range.late = true;
+      REXLOG_DEBUG("video: {:#x} ({} bytes) is written after its draws", frameRange.address,
+                   frameRange.size);
+    } else {
+      // Checked once this frame: next frame, check it at every draw first
+      // (it may only be filled between two of its draws).
+      range.changedFrame = g_frameCount;
+    }
+  }
+  for (auto& frameRange : g_frameRanges) {
+    if (frameRange.lateCopy) {
+      const uint8_t* source = guest::Physical(frameRange.address);
+      std::memcpy(frameRange.lateCopy, source, frameRange.size);
+      std::memcpy(g_guestMemoryShadow + frameRange.address, source, frameRange.size);
+      g_profile.uploadedBytes += frameRange.size;
+    }
+  }
+  g_frameRanges.clear();
 }
 
 // Shaders ---------------------------------------------------------------------
@@ -1028,14 +1150,16 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   uint32_t base = uint32_t(fetch.base_address) << 12;
 
   // Render-to-texture results live on the GPU.
-  if (auto it = g_resolvedTextures.find(ResolvedKey(base, fetch));
-      it != g_resolvedTextures.end()) {
-    Transition(*it->second, RenderTextureLayout::SHADER_READ);
-    return it->second->descriptor;
-  }
-  if (auto it = g_lastResolve.find(base); it != g_lastResolve.end()) {
-    Transition(*it->second, RenderTextureLayout::SHADER_READ);
-    return it->second->descriptor;
+  if (ResolveCurrent(base)) {
+    if (auto it = g_resolvedTextures.find(ResolvedKey(base, fetch));
+        it != g_resolvedTextures.end()) {
+      Transition(*it->second, RenderTextureLayout::SHADER_READ);
+      return it->second->descriptor;
+    }
+    if (auto it = g_lastResolve.find(base); it != g_lastResolve.end()) {
+      Transition(*it->second, RenderTextureLayout::SHADER_READ);
+      return it->second->descriptor;
+    }
   }
 
   TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
@@ -1431,7 +1555,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   GuestShader* ps = findShader(guest::Load32(device + 0x318C));
   RenderShader* vertexShader = vs ? GetHostShader(*vs) : nullptr;
   RenderShader* pixelShader = ps ? GetHostShader(*ps) : nullptr;
-  if (!vertexShader || !pixelShader || count == 0) {
+  // No pixel shader: a depth-only draw (Z prepass, shadow casters).
+  bool depthOnly = guest::Load32(device + 0x318C) == 0;
+  if (!vertexShader || (!pixelShader && !depthOnly) || count == 0) {
     return;
   }
 
@@ -1508,10 +1634,14 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     }
     uint32_t descriptor = GetTexture(fetch);
     if (Tracing()) {
-      REXLOG_INFO("  tex {} fmt {} {}x{} base {:#x} tiled {} endian {} dim {} -> {}", slot,
-                  uint32_t(fetch.format), fetch.size_2d.width + 1, fetch.size_2d.height + 1,
-                  uint32_t(fetch.base_address) << 12, uint32_t(fetch.tiled),
-                  uint32_t(fetch.endianness), uint32_t(fetch.dimension), descriptor);
+      REXLOG_INFO("  tex {} fmt {} {}x{} base {:#x} tiled {} endian {} dim {} sign {}{}{}{} "
+                  "swizzle {:#o} exp {} -> {}",
+                  slot, uint32_t(fetch.format), fetch.size_2d.width + 1,
+                  fetch.size_2d.height + 1, uint32_t(fetch.base_address) << 12,
+                  uint32_t(fetch.tiled), uint32_t(fetch.endianness), uint32_t(fetch.dimension),
+                  uint32_t(fetch.sign_x), uint32_t(fetch.sign_y), uint32_t(fetch.sign_z),
+                  uint32_t(fetch.sign_w), uint32_t(fetch.swizzle), int32_t(fetch.exp_adjust),
+                  descriptor);
     }
     if (descriptor) {
       shared.textureIndices[0][slot] = descriptor;  // 2D
@@ -1541,7 +1671,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   // Pixel shaders can fetch vertex data too.
   uint32_t fetchMask[3];
   for (int i = 0; i < 3; i++) {
-    fetchMask[i] = vs->entry->vertexFetchMask[i] | ps->entry->vertexFetchMask[i];
+    fetchMask[i] = vs->entry->vertexFetchMask[i] | (ps ? ps->entry->vertexFetchMask[i] : 0);
   }
   uint32_t declaration = guest::Load32(device + 0x2E24);
   if (declaration && !vs->elements.empty()) {
@@ -1678,7 +1808,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 
   PipelineKey key = {};
   key.vertexShader = vs->entry->hash;
-  key.pixelShader = ps->entry->hash;
+  key.pixelShader = ps ? ps->entry->hash : 1;  // 0 is the debug shader's
   key.primitive = primitive;
   for (uint32_t i = 0; i < 4; i++) {
     key.colorFormats[i] =
@@ -1693,14 +1823,14 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   // A target the pixel shader doesn't write keeps its contents.
   uint32_t written = 0;
   for (uint32_t i = 0; i < 4; i++) {
-    written |= (ps->colorOutputs >> i & 1) ? 0xFu << (i * 4) : 0;
+    written |= (ps && (ps->colorOutputs >> i & 1)) ? 0xFu << (i * 4) : 0;
   }
   key.colorMask = Register(device, 0x2104) & written & ((1u << (targetCount * 4)) - 1);
   key.depthControl = Register(device, 0x2200);
   key.stencilMasks = Register(device, 0x210D);
   key.cull = mode.value & 0x7;
   key.alphaTest = colorControl.alpha_test_enable;
-  key.alphaToCoverage = colorControl.alpha_to_mask_enable;
+  key.alphaToCoverage = ps && colorControl.alpha_to_mask_enable;  // needs a fragment shader
   if (Highlighted(vs->entry->hash)) {
     key.pixelShader = 0;  // the debug shader's pipelines
     pixelShader = g_debugShader.get();
@@ -1719,11 +1849,11 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     }
     REXLOG_INFO("  fetch95 {:08x} {:08x} vs container {:#x} ps container {:#x}",
                 shared.vertexFetch[95][0], shared.vertexFetch[95][1], vs->container,
-                ps->container);
+                ps ? ps->container : 0);
     REXLOG_INFO("draw prim {} count {} indexed {} vs {:016X} ps {:016X} target {}x{} fmt {} "
                 "targets {} mask {:#x} blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {} "
                 "base {} indx_offset {:#x} min/max {:#x}/{:#x}",
-                primitive, count, indexed, vs->entry->hash, ps->entry->hash,
+                primitive, count, indexed, vs->entry->hash, ps ? ps->entry->hash : 0,
                 sizeSource->width, sizeSource->height, uint32_t(sizeSource->format), targetCount,
                 key.colorMask, key.blendControls[0], key.depthControl, vte.value, viewport.x, viewport.y,
                 viewport.width, viewport.height, startVertex, Register(device, 0x2102),
@@ -1756,6 +1886,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 void Present(HostTexture* frontBuffer) {
   StageTimer timer(Stage::kPresent);
   auto* commandList = CommandList();
+  FinishGuestMemory();
 
   g_swapChainValid &= !g_swapChain->needsResize();
   if (!g_swapChainValid) {
@@ -1988,6 +2119,7 @@ void CreatePipelines() {
   g_guestMemory = g_device->createBuffer(RenderBufferDesc::DefaultBuffer(
       GUEST_MEMORY_SIZE, RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE));
   g_guestMemoryAddress = g_guestMemory->getDeviceAddress();
+  g_guestMemoryShadow = static_cast<uint8_t*>(std::calloc(GUEST_MEMORY_SIZE, 1));
 }
 
 }  // namespace
@@ -2061,6 +2193,10 @@ void DestroyHostDevice() {
     allocator.chunks.clear();
   }
   g_guestMemory.reset();
+  g_frameRanges.clear();
+  std::free(g_guestMemoryShadow);
+  g_guestMemoryShadow = nullptr;
+  g_guestMemoryRanges.clear();
   g_resolveTemps.clear();
   g_copyPipelines.clear();
   g_copyShader.reset();
@@ -2069,6 +2205,7 @@ void DestroyHostDevice() {
   g_surfaces.clear();
   g_lastResolve.clear();
   g_resolvedTextures.clear();
+  g_resolvedMemory.clear();
   g_presentPipeline.reset();
   g_presentShader.reset();
   g_fullscreenShader.reset();
