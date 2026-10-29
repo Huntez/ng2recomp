@@ -104,7 +104,9 @@ constexpr uint32_t kPlayTimeName = 0x2F;
 constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97;
 constexpr uint32_t kSlotCount = 0x98;  // past the last index used
 
-enum class Kind { kScale, kFiltering, kLevel, kOnOff, kPresent, kWindowMode, kWindowSize };
+enum class Kind {
+  kScale, kFiltering, kLevel, kOnOff, kPresent, kWindowMode, kWindowSize, kSamples
+};
 struct Setting {
   std::u16string_view label;
   std::array<std::u16string_view, 10> choices;
@@ -118,6 +120,8 @@ constexpr Setting kSettings[] = {
     {u"Texture Filtering", {u"Default", u"4x", u"8x", u"16x"}, 4, "anisotropic_filtering",
      Kind::kFiltering},
     {u"Bloom", {u"Off", u"Reduced", u"On"}, 3, "bloom", Kind::kLevel},
+    {u"Anti-Aliasing", {u"Off", u"2x MSAA", u"4x MSAA", u"8x MSAA"}, 4, "antialiasing",
+     Kind::kSamples},
     {u"Window Mode", {u"Windowed", u"Borderless", u"Fullscreen"}, 3, "fullscreen",
      Kind::kWindowMode},
     {u"Window Size", {u"1280x720", u"1600x900", u"1920x1080", u"2560x1440", u"3840x2160"}, 5,
@@ -145,13 +149,16 @@ struct Page {
 };
 constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
-     {{{0, 0x1E0, true, false}, {1, 0x450, true, true}, {2, 0x450 + kListSize, true, true}}},
-     3},
+     {{{0, 0x1E0, true, false},
+       {1, 0x450, true, true},
+       {2, 0x450 + kListSize, true, true},
+       {3, 0xA60, true, true}}},
+     4},
     {u"Display", 2, 0x1CC0, 0x1A20,
-     {{{3, 0x1E0, true, true},
-       {4, 0x1E0 + kListSize, true, true},
-       {5, 0x7F0, true, true},
-       {6, 0xE00, false, false}}},
+     {{{4, 0x1E0, true, true},
+       {5, 0x1E0 + kListSize, true, true},
+       {6, 0x7F0, true, true},
+       {7, 0xE00, false, false}}},
      4},
 };
 constexpr uint32_t kPageCount = std::size(kPages);
@@ -467,6 +474,10 @@ uint32_t ValueOf(const Setting& setting) {
       return uint32_t(std::clamp(GetInt(setting.name), 0, int32_t(setting.count) - 1));
     case Kind::kWindowMode:
       return GetSetting("fullscreen") != "true" ? 0 : GetSetting(kExclusive) == "true" ? 2 : 1;
+    case Kind::kSamples: {
+      int32_t samples = GetInt(setting.name);
+      return samples >= 8 ? 3 : samples >= 4 ? 2 : samples >= 2 ? 1 : 0;
+    }
     case Kind::kWindowSize:
       for (uint32_t i = 0; i < std::size(kWindowSizes); i++) {
         if (GetInt("windowed_width") == kWindowSizes[i].first &&
@@ -570,6 +581,9 @@ void SetValue(const Setting& setting, uint32_t value) {
     case Kind::kWindowMode:
       SetSetting(kExclusive, value == 2 ? "true" : "false");
       SetSetting("fullscreen", value != 0 ? "true" : "false");
+      break;
+    case Kind::kSamples:
+      SetSetting(setting.name, std::to_string(value == 0 ? 0 : 1 << value));
       break;
     case Kind::kWindowSize:
       SetSetting("windowed_width", std::to_string(kWindowSizes[value].first));

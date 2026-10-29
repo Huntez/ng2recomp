@@ -141,6 +141,12 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   window_width/height as the guest video mode; applied with
   SDL_SetWindowSize when windowed), V-Sync (present_mode: off, FIFO,
   mailbox, FIFO relaxed through plume's setPresentMode), Show FPS.
+- Graphics also has Anti-Aliasing (antialiasing: 0, 2, 4, 8 samples for
+  the targets the game multisamples, its 1120x584 main picture at 2x;
+  stepped down to what the device supports; list made at Game page +0xA60).
+- In gameplay, Back opens "IN-GAME MANUAL AND OPTIONS" (one list: manual,
+  camera and game settings, Quit Game, Return to Game); Start the
+  inventory. Not mapped yet.
 - show_fps (src/perf_overlay.cpp): a text item (sprite + text part, as the
   arrow lists' value text) in guest memory, given UI package 0's resource
   0xA (a text frame like package 0x78's 0x2A, which only Options loads),

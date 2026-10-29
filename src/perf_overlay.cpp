@@ -35,7 +35,7 @@ constexpr uint32_t kTextChars = 32;
 constexpr uint32_t kMenuFontSize = 0x1C;  // as the Options rows ask sub_836A9EB0
 // From the frame's anchor (about 953, 650 in the 1280x720 UI) to the top
 // left corner (left edge, line center).
-constexpr float kX = 32.0f - 953.0f, kY = 28.0f - 650.0f;
+constexpr float kX = 32.0f - 953.0f, kY = 16.0f - 650.0f;
 constexpr uint32_t kLayer = 0x15;
 constexpr uint32_t kAllocAttributes = 0xB2800000;
 // A text frame like the one the Options pages' arrow lists show their value

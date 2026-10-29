@@ -77,6 +77,10 @@ REXCVAR_DEFINE_INT32(present_mode, 1, "Video",
                      "How frames are shown: 0 off (no V-Sync, may tear), 1 FIFO (V-Sync), "
                      "2 mailbox (V-Sync, newest frame), 3 adaptive (V-Sync unless late)")
     .range(0, 3);
+REXCVAR_DEFINE_INT32(antialiasing, 2, "Video",
+                     "MSAA samples for the render targets the game multisamples (its main "
+                     "picture): 0 off, 2 as the game, 4 or 8")
+    .range(0, 8);
 REXCVAR_DEFINE_INT32(bloom, 2, "Video", "The game's bloom: 0 off, 1 reduced (half), 2 on")
     .range(0, 2);
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "Video",
@@ -336,6 +340,30 @@ uint64_t g_frameCount = 0;
 // many host pixels per guest pixel each way (render_scale, applied between
 // frames by ApplyRenderScale).
 uint32_t g_resolutionScale = 1;
+// MSAA samples for the targets the game multisamples (antialiasing, applied
+// with the render scale).
+uint32_t g_antialiasing = 2;
+// The setting, stepped down to what the device multisamples for the color
+// and depth formats the game's multisampled targets use.
+uint32_t AntialiasingSetting() {
+  int32_t setting = REXCVAR_GET(antialiasing);
+  uint32_t samples = setting >= 8 ? 8 : setting >= 4 ? 4 : setting >= 2 ? 2 : 0;
+  if (!g_device) {
+    return samples;
+  }
+  for (; samples > 2; samples /= 2) {
+    bool supported = true;
+    for (RenderFormat format :
+         {RenderFormat::R8G8B8A8_UNORM, RenderFormat::R16G16B16A16_FLOAT,
+          RenderFormat::D32_FLOAT_S8_UINT}) {
+      supported &= (g_device->getSampleCountsSupported(format) & samples) != 0;
+    }
+    if (supported) {
+      break;
+    }
+  }
+  return samples;
+}
 // The Options header picture's guest address, and how much wider ours is
 // than the game's (1: the game's is shown).
 struct MenuHeader {
@@ -555,15 +583,16 @@ RenderFormat ResolveTextureFormat(xenos::TextureFormat format) {
   }
 }
 
+// A guest target's sample count on the host: the antialiasing setting's for
+// targets the game multisamples (at least the game's), none for the others.
 RenderSampleCounts SampleCount(uint32_t msaa) {
-  switch (msaa) {
-    case 1:
-      return RenderSampleCount::COUNT_2;
-    case 2:
-      return RenderSampleCount::COUNT_4;
-    default:
-      return RenderSampleCount::COUNT_1;
+  if ((msaa != 1 && msaa != 2) || g_antialiasing < 2) {
+    return RenderSampleCount::COUNT_1;
   }
+  uint32_t samples = std::max(g_antialiasing, msaa == 1 ? 2u : 4u);
+  return samples >= 8   ? RenderSampleCount::COUNT_8
+         : samples >= 4 ? RenderSampleCount::COUNT_4
+                        : RenderSampleCount::COUNT_2;
 }
 
 // Frame -----------------------------------------------------------------------
@@ -2705,6 +2734,7 @@ bool IsNativeRenderer() {
 bool CreateHostDevice() {
   std::lock_guard lock(g_mutex);
   g_resolutionScale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 8));
+  g_antialiasing = AntialiasingSetting();
   RenderWindow renderWindow{};
   if (!GetRenderWindow(renderWindow)) {
     return false;
@@ -3108,11 +3138,12 @@ void UpdateGammaTable(uint32_t device) {
   Transition(*g_gammaTable, RenderTextureLayout::SHADER_READ);
 }
 
-// A new render_scale, between frames: the render targets are made again at
-// the new size (their contents start over).
+// A new render_scale or antialiasing, between frames: the render targets are
+// made again at the new size and sample count (their contents start over).
 void ApplyRenderScale() {
   uint32_t scale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 8));
-  if (scale == g_resolutionScale) {
+  uint32_t samples = AntialiasingSetting();
+  if (scale == g_resolutionScale && samples == g_antialiasing) {
     return;
   }
   WaitForGPU();
@@ -3129,7 +3160,8 @@ void ApplyRenderScale() {
   // Resolved textures stay (guest memory never got their pixels); each is
   // made again at the new scale by its next resolve (GetResolveDestination).
   g_resolutionScale = scale;
-  REXLOG_INFO("video: render scale {}", scale);
+  g_antialiasing = samples;
+  REXLOG_INFO("video: render scale {}, antialiasing {}", scale, samples);
 }
 
 void OnSwap(uint32_t device, uint32_t frontBuffer) {
