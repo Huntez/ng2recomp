@@ -40,7 +40,7 @@ render targets, Clear, Resolve (copy, MSAA resolve, format conversion by
 draw), Swap/present, draws (DrawVertices, DrawIndexedVertices, inline
 BeginVertices/BeginIndexedVertices), shaders from the ahead-of-time cache,
 2D/1D textures (base level), rect lists (geometry shader), quad lists.
-Debug aids: NG2_TRACE_FRAME=<n>, NG2_DUMP_TEXTURES=<dir> (DXT as DDS),
+Debug aids: NG2_TRACE_FRAME=<n>[+count], NG2_DUMP_TEXTURES=<dir> (DXT as DDS),
 NG2_DEBUG_WHITE_TEXTURES=1.
 
 ## Next
@@ -99,6 +99,13 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   Hair was black where a 1x1 tint texture read as black: small textures
   with packed mips keep their base level in the mip tail, and base rows
   are aligned to 32 blocks. Draws without a pixel shader (depth only) are drawn now.
+- Gameplay (10-29): textures have their mips now (Xenia's guest layout), so
+  distant windows and floors no longer shimmer; shadow casters get the
+  game's polygon offset (no acne). Lines at the HUD's edges were the last
+  row of tiled textures cut off: a tiled level can reach past pitch x rows
+  (Xenia's GetTiledAddressUpperBound2D). Not done: anisotropy (not enabled
+  on the device) and per-fetch LOD overrides (XenosRecomp samples with
+  implicit LOD).
 - The xenos plugin draws the in-game 3D black (only the HUD shows), so it
   is no reference for gameplay either.
 - Movie audio is pushed as it decodes, paced by the video queue (about

@@ -357,11 +357,16 @@ void DebugColor(uint64_t vertexShader, float color[4]) {
 }
 
 // NG2_TRACE_FRAME=<n>: log what frame n draws; t<seconds>: the first frame
-// that starts that long after the first draw.
+// that starts that long after the first draw. A +<count> suffix traces that
+// many frames from there.
 bool Tracing() {
   static const char* spec = std::getenv("NG2_TRACE_FRAME");
   static const bool byTime = spec && spec[0] == 't';
   static int64_t frame = spec && !byTime ? std::strtoll(spec, nullptr, 10) : -1ll;
+  static const int64_t count = [] {
+    const char* plus = spec ? std::strchr(spec, '+') : nullptr;
+    return plus ? std::max<int64_t>(std::strtoll(plus + 1, nullptr, 10), 1) : 1;
+  }();
   if (byTime && frame < 0) {
     static const auto start = std::chrono::steady_clock::now();
     if (std::chrono::steady_clock::now() - start >=
@@ -369,7 +374,7 @@ bool Tracing() {
       frame = int64_t(g_frameCount) + 1;
     }
   }
-  return int64_t(g_frameCount) == frame;
+  return frame >= 0 && int64_t(g_frameCount) >= frame && int64_t(g_frameCount) < frame + count;
 }
 
 std::unordered_map<uint64_t, std::pair<uint32_t, std::unique_ptr<RenderSampler>>> g_samplers;
@@ -1060,7 +1065,13 @@ uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
                                                                     : RenderFilter::LINEAR;
   desc.mipmapMode = fetch.mip_filter == xenos::TextureFilter::kLinear ? RenderMipmapMode::LINEAR
                                                                        : RenderMipmapMode::NEAREST;
-  desc.maxLOD = 0.0f;  // base level only for now
+  // The texture views hold only the levels the fetch constant has.
+  // Without a base address only the mips are there (Xenia's
+  // GetSubresourcesFromFetchConstant).
+  desc.minLOD = float(fetch.base_address ? uint32_t(fetch.mip_min_level)
+                                         : std::max(uint32_t(fetch.mip_min_level), 1u));
+  desc.maxLOD = fetch.mip_filter == xenos::TextureFilter::kBaseMap ? desc.minLOD : FLT_MAX;
+  desc.mipLODBias = std::clamp(float(fetch.lod_bias) / 32.0f, -15.0f, 15.0f);
   uint64_t hash = XXH3_64bits(&desc, sizeof(desc));
   auto& sampler = g_samplers[hash];
   if (!sampler.second) {
@@ -1074,74 +1085,182 @@ uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   return sampler.first;
 }
 
-// Where a texture's base level lies in guest memory, in blocks (Xenia's
-// texture_util::GetGuestTextureLayout and GetPackedMipOffset, level 0).
-struct BaseLevelLayout {
-  uint32_t pitchBlocks;     // row pitch: the fetch constant's, aligned to a 32-block tile
-  uint32_t offsetX, offsetY;  // within the packed mip tail, for textures of 16 or less
-  uint64_t size;            // bytes the level spans
+// Where each level of a guest texture lies in memory (Xenia's
+// texture_util::GetGuestTextureLayout and GetPackedMipOffset, 2D only).
+struct LevelLayout {
+  uint32_t width, height;     // texels
+  uint32_t pitchBlocks;       // row pitch, aligned to a 32-block tile
+  uint32_t offsetX, offsetY;  // blocks into the packed mip tail
+  uint64_t start;             // bytes from the base or mip address
+  uint64_t size;              // bytes from start the level spans
+};
+struct TextureLayout {
+  std::vector<LevelLayout> levels;  // the base, then the mips
+  uint32_t mipAddress = 0;          // guest physical
+  uint64_t mipsSize = 0;            // bytes from mipAddress the mips span
 };
 
-BaseLevelLayout GetBaseLevelLayout(const xenos::xe_gpu_texture_fetch_t& fetch,
-                                   const TextureFormatInfo& info, uint32_t width,
-                                   uint32_t height) {
-  BaseLevelLayout layout = {};
-  uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
-  uint32_t pitchTexels = std::max(uint32_t(fetch.pitch) << 5, width);
-  layout.pitchBlocks = ((pitchTexels + info.blockSize - 1) / info.blockSize + 31) & ~31u;
-  // Small textures with packed mips keep the base level in the mip tail: 16
-  // texels across, or down for wide ones.
-  auto log2Ceil = [](uint32_t value) { return uint32_t(std::bit_width(value - 1)); };
-  uint32_t log2Width = log2Ceil(width), log2Height = log2Ceil(height);
+uint32_t Log2Ceil(uint32_t value) { return uint32_t(std::bit_width(value - 1)); }
+
+// Bytes a level spans from its start. Tiled addresses of the last tile can
+// reach past pitch x rows (the 8-bit last row of a 300x145 HUD texture):
+// Xenia's GetTiledAddressUpperBound2D, from the origin of the last 32x32 tile.
+uint64_t LevelExtent(bool tiled, uint32_t pitchBlocks, uint32_t rightBlocks,
+                     uint32_t bottomBlocks, uint32_t bytesPerBlock) {
+  if (!tiled) {
+    return uint64_t(pitchBlocks) * (bottomBlocks - 1) * bytesPerBlock +
+           uint64_t(rightBlocks) * bytesPerBlock;
+  }
+  uint32_t bppLog2 = uint32_t(std::countr_zero(bytesPerBlock));
+  uint64_t bound = uint32_t(TiledOffset2D(int32_t((rightBlocks - 1) & ~31u),
+                                          int32_t((bottomBlocks - 1) & ~31u), pitchBlocks,
+                                          bppLog2));
+  return bound + (bppLog2 == 0 ? 0xA00 : bppLog2 == 1 ? 0xC00 : 0x400u << bppLog2);
+}
+
+// Levels from packedLevel on share one 32x32 tile, each at its own offset:
+// 16 texels across for the first (down for wide textures), then 8 and 4, then
+// the 2x2 and 1x1 ones along the other axis.
+void PackedMipOffset(uint32_t width, uint32_t height, uint32_t level, uint32_t blockSize,
+                     uint32_t& x, uint32_t& y) {
+  uint32_t log2Width = Log2Ceil(width), log2Height = Log2Ceil(height);
+  uint32_t log2Size = std::min(log2Width, log2Height);
+  uint32_t packedBase = log2Size > 4 ? log2Size - 4 : 0;
+  uint32_t packed = level - packedBase;
+  bool wide = log2Width > std::max(log2Height, 1u);  // 2x1 packs like a square
+  x = y = 0;
+  if (packed < 3) {
+    (wide ? y : x) = 16 >> packed;
+  } else if (wide) {
+    x = (1u << (log2Width - packedBase)) >> (packed - 2);
+  } else {
+    y = (1u << (log2Height - packedBase)) >> (packed - 2);
+  }
+  x /= blockSize;
+  y /= blockSize;
+}
+
+TextureLayout GetTextureLayout(const xenos::xe_gpu_texture_fetch_t& fetch,
+                               const TextureFormatInfo& info, uint32_t width, uint32_t height) {
+  TextureLayout layout;
+  auto blocks = [&](uint32_t texels) { return (texels + info.blockSize - 1) / info.blockSize; };
+  bool oneD = fetch.dimension == xenos::DataDimension::k1D;
   // (1D textures don't pack their mips: Xenia ignores the flag there.)
-  if (fetch.packed_mips && fetch.dimension != xenos::DataDimension::k1D &&
-      std::min(log2Width, log2Height) <= 4) {
-    bool wide = log2Width > std::max(log2Height, 1u);
-    layout.offsetX = wide ? 0 : 16 / info.blockSize;
-    layout.offsetY = wide ? 16 / info.blockSize : 0;
+  uint32_t log2Size = std::min(Log2Ceil(width), Log2Ceil(height));
+  uint32_t packedLevel =
+      fetch.packed_mips && !oneD ? (log2Size > 4 ? log2Size - 4 : 0) : ~0u;
+
+  LevelLayout base = {width, height};
+  uint32_t pitchTexels = std::max(uint32_t(fetch.pitch) << 5, width);
+  base.pitchBlocks = (blocks(pitchTexels) + 31) & ~31u;
+  if (packedLevel == 0) {
+    PackedMipOffset(width, height, 0, info.blockSize, base.offsetX, base.offsetY);
   }
-  uint32_t rows = blocksY + layout.offsetY;
-  if (fetch.tiled) {
-    rows = (rows + 31) & ~31u;
+  base.size = LevelExtent(fetch.tiled, base.pitchBlocks, blocks(width) + base.offsetX,
+                          blocks(height) + base.offsetY, info.bytesPerBlock);
+  layout.levels.push_back(base);
+
+  // With the base in the mip tail, the whole tail is at the base address.
+  uint32_t mipPage = packedLevel == 0 && fetch.base_address ? uint32_t(fetch.base_address)
+                                                            : uint32_t(fetch.mip_address);
+  // No mips for 1D or stacked textures (sampled as one 2D slice).
+  uint32_t sizeMaxLevel = uint32_t(std::bit_width(std::max(width, height)) - 1);
+  uint32_t maxLevel = 0;
+  if (mipPage && !oneD && !fetch.stacked) {
+    maxLevel = std::max(std::min(uint32_t(fetch.mip_max_level), sizeMaxLevel),
+                        std::min(uint32_t(fetch.mip_min_level), sizeMaxLevel));
   }
-  layout.size = uint64_t(layout.pitchBlocks) * rows * info.bytesPerBlock;
+  layout.mipAddress = mipPage << 12;
+  // Mips are laid out as for power-of-two base sizes, each level's rows
+  // aligned to 32 blocks (linear ones to 256 bytes) and its storage to 4 KB.
+  uint32_t pitchAlignment = fetch.tiled ? 32 : std::max(256 / info.bytesPerBlock, 32u);
+  uint64_t offset = 0;
+  for (uint32_t level = 1; level <= maxLevel; level++) {
+    uint32_t stored = std::min(level, packedLevel);
+    LevelLayout mip = {std::max(width >> level, 1u), std::max(height >> level, 1u)};
+    uint32_t pitch = blocks(std::max(std::bit_ceil(width) >> stored, 1u));
+    mip.pitchBlocks = (pitch + pitchAlignment - 1) / pitchAlignment * pitchAlignment;
+    if (level >= packedLevel) {
+      PackedMipOffset(width, height, level, info.blockSize, mip.offsetX, mip.offsetY);
+    }
+    mip.start = offset;
+    mip.size = LevelExtent(fetch.tiled, mip.pitchBlocks, blocks(mip.width) + mip.offsetX,
+                           blocks(mip.height) + mip.offsetY, info.bytesPerBlock);
+    layout.mipsSize = std::max(layout.mipsSize, mip.start + mip.size);
+    if (level < packedLevel) {
+      uint32_t rows = (blocks(std::max(std::bit_ceil(height) >> stored, 1u)) + 31) & ~31u;
+      offset += (uint64_t(mip.pitchBlocks) * rows * info.bytesPerBlock + 0xFFF) & ~0xFFFull;
+    }
+    layout.levels.push_back(mip);
+  }
   return layout;
 }
 
-// Uploads the base level of a guest texture: endian swap, untile.
-std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
-                                           const TextureFormatInfo& info, uint32_t width,
-                                           uint32_t height, const uint8_t* guestData,
-                                           uint32_t guestSize) {
-  uint32_t blocksX = (width + info.blockSize - 1) / info.blockSize;
-  uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
-  BaseLevelLayout layout = GetBaseLevelLayout(fetch, info, width, height);
+// Untiles one level into rows of its blocks. data and size: the memory at
+// the level's base or mip address, endian swapped.
+void CopyLevel(const xenos::xe_gpu_texture_fetch_t& fetch, const TextureFormatInfo& info,
+               const LevelLayout& level, const uint8_t* data, uint64_t size, uint8_t* out) {
+  uint32_t blocksX = (level.width + info.blockSize - 1) / info.blockSize;
+  uint32_t blocksY = (level.height + info.blockSize - 1) / info.blockSize;
   uint32_t bppLog2 = uint32_t(std::countr_zero(info.bytesPerBlock));
-
-  std::vector<uint8_t> swapped(guestData, guestData + guestSize);
-  EndianSwap(swapped.data(), swapped.size(), fetch.endianness);
-
   uint64_t rowBytes = uint64_t(blocksX) * info.bytesPerBlock;
-  Upload upload = Allocate(rowBytes * blocksY, 16);
-  uint64_t linearRowBytes = uint64_t(layout.pitchBlocks) * info.bytesPerBlock;
+  uint64_t linearRowBytes = uint64_t(level.pitchBlocks) * info.bytesPerBlock;
+  if (level.start >= size) {
+    return;
+  }
+  data += level.start;
+  size -= level.start;
   for (uint32_t y = 0; y < blocksY; y++) {
-    uint8_t* row = upload.data + y * rowBytes;
-    uint32_t guestY = y + layout.offsetY;
+    uint8_t* row = out + y * rowBytes;
+    uint32_t guestY = y + level.offsetY;
     if (fetch.tiled) {
       for (uint32_t x = 0; x < blocksX; x++) {
-        int32_t offset = TiledOffset2D(int32_t(x + layout.offsetX), int32_t(guestY),
-                                       layout.pitchBlocks, bppLog2);
-        if (offset >= 0 && uint64_t(offset) + info.bytesPerBlock <= guestSize) {
-          std::memcpy(row + x * info.bytesPerBlock, swapped.data() + offset, info.bytesPerBlock);
+        int32_t offset = TiledOffset2D(int32_t(x + level.offsetX), int32_t(guestY),
+                                       level.pitchBlocks, bppLog2);
+        if (offset >= 0 && uint64_t(offset) + info.bytesPerBlock <= size) {
+          std::memcpy(row + x * info.bytesPerBlock, data + offset, info.bytesPerBlock);
         }
       }
     } else {
-      uint64_t start = guestY * linearRowBytes + uint64_t(layout.offsetX) * info.bytesPerBlock;
-      if (start + rowBytes <= guestSize) {
-        std::memcpy(row, swapped.data() + start, rowBytes);
+      uint64_t start = guestY * linearRowBytes + uint64_t(level.offsetX) * info.bytesPerBlock;
+      if (start + rowBytes <= size) {
+        std::memcpy(row, data + start, rowBytes);
       }
     }
   }
+}
+
+// Uploads a guest texture and its mips: endian swap, untile.
+std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                           const TextureFormatInfo& info,
+                                           const TextureLayout& layout, const uint8_t* baseData,
+                                           uint64_t baseSize, const uint8_t* mipData,
+                                           uint64_t mipSize) {
+  uint32_t width = layout.levels[0].width, height = layout.levels[0].height;
+  std::vector<uint8_t> base(baseData, baseData + baseSize);
+  EndianSwap(base.data(), base.size(), fetch.endianness);
+  std::vector<uint8_t> mips(mipData, mipData + mipSize);
+  EndianSwap(mips.data(), mips.size(), fetch.endianness);
+
+  std::vector<Upload> uploads;
+  for (size_t i = 0; i < layout.levels.size(); i++) {
+    const LevelLayout& level = layout.levels[i];
+    uint64_t bytes = uint64_t((level.width + info.blockSize - 1) / info.blockSize) *
+                     ((level.height + info.blockSize - 1) / info.blockSize) * info.bytesPerBlock;
+    Upload upload = Allocate(bytes, 16);
+    std::memset(upload.data, 0, bytes);
+    if (i == 0) {
+      CopyLevel(fetch, info, level, base.data(), base.size(), upload.data);
+    } else {
+      CopyLevel(fetch, info, level, mips.data(), mips.size(), upload.data);
+    }
+    uploads.push_back(upload);
+  }
+  // The base level, for the dumps below.
+  uint32_t blocksX = (width + info.blockSize - 1) / info.blockSize;
+  uint32_t blocksY = (height + info.blockSize - 1) / info.blockSize;
+  uint64_t rowBytes = uint64_t(blocksX) * info.bytesPerBlock;
+  const Upload& upload = uploads[0];
 
   // NG2_DUMP_TEXTURES=<dir>: write decoded 8-bit and 8888 textures (PGM/PAM).
   static const char* dumpDir = std::getenv("NG2_DUMP_TEXTURES");
@@ -1193,18 +1312,24 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   host->width = width;
   host->height = height;
   host->format = info.format;
-  host->texture =
-      g_device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, info.format));
+  uint32_t levelCount = uint32_t(layout.levels.size());
+  host->texture = g_device->createTexture(
+      RenderTextureDesc::Texture2D(width, height, levelCount, info.format));
   Transition(*host, RenderTextureLayout::COPY_DEST);
-  CommandList()->copyTextureRegion(
-      RenderTextureCopyLocation::Subresource(host->texture.get()),
-      RenderTextureCopyLocation::PlacedFootprint(upload.buffer, info.format, width, height, 1,
-                                                 blocksX * info.blockSize, upload.offset));
+  for (uint32_t i = 0; i < levelCount; i++) {
+    const LevelLayout& level = layout.levels[i];
+    uint32_t rowTexels = (level.width + info.blockSize - 1) / info.blockSize * info.blockSize;
+    CommandList()->copyTextureRegion(
+        RenderTextureCopyLocation::Subresource(host->texture.get(), i),
+        RenderTextureCopyLocation::PlacedFootprint(uploads[i].buffer, info.format, level.width,
+                                                   level.height, 1, rowTexels,
+                                                   uploads[i].offset));
+  }
 
   RenderTextureViewDesc viewDesc;
   viewDesc.format = info.format;
   viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
-  viewDesc.mipLevels = 1;
+  viewDesc.mipLevels = levelCount;
   viewDesc.componentMapping = RenderComponentMapping(
       ConvertSwizzle(fetch.swizzle & 7), ConvertSwizzle((fetch.swizzle >> 3) & 7),
       ConvertSwizzle((fetch.swizzle >> 6) & 7), ConvertSwizzle((fetch.swizzle >> 9) & 7));
@@ -1258,28 +1383,37 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   }
   uint32_t width = oneD ? fetch.size_1d.width + 1 : fetch.size_2d.width + 1;
   uint32_t height = oneD ? 1 : fetch.size_2d.height + 1;
-  uint64_t guestSize = GetBaseLevelLayout(fetch, info, width, height).size;
+  TextureLayout layout = GetTextureLayout(fetch, info, width, height);
+  uint64_t guestSize = layout.levels[0].size;
   if (guestSize == 0 || base + guestSize > GUEST_MEMORY_SIZE) {
     ReportUnsupportedTexture("size", fetch);
     return 0;
   }
+  if (layout.mipAddress + layout.mipsSize > GUEST_MEMORY_SIZE) {
+    layout.levels.resize(1);  // mips past the end of memory: the base alone
+    layout.mipsSize = 0;
+  }
 
-  // Shape and view: dwords 0-2, the swizzle, and the dimension and packed
-  // mips bits of dword 5 (they move the base level); sampler fields don't
-  // matter.
-  uint32_t keyData[5] = {fetch.dword_0 & ~0x3FFFFFu, fetch.dword_1, fetch.dword_2,
-                         uint32_t(fetch.swizzle), fetch.dword_5 & 0xE00};
+  // Shape and view: dwords 0-2, the swizzle, the mip levels of dword 4, and
+  // the dimension, packed mips bit and mip address of dword 5; sampler fields
+  // don't matter.
+  uint32_t keyData[6] = {fetch.dword_0 & ~0x3FFFFFu, fetch.dword_1, fetch.dword_2,
+                         uint32_t(fetch.swizzle), fetch.dword_4 & 0x3FC,
+                         fetch.dword_5 & 0xFFFFFE00};
   uint64_t key = XXH3_64bits(keyData, sizeof(keyData));
   auto& cached = g_textures[key];
   if (cached.checkedFrame != g_frameCount) {
     cached.checkedFrame = g_frameCount;
     const uint8_t* data = guest::Physical(base);
-    uint64_t hash = XXH3_64bits(data, guestSize);
+    const uint8_t* mipData = guest::Physical(layout.mipAddress);
+    uint64_t hash = XXH3_64bits(data, guestSize) ^
+                    (layout.mipsSize ? XXH3_64bits(mipData, layout.mipsSize) * 0x9E3779B97F4A7C15ull
+                                     : 0);
     if (!cached.host || hash != cached.contentHash) {
       if (cached.host) {
         g_garbage[g_frame].push_back(std::move(cached.host));
       }
-      cached.host = CreateTexture(fetch, info, width, height, data, uint32_t(guestSize));
+      cached.host = CreateTexture(fetch, info, layout, data, guestSize, mipData, layout.mipsSize);
       cached.contentHash = hash;
     }
   }
@@ -1409,6 +1543,39 @@ static_assert(offsetof(SharedConstants, alphaFunc) == 1736);
 static_assert(offsetof(SharedConstants, debugColor) == 1744);
 
 // Pipeline state that varies per draw (hashed into the pipeline key).
+// The depth bias of a draw (PA_SU_POLY_OFFSET_*) in Vulkan's terms, picked
+// as Xenia does (draw_util::GetPreferredFacePolygonOffset): one bias for the
+// whole draw, the front face's unless that face is culled. The guest offset
+// is in depth units, about 2^-24 each on the host's float buffer near 1; the
+// scale is in 1/16 subpixels.
+void PolygonOffset(uint32_t device, reg::PA_SU_SC_MODE_CNTL mode, uint32_t primitive,
+                   float& constant, float& slope) {
+  float scale = 0.0f, offset = 0.0f;
+  auto type = xenos::PrimitiveType(primitive);
+  bool polygonal = type != xenos::PrimitiveType::kPointList &&
+                   type != xenos::PrimitiveType::kLineList &&
+                   type != xenos::PrimitiveType::kLineStrip &&
+                   type != xenos::PrimitiveType::kLineLoop &&
+                   type != xenos::PrimitiveType::kRectangleList;
+  if (polygonal) {
+    if (mode.poly_offset_front_enable && !mode.cull_front) {
+      scale = RegisterFloat(device, 0x2380);
+      offset = RegisterFloat(device, 0x2381);
+    }
+    if (mode.poly_offset_back_enable && !mode.cull_back && scale == 0.0f && offset == 0.0f) {
+      scale = RegisterFloat(device, 0x2382);
+      offset = RegisterFloat(device, 0x2383);
+    }
+  } else if (mode.poly_offset_para_enable) {
+    scale = RegisterFloat(device, 0x2380);
+    offset = RegisterFloat(device, 0x2381);
+  }
+  // The pipeline takes whole units: rounded away from zero, as Xenia's
+  // GetD3D10IntegerPolygonOffset (more bias is better than none).
+  constant = std::copysign(std::ceil(std::abs(offset) * float(1u << 24)), offset);
+  slope = scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+}
+
 struct PipelineKey {
   uint64_t vertexShader;  // shader cache entry hashes
   uint64_t pixelShader;
@@ -1423,6 +1590,8 @@ struct PipelineKey {
   uint32_t cull;
   uint32_t alphaTest;
   uint32_t alphaToCoverage;
+  float depthBias;  // host units (PolygonOffset)
+  float slopeDepthBias;
 };
 
 RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
@@ -1500,6 +1669,8 @@ RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
     desc.depthEnabled = depth.z_enable;
     desc.depthWriteEnabled = depth.z_enable && depth.z_write_enable;
     desc.depthFunction = ConvertCompare(depth.zfunc);
+    desc.depthBias = int32_t(key.depthBias);
+    desc.slopeScaledDepthBias = key.slopeDepthBias;
     desc.stencilEnabled = depth.stencil_enable;
     desc.stencilFrontFace.compareFunction = ConvertCompare(depth.stencilfunc);
     desc.stencilFrontFace.failOp = ConvertStencilOp(depth.stencilfail);
@@ -1919,6 +2090,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   key.depthControl = Register(device, 0x2200);
   key.stencilMasks = Register(device, 0x210D);
   key.cull = mode.value & 0x7;
+  PolygonOffset(device, mode, primitive, key.depthBias, key.slopeDepthBias);
   key.alphaTest = colorControl.alpha_test_enable;
   key.alphaToCoverage = ps && colorControl.alpha_to_mask_enable;  // needs a fragment shader
   // =all colors the skinned draws only (bones in fetch slot 94): other
@@ -1947,13 +2119,14 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                 ps ? ps->container : 0);
     REXLOG_INFO("draw prim {} count {} indexed {} vs {:016X} ps {:016X} target {}x{} fmt {} "
                 "targets {} mask {:#x} blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {} "
-                "base {} indx_offset {:#x} min/max {:#x}/{:#x} colorcontrol {:#x} bools {:08x}",
+                "base {} indx_offset {:#x} min/max {:#x}/{:#x} colorcontrol {:#x} bools {:08x} "
+                "bias {} {}",
                 primitive, count, indexed, vs->entry->hash, ps ? ps->entry->hash : 0,
                 sizeSource->width, sizeSource->height, uint32_t(sizeSource->format), targetCount,
                 key.colorMask, key.blendControls[0], key.depthControl, vte.value, viewport.x, viewport.y,
                 viewport.width, viewport.height, startVertex, Register(device, 0x2102),
                 Register(device, 0x2101), Register(device, 0x2100), colorControl.value,
-                shared.booleans[4]);
+                shared.booleans[4], key.depthBias, key.slopeDepthBias);
   }
   DrawRecord record;
   record.pipeline = pipeline;
@@ -1983,6 +2156,9 @@ void Present(HostTexture* frontBuffer) {
   StageTimer timer(Stage::kPresent);
   auto* commandList = CommandList();
   FinishGuestMemory();
+  if (Tracing()) {
+    REXLOG_INFO("present frame {}", g_frameCount);
+  }
 
   g_swapChainValid &= !g_swapChain->needsResize();
   if (!g_swapChainValid) {
