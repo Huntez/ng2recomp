@@ -1721,11 +1721,13 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                 shared.vertexFetch[95][0], shared.vertexFetch[95][1], vs->container,
                 ps->container);
     REXLOG_INFO("draw prim {} count {} indexed {} vs {:016X} ps {:016X} target {}x{} fmt {} "
-                "targets {} mask {:#x} blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {}",
+                "targets {} mask {:#x} blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {} "
+                "base {} indx_offset {:#x} min/max {:#x}/{:#x}",
                 primitive, count, indexed, vs->entry->hash, ps->entry->hash,
                 sizeSource->width, sizeSource->height, uint32_t(sizeSource->format), targetCount,
                 key.colorMask, key.blendControls[0], key.depthControl, vte.value, viewport.x, viewport.y,
-                viewport.width, viewport.height);
+                viewport.width, viewport.height, startVertex, Register(device, 0x2102),
+                Register(device, 0x2101), Register(device, 0x2100));
   }
   DrawRecord record;
   record.pipeline = pipeline;
