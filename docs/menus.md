@@ -74,3 +74,23 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   Game Settings has a language list, a two-choice row and five On/Off-style
   rows; Screen Settings: Aspect Ratio, Video Adjustment, "???"; Audio: three
   sliders, Speaker Output (5.1 / Stereo), "???".
+
+## RECOMP SETTINGS (built 10-29)
+
+- src/recomp_settings.cpp: sub_8364CFC8 turns the Marketplace message (13)
+  into Options (9) in recomp mode; sub_823E55B0 (the whole Options run, its
+  loop in sub_823E5778 switching on the page at 0x83CEB3F8) closes it. The
+  Camera page handler sub_823E7040 runs with our four values in the
+  settings object (pointer at 0x84C3B9E4, bytes +0x3B/+0x3C/+0x3E/+0x3F),
+  the player's put back after each frame. Row and choice texts are
+  rewritten in the string table (indices 0x97, 0x06, 0x07, 0x14-0x17,
+  0xAA, 0xAB); slider ranges in the range table at 0x83ADC2D8 (entries
+  0x1A, 0x1B: min, max, default). Changed settings are merged into the
+  config file on closing.
+- src/gpu/menu_label.cpp: the Marketplace label picture (520x90, hash
+  f8fb387ec4883ffc) is rebuilt as RECOMP SETTINGS from the entries' atlas
+  (520x990, hash 3737e258b350fa36), letters cut at bright-pixel valleys.
+- Known: the sliders keep their SLOW/FAST pictures; strings 0x14-0x17 also
+  show on the Controller page's Swimming Controls while open; Restore
+  Defaults can reset rows 0-1 to 1 when the profile asks for inverted
+  controls (words 0x852AE640+48/+52).

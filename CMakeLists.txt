@@ -14,7 +14,9 @@ include(generated/rexglue.cmake)
 set(NG2_SOURCES
     src/main.cpp
     src/gpu/video.cpp
+    src/gpu/menu_label.cpp
     src/gpu/d3d_hooks.cpp
+    src/recomp_settings.cpp
     src/movie/movie_hooks.cpp
     src/movie/host_movie.cpp
     src/debug_waits.cpp

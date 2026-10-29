@@ -42,6 +42,7 @@
 #include <smolv.h>
 
 #include "guest.h"
+#include "menu_label.h"
 #include "shader_cache.h"
 
 extern const uint8_t g_fullscreen_vs[];
@@ -1309,7 +1310,7 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
                                            const TextureFormatInfo& info,
                                            const TextureLayout& layout, const uint8_t* baseData,
                                            uint64_t baseSize, const uint8_t* mipData,
-                                           uint64_t mipSize) {
+                                           uint64_t mipSize, bool* retry = nullptr) {
   uint32_t width = layout.levels[0].width, height = layout.levels[0].height;
   std::vector<uint8_t> base(baseData, baseData + baseSize);
   EndianSwap(base.data(), base.size(), fetch.endianness);
@@ -1325,6 +1326,11 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
     std::memset(upload.data, 0, bytes);
     if (i == 0) {
       CopyLevel(fetch, info, level, base.data(), base.size(), upload.data);
+      if (info.format == RenderFormat::R8_UNORM &&
+          RewriteMenuLabel(level.width, level.height, upload.data) == LabelResult::kRetry &&
+          retry) {
+        *retry = true;
+      }
     } else {
       CopyLevel(fetch, info, level, mips.data(), mips.size(), upload.data);
     }
@@ -1575,8 +1581,10 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
       if (cached.host) {
         g_garbage[g_frame].push_back(std::move(cached.host));
       }
-      cached.host = CreateTexture(fetch, info, layout, data, guestSize, mipData, layout.mipsSize);
-      cached.contentHash = hash;
+      bool retry = false;  // made differently once another texture is seen
+      cached.host =
+          CreateTexture(fetch, info, layout, data, guestSize, mipData, layout.mipsSize, &retry);
+      cached.contentHash = retry ? 0 : hash;
     }
   }
   Transition(*cached.host, RenderTextureLayout::SHADER_READ);

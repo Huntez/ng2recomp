@@ -17,6 +17,7 @@
 #include "gpu/video.h"
 #include "movie/movie.h"
 #include "null_audio.h"
+#include "recomp_settings.h"
 #include "script_input.h"
 
 class Ng2App : public rex::ReXApp {
@@ -36,6 +37,7 @@ class Ng2App : public rex::ReXApp {
     if (config && *config) {
       paths.config_path = config;
     }
+    ng2::recomp_settings::SetConfigPath(paths.config_path);
   }
 
   // Game-specific defaults (from Xenia's compatibility notes for 544307D5),
