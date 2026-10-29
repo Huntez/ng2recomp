@@ -27,8 +27,26 @@ float ApplyGamma(Texture2D<float4> table, float value, uint channel)
 
 float4 main(in float4 position : SV_Position, in float2 texCoord : TEXCOORD0) : SV_Target
 {
-    float4 color = g_Texture2DDescriptorHeap[g_PushConstants.TextureIndex].Sample(
-        g_SamplerDescriptorHeap[g_PushConstants.SamplerIndex], texCoord);
+    Texture2D<float4> source = g_Texture2DDescriptorHeap[g_PushConstants.TextureIndex];
+    SamplerState samplerState = g_SamplerDescriptorHeap[g_PushConstants.SamplerIndex];
+    // Larger than the window (a render scale above 1): average a grid of
+    // bilinear taps over the pixel's footprint, up to 4x4, rather than one tap
+    // that would skip texels.
+    float2 size;
+    source.GetDimensions(size.x, size.y);
+    float2 footprint = float2(abs(ddx(texCoord.x)), abs(ddy(texCoord.y))) * size;
+    uint2 taps = uint2(clamp(ceil(footprint / 2.0), 1.0, 4.0));
+    float2 step = footprint / float2(taps) / size;
+    float2 start = texCoord - step * (float2(taps) - 1.0) * 0.5;
+    float4 color = 0.0;
+    for (uint y = 0; y < taps.y; y++)
+    {
+        for (uint x = 0; x < taps.x; x++)
+        {
+            color += source.SampleLevel(samplerState, start + step * float2(x, y), 0);
+        }
+    }
+    color /= float(taps.x * taps.y);
     if (g_PushConstants.GammaTableIndex != 0)
     {
         Texture2D<float4> table = g_Texture2DDescriptorHeap[g_PushConstants.GammaTableIndex];

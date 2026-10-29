@@ -113,6 +113,13 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   render targets resolve through a shader that clamps and rounds to 7e3 and
   2-bit alpha (no visible change here). Not done: the PWL form of the table
   (10-bit front buffers), blend constants (plume pipelines keep them at 0).
+- Settings (10-29), as cvars in ng2.toml or on the command line:
+  render_scale 1-4 (render targets and their resolves at that many times the
+  game's size; guest pixel values scaled where they reach the host; shaders
+  see guest pixels and texels via XenosRecomp patch 0007; changes apply
+  between frames), vsync, anisotropic_filtering (-1 game, 0 off, 1-5 for
+  1x-16x). The present shader box-filters a front buffer bigger than the
+  window.
 - The xenos plugin draws the in-game 3D black (only the HUD shows), so it
   is no reference for gameplay either.
 - Movie audio is pushed as it decodes, paced by the video queue (about

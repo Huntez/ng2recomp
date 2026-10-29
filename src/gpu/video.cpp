@@ -31,6 +31,7 @@
 
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
 #define XXH_INLINE_ALL
@@ -61,6 +62,16 @@ extern const uint8_t g_depth_copy_ms_ps[];
 extern const size_t g_depth_copy_ms_ps_size;
 extern const uint8_t g_debug_ps[];
 extern const size_t g_debug_ps_size;
+
+REXCVAR_DEFINE_INT32(render_scale, 1, "Video",
+                     "Internal resolution: render targets at this many times the game's size "
+                     "each way (1-4)")
+    .range(1, 4);
+REXCVAR_DEFINE_BOOL(vsync, true, "Video", "Wait for the display's refresh to present");
+REXCVAR_DEFINE_INT32(anisotropic_filtering, -1, "Video",
+                     "Anisotropic filtering for mipmapped textures: -1 as the game asks, "
+                     "0 off, 1-5 for 1x, 2x, 4x, 8x, 16x")
+    .range(-1, 5);
 
 namespace plume {
 std::unique_ptr<RenderInterface> CreateVulkanInterface();
@@ -101,6 +112,7 @@ struct HostTexture {
   std::unique_ptr<RenderTextureView> view;  // for the texture heap
   uint32_t descriptor = 0;                    // in the texture heap, 0 = none
   bool float7e3 = false;  // a color target last bound as 2_10_10_10_FLOAT
+  uint32_t scale = 1;     // host pixels per guest pixel (render targets, resolves)
 };
 
 struct DescriptorAllocator {
@@ -305,6 +317,10 @@ std::unordered_map<uint64_t, CachedTexture> g_textures;
 // frame's fence has passed.
 std::vector<std::unique_ptr<HostTexture>> g_garbage[NUM_FRAMES];
 uint64_t g_frameCount = 0;
+// Render scale: render targets and the textures resolved from them have this
+// many host pixels per guest pixel each way (render_scale, applied between
+// frames by ApplyRenderScale).
+uint32_t g_resolutionScale = 1;
 // The display gamma table (UpdateGammaTable).
 std::unique_ptr<HostTexture> g_gammaTable;
 uint64_t g_gammaTableHash = 0;
@@ -613,17 +629,24 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
   auto& slot = g_surfaces[key];
   if (!slot) {
     auto host = std::make_unique<HostTexture>();
-    host->width = key.width;
-    host->height = key.height;
+    host->scale = g_resolutionScale;
+    host->width = key.width * host->scale;
+    host->height = key.height * host->scale;
     host->samples = SampleCount(key.msaa);
     host->format = depth ? RenderFormat::D32_FLOAT_S8_UINT : ColorTargetFormat(guestFormat);
     RenderTextureDesc desc = RenderTextureDesc::Texture2D(
-        key.width, key.height, 1, host->format,
+        host->width, host->height, 1, host->format,
         depth ? RenderTextureFlag::DEPTH_TARGET : RenderTextureFlag::RENDER_TARGET);
     desc.multisampling.sampleCount = host->samples;
     host->texture = g_device->createTexture(desc);
-    REXLOG_INFO("video: {} target {}x{} edram {:#x} format {} msaa {}", depth ? "depth" : "color",
-                key.width, key.height, key.edramBase, guestFormat, key.msaa);
+    if (!host->texture) {
+      // Out of video memory, most likely at a high render scale.
+      REXLOG_ERROR("video: no {}x{} render target", host->width, host->height);
+      return nullptr;
+    }
+    REXLOG_INFO("video: {} target {}x{} edram {:#x} format {} msaa {} (scale {})",
+                depth ? "depth" : "color", key.width, key.height, key.edramBase, guestFormat,
+                key.msaa, host->scale);
     slot = std::move(host);
   }
   // 2_10_10_10_FLOAT and its 16_16_16_16 view hold 7e3 color (ResolveByDraw).
@@ -673,7 +696,9 @@ uint64_t ResolvedKey(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetc
 }
 
 // Host texture backing a guest texture written by resolves.
-HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetch) {
+// scale: the source's, so the copy is pixel for pixel.
+HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetch,
+                                   uint32_t scale) {
   RenderFormat format = ResolveTextureFormat(fetch.format);
   if (format == RenderFormat::UNKNOWN) {
     return nullptr;
@@ -681,13 +706,21 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
   uint32_t width = fetch.size_2d.width + 1;
   uint32_t height = fetch.size_2d.height + 1;
   auto& slot = g_resolvedTextures[ResolvedKey(address, fetch)];
+  if (slot && slot->scale != scale) {
+    g_garbage[g_frame].push_back(std::move(slot));  // resolved at another render scale
+  }
   if (!slot) {
     auto host = std::make_unique<HostTexture>();
-    host->width = width;
-    host->height = height;
+    host->scale = scale;
+    host->width = width * scale;
+    host->height = height * scale;
     host->format = format;
-    host->texture = g_device->createTexture(
-        RenderTextureDesc::Texture2D(width, height, 1, format, RenderTextureFlag::RENDER_TARGET));
+    host->texture = g_device->createTexture(RenderTextureDesc::Texture2D(
+        host->width, host->height, 1, format, RenderTextureFlag::RENDER_TARGET));
+    if (!host->texture) {
+      REXLOG_ERROR("video: no {}x{} resolve texture", host->width, host->height);
+      return nullptr;
+    }
     // Depth textures read their single channel everywhere, as Xenos does.
     if (fetch.format == xenos::TextureFormat::k_24_8 ||
         fetch.format == xenos::TextureFormat::k_24_8_FLOAT) {
@@ -1090,6 +1123,9 @@ uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
   // Anisotropy as the fetch constant asks (1x-16x), for filtered mipmapped
   // sampling like Xenia's; it implies linear filtering.
   uint32_t aniso = uint32_t(fetch.aniso_filter);
+  if (int32_t forced = REXCVAR_GET(anisotropic_filtering); forced >= 0) {
+    aniso = uint32_t(forced);  // the player's choice, as Xenia's anisotropic_override
+  }
   if (aniso >= 2 && aniso <= 5 && fetch.mip_filter != xenos::TextureFilter::kBaseMap &&
       desc.minFilter == RenderFilter::LINEAR && desc.magFilter == RenderFilter::LINEAR) {
     desc.anisotropyEnabled = true;
@@ -1395,14 +1431,16 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
 
   // Render-to-texture results live on the GPU.
   if (ResolveCurrent(base)) {
+    // The render scale above bit 20: shaders take fetch offsets in guest
+    // texels (XenosRecomp's getGuestTexture2DDimensions).
     if (auto it = g_resolvedTextures.find(ResolvedKey(base, fetch));
         it != g_resolvedTextures.end()) {
       Transition(*it->second, RenderTextureLayout::SHADER_READ);
-      return it->second->descriptor;
+      return it->second->descriptor | ((it->second->scale - 1) << 20);
     }
     if (auto it = g_lastResolve.find(base); it != g_lastResolve.end()) {
       Transition(*it->second, RenderTextureLayout::SHADER_READ);
-      return it->second->descriptor;
+      return it->second->descriptor | ((it->second->scale - 1) << 20);
     }
   }
 
@@ -1560,7 +1598,7 @@ struct SharedConstants {
   uint32_t vertexElements[16][4];
   float ndcTransform[4];
   uint32_t alphaFunc;  // RB_COLORCONTROL alpha_func
-  uint32_t padding[1];
+  float resolutionScale;  // host pixels per guest pixel (g_resolutionScale)
   float debugColor[4];  // NG2_DEBUG_HIGHLIGHT
 };
 static_assert(offsetof(SharedConstants, samplerIndices) == 512);
@@ -1570,6 +1608,7 @@ static_assert(offsetof(SharedConstants, vertexFetch) == 696);
 static_assert(offsetof(SharedConstants, vertexElements) == 1464);
 static_assert(offsetof(SharedConstants, ndcTransform) == 1720);
 static_assert(offsetof(SharedConstants, alphaFunc) == 1736);
+static_assert(offsetof(SharedConstants, resolutionScale) == 1740);
 static_assert(offsetof(SharedConstants, debugColor) == 1744);
 
 // Pipeline state that varies per draw (hashed into the pipeline key).
@@ -1603,7 +1642,9 @@ void PolygonOffset(uint32_t device, reg::PA_SU_SC_MODE_CNTL mode, uint32_t primi
   // The pipeline takes whole units: rounded away from zero, as Xenia's
   // GetD3D10IntegerPolygonOffset (more bias is better than none).
   constant = std::copysign(std::ceil(std::abs(offset) * float(1u << 24)), offset);
-  slope = scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+  // Per host pixel the depth slope is smaller by the render scale (Xenia
+  // multiplies by its resolution scale too).
+  slope = scale * xenos::kPolygonOffsetScaleSubpixelUnit * float(g_resolutionScale);
 }
 
 struct PipelineKey {
@@ -2017,10 +2058,14 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   HostTexture* sizeSource = target ? target : depth;
   float targetWidth = float(sizeSource->width);
   float targetHeight = float(sizeSource->height);
+  // The guest's viewport is in guest pixels; the target has scale host
+  // pixels for each.
+  float scale = float(sizeSource->scale);
+  shared.resolutionScale = scale;
   RenderViewport viewport(0.0f, 0.0f, targetWidth, targetHeight, 0.0f, 1.0f);
   if (vte.vport_x_scale_ena) {
-    float xScale = RegisterFloat(device, 0x210F), xOffset = RegisterFloat(device, 0x2110);
-    float yScale = RegisterFloat(device, 0x2111), yOffset = RegisterFloat(device, 0x2112);
+    float xScale = RegisterFloat(device, 0x210F) * scale, xOffset = RegisterFloat(device, 0x2110) * scale;
+    float yScale = RegisterFloat(device, 0x2111) * scale, yOffset = RegisterFloat(device, 0x2112) * scale;
     float zScale = RegisterFloat(device, 0x2113), zOffset = RegisterFloat(device, 0x2114);
     viewport = RenderViewport(xOffset - std::fabs(xScale), yOffset - std::fabs(yScale),
                               2.0f * std::fabs(xScale), 2.0f * std::fabs(yScale),
@@ -2034,9 +2079,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     shared.ndcTransform[0] = xScale < 0 ? -1.0f : 1.0f;
     shared.ndcTransform[1] = yScale < 0 ? 1.0f : -1.0f;
   } else {
-    // Window coordinates: map pixels to NDC over the whole target.
-    shared.ndcTransform[0] = 2.0f / targetWidth;
-    shared.ndcTransform[1] = -2.0f / targetHeight;
+    // Window coordinates (guest pixels): map them to NDC over the target.
+    shared.ndcTransform[0] = 2.0f * scale / targetWidth;
+    shared.ndcTransform[1] = -2.0f * scale / targetHeight;
     shared.ndcTransform[2] = -1.0f;
     shared.ndcTransform[3] = 1.0f;
   }
@@ -2190,6 +2235,7 @@ void Present(HostTexture* frontBuffer) {
     REXLOG_INFO("present frame {}", g_frameCount);
   }
 
+  g_swapChain->setVsyncEnabled(REXCVAR_GET(vsync));  // takes effect through a resize
   g_swapChainValid &= !g_swapChain->needsResize();
   if (!g_swapChainValid) {
     // Finish what was recorded, then rebuild the swapchain.
@@ -2439,6 +2485,7 @@ bool IsNativeRenderer() {
 
 bool CreateHostDevice() {
   std::lock_guard lock(g_mutex);
+  g_resolutionScale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 4));
   RenderWindow renderWindow{};
   if (!GetRenderWindow(renderWindow)) {
     return false;
@@ -2569,10 +2616,15 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
   // to clear.
   int32_t limitX = int32_t(target ? target->width : depth->width);
   int32_t limitY = int32_t(target ? target->height : depth->height);
+  int32_t scale = int32_t(target ? target->scale : depth->scale);  // guest to host pixels
   std::vector<RenderRect> clearRects;
   for (uint32_t i = 0; i < rectCount; i++) {
-    RenderRect rect(std::max(rects[i][0], 0), std::max(rects[i][1], 0),
-                    std::min(rects[i][2], limitX), std::min(rects[i][3], limitY));
+    // Clamped in guest pixels first: huge rects would overflow when scaled.
+    int32_t guestX = limitX / scale, guestY = limitY / scale;
+    RenderRect rect(std::clamp(rects[i][0], 0, guestX) * scale,
+                    std::clamp(rects[i][1], 0, guestY) * scale,
+                    std::clamp(rects[i][2], 0, guestX) * scale,
+                    std::clamp(rects[i][3], 0, guestY) * scale);
     if (rect.right > rect.left && rect.bottom > rect.top) {
       clearRects.push_back(rect);
     }
@@ -2633,7 +2685,7 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
   if (target && destTexture) {
     auto fetch = ReadTextureFetch(destTexture);
     uint32_t address = PhysicalAddress(uint32_t(fetch.base_address) << 12);
-    HostTexture* dest = GetResolveDestination(address, fetch);
+    HostTexture* dest = GetResolveDestination(address, fetch, target->scale);
     if (dest) {
       int32_t x1 = 0, y1 = 0, x2 = int32_t(target->width), y2 = int32_t(target->height);
       if (sourceRect) {
@@ -2644,6 +2696,12 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
       }
       uint32_t dx = destPoint ? guest::Load32(destPoint) : 0;
       uint32_t dy = destPoint ? guest::Load32(destPoint + 4) : 0;
+      // Guest pixels to the targets' host pixels.
+      if (sourceRect) {
+        int32_t scale = int32_t(target->scale);
+        x1 *= scale, y1 *= scale, x2 *= scale, y2 *= scale;
+      }
+      dx *= target->scale, dy *= target->scale;
       if (dx < dest->width && dy < dest->height) {
         x1 = std::max(x1, 0);
         y1 = std::max(y1, 0);
@@ -2829,6 +2887,30 @@ void UpdateGammaTable(uint32_t device) {
   Transition(*g_gammaTable, RenderTextureLayout::SHADER_READ);
 }
 
+// A new render_scale, between frames: the render targets are made again at
+// the new size (their contents start over).
+void ApplyRenderScale() {
+  uint32_t scale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 4));
+  if (scale == g_resolutionScale) {
+    return;
+  }
+  WaitForGPU();
+  for (auto& [key, texture] : g_surfaces) {
+    g_descriptors.Free(texture->descriptor);
+  }
+  for (auto& [source, texture] : g_resolveTemps) {
+    g_descriptors.Free(texture->descriptor);
+  }
+  g_framebuffers.clear();
+  g_boundFramebuffer = nullptr;
+  g_surfaces.clear();
+  g_resolveTemps.clear();
+  // Resolved textures stay (guest memory never got their pixels); each is
+  // made again at the new scale by its next resolve (GetResolveDestination).
+  g_resolutionScale = scale;
+  REXLOG_INFO("video: render scale {}", scale);
+}
+
 void OnSwap(uint32_t device, uint32_t frontBuffer) {
   std::lock_guard lock(g_mutex);
   if (!g_device) {
@@ -2854,6 +2936,7 @@ void OnSwap(uint32_t device, uint32_t frontBuffer) {
     }
   }
   Present(front);
+  ApplyRenderScale();
   ReportProfile();
 }
 
