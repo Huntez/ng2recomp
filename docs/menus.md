@@ -102,19 +102,34 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   the model at build), +0x600 = 1 marks the game's On/Off rows, whose value
   1 is the first choice.
 
-## RECOMP SETTINGS (built 10-29, reworked the same day)
+## RECOMP SETTINGS (built 10-29, reworked twice the same day)
 
 - src/recomp_settings.cpp: sub_8364CFC8 turns the Marketplace message (13)
   into Options (9) in recomp mode; sub_823E55B0 (the whole Options run)
-  closes it. The category list's handler is replaced: its first frame
-  enters the Game page as its Confirm would, and coming back to it leaves
-  Options. The Game page's builder runs with its row and choice calls
-  rewritten (our labels and choices, the language row and Save Method left
-  out, the rows below moved up, +0x600 cleared), and its handler is
-  replaced by ours on the same helpers. Texts go in the Music Test's track
-  name slots (0x63-0x96); the other category names and "Total Play Time"
-  are blanked, and the play time string (0x859D8DC4) is cleared each frame.
-  Changed settings are merged into the config file on closing.
+  closes it. The category list's handler is ours (categories Graphics and
+  Display, names written over category names 0x00 and 0x01, the rest
+  blanked). Graphics is the Game page (1), Display the Controller page (2):
+  their builders run with every row and choice call dropped, then our rows
+  are appended (reset, place, choices or list texts, value, sub_836AB540,
+  height). Arrow rows are list widgets (vtable 0x82281010, 0x270 bytes):
+  the Game page's language list plus two made in place over its Voice
+  Language choice widget (+0x450), as its constructor sub_83681EB0 makes
+  one (sprites sub_836DFDE0 at +0x50/+0xE0/+0x170, part sub_823E41F0 at
+  +0x200, +0x260 = 1). A list shows the pointer at +0x20 + 4 * value
+  (+0x234 the current one) and is placed for the first row only: its value
+  part's y (+0x244) and its arrow sprites' y (+0x34 in each) are moved down
+  to its row. The overwritten widget is put back before that page is next
+  built (the closing screen still draws ours). Texts go in the Music Test's
+  track name slots (0x63-0x96); "Total Play Time" is blanked and the play
+  time string (0x859D8DC4) cleared each frame. Changed settings are merged
+  into the config file on closing.
+- Title menu (sub_8364CBE8, entries of 0x140 bytes from 0x85387600: action
+  +0x124, place +0x128, Xbox LIVE flag +0x130): LEADERBOARDS removed, our
+  entry not greyed (and sub_8364CA08 reports it signed out), EXIT GAME
+  added as action 7 (pictures by language * 8 + action from the table at
+  0x83A93700; action 7 is the atlas's EXIT DEMO band).
+- The Options header ("OPTIONS", a 172x58 picture) is drawn as a full-screen
+  quad (x -2453..1386) placed by its shader's constants; not changed yet.
 - src/gpu/menu_label.cpp: the Marketplace label picture (520x90, hash
   f8fb387ec4883ffc) is rebuilt as RECOMP SETTINGS from the entries' atlas
   (520x990, hash 3737e258b350fa36), letters cut at bright-pixel valleys.
