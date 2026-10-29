@@ -68,6 +68,9 @@ REXCVAR_DEFINE_INT32(render_scale, 1, "Video",
                      "each way (1-4)")
     .range(1, 4);
 REXCVAR_DEFINE_BOOL(vsync, true, "Video", "Wait for the display's refresh to present");
+REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "Video",
+                    "Shift drawing by half a pixel where the game uses D3D's pixel centers, "
+                    "as the console does");
 REXCVAR_DEFINE_INT32(anisotropic_filtering, -1, "Video",
                      "Anisotropic filtering for mipmapped textures: -1 as the game asks, "
                      "0 off, 1-5 for 1x, 2x, 4x, 8x, 16x")
@@ -2062,10 +2065,21 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   // pixels for each.
   float scale = float(sizeSource->scale);
   shared.resolutionScale = scale;
+  // D3D's pixel centers (PA_SU_VTX_CNTL.pix_center 0) are at integer
+  // coordinates: shift everything by half a guest pixel, as Xenia does, or
+  // full-screen passes sample between texels and blurs drift.
+  reg::PA_SU_VTX_CNTL vtxControl;
+  vtxControl.value = Register(device, 0x2302);
+  float halfPixel = REXCVAR_GET(half_pixel_offset) &&
+                            vtxControl.pix_center == xenos::PixelCenter::kD3DZero
+                        ? 0.5f
+                        : 0.0f;
   RenderViewport viewport(0.0f, 0.0f, targetWidth, targetHeight, 0.0f, 1.0f);
   if (vte.vport_x_scale_ena) {
-    float xScale = RegisterFloat(device, 0x210F) * scale, xOffset = RegisterFloat(device, 0x2110) * scale;
-    float yScale = RegisterFloat(device, 0x2111) * scale, yOffset = RegisterFloat(device, 0x2112) * scale;
+    float xScale = RegisterFloat(device, 0x210F) * scale;
+    float xOffset = RegisterFloat(device, 0x2110) * scale;
+    float yScale = RegisterFloat(device, 0x2111) * scale;
+    float yOffset = RegisterFloat(device, 0x2112) * scale;
     float zScale = RegisterFloat(device, 0x2113), zOffset = RegisterFloat(device, 0x2114);
     viewport = RenderViewport(xOffset - std::fabs(xScale), yOffset - std::fabs(yScale),
                               2.0f * std::fabs(xScale), 2.0f * std::fabs(yScale),
@@ -2078,12 +2092,19 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     // shader) expects; mirror only the unusual signs.
     shared.ndcTransform[0] = xScale < 0 ? -1.0f : 1.0f;
     shared.ndcTransform[1] = yScale < 0 ? 1.0f : -1.0f;
+    // The half pixel moves the geometry, not the viewport (which clips): as
+    // Xenia's ndc_offset. A host pixel is 1/|scale| in NDC; y is negated by
+    // the shaders' -fvk-invert-y after this transform.
+    if (xScale != 0.0f && yScale != 0.0f) {
+      shared.ndcTransform[2] = halfPixel * scale / std::fabs(xScale);
+      shared.ndcTransform[3] = -halfPixel * scale / std::fabs(yScale);
+    }
   } else {
     // Window coordinates (guest pixels): map them to NDC over the target.
     shared.ndcTransform[0] = 2.0f * scale / targetWidth;
     shared.ndcTransform[1] = -2.0f * scale / targetHeight;
-    shared.ndcTransform[2] = -1.0f;
-    shared.ndcTransform[3] = 1.0f;
+    shared.ndcTransform[2] = -1.0f + halfPixel * shared.ndcTransform[0];
+    shared.ndcTransform[3] = 1.0f + halfPixel * shared.ndcTransform[1];
   }
 
   // Float constants, little-endian.
