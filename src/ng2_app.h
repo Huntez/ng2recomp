@@ -38,6 +38,7 @@ class Ng2App : public rex::ReXApp {
       paths.config_path = config;
     }
     ng2::recomp_settings::SetConfigPath(paths.config_path);
+    ng2::recomp_settings::SetAppContext(&app_context());
   }
 
   // Game-specific defaults (from Xenia's compatibility notes for 544307D5),

@@ -1,26 +1,29 @@
 // ng2 - Ninja Gaiden II static recompilation
 //
 // RECOMP SETTINGS: the title menu's Xbox LIVE Marketplace entry opens the
-// game's own Options screen with the recomp's settings in it
+// game's own Options screen as a screen of the recomp's settings
 // (docs/menus.md). While it is open:
 //
-// - The Camera Settings page shows the video settings: its row and choice
-//   texts are rewritten in the loaded string table (in place, each within its
-//   16-byte-aligned slot) and its four values, bytes of the game's settings
-//   object, hold ours around each run of the page's handler, so the game's
-//   own input, sounds and drawing edit them. The player's camera settings
-//   are put back after every run.
-// - The two sliders get new ranges (Bloom 0-2, V-Sync 0-1) in the game's
-//   option range table.
+// - Options starts on the Game Settings page, and Back leaves Options; the
+//   category list shows only "Recomp Settings" (the other names are blanked
+//   in the loaded string table).
+// - The page's builder (sub_836AC710) runs as usual, but its rows and choices
+//   are ours: the row and choice calls it makes are rewritten, rows we don't
+//   use are left out and the rows below them moved up. Our texts go in
+//   spare slots of the string table (the Music Test's track names).
+// - The page's handler (sub_823E6490) is replaced by one that edits our
+//   settings, using the game's own input, sound and menu-model functions.
 //
 // Everything is restored and the settings are saved when Options closes.
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,14 +31,10 @@
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
+#include <rex/ui/windowed_app_context.h>
 
 #include "gpu/guest.h"
 #include "recomp_settings.h"
-
-REXCVAR_DECLARE(int32_t, render_scale);
-REXCVAR_DECLARE(int32_t, anisotropic_filtering);
-REXCVAR_DECLARE(int32_t, bloom);
-REXCVAR_DECLARE(bool, vsync);
 
 namespace ng2::recomp_settings {
 namespace {
@@ -45,48 +44,92 @@ namespace {
 constexpr uint32_t kMarketplaceMessage = 13;
 constexpr uint32_t kOptionsScreen = 9;
 
-// The game's settings object, and the Camera page's values in it
-// (sub_823E7040): 1st/3rd-person camera controls, 1st/3rd-person speeds.
-constexpr uint32_t kSettingsPointer = 0x84C3B9E4;
-constexpr uint32_t kValueOffsets[4] = {0x3B, 0x3C, 0x3E, 0x3F};
+// Options state (sub_823E5778): the page (0 the category list, 1 Game
+// Settings, past 11 closes Options), the page before this frame's, the
+// depth, and a cursor per page.
+constexpr uint32_t kPage = 0x83CEB3F8;
+constexpr uint32_t kLastPage = 0x83CEB3FC;
+constexpr uint32_t kDepth = 0x83CEB400;
+constexpr uint32_t kCursors = 0x83CEB414;
+constexpr uint32_t kGamePage = 1;
+constexpr uint32_t kClosed = 0xFF;  // what the category list's Back sets
+// The pad state, the player's pad, and the menu model.
+constexpr uint32_t kPadState = 0x84F41264;
+constexpr uint32_t kPlayerPad = 0x84B5030A;
+constexpr uint32_t kMenuModel = 0x85313E30;
+constexpr uint32_t kCursorSound = 0x8206EE58;  // the float the sounds take
+// sub_83682750(n): the menu's transitions.
+constexpr uint32_t kChoiceChanged = 5;
+constexpr uint32_t kEnter = 6;
+constexpr uint32_t kLeave = 7;
 
-// Option ranges: 12-byte entries (min, max, default) from 0x83ADC2D8; the
-// Camera page's sliders use entries 0x1A and 0x1B.
-constexpr uint32_t kRangeTable = 0x83ADC2D8;
-constexpr uint32_t kSliderEntries[2] = {0x1A, 0x1B};
-constexpr int32_t kSliderRanges[2][3] = {{0, 2, 2}, {0, 1, 1}};  // Bloom, V-Sync
+// The Game Settings page object's rows, in the order its builder makes them:
+// the language list, six choice rows, the play time, Restore Defaults.
+constexpr uint32_t kLanguageRow = 0x1E0;
+constexpr uint32_t kChoiceRows[6] = {0x450, 0xA60, 0x1070, 0x1680, 0x1C90, 0x22A0};
+constexpr uint32_t kPlayTime = 0x28B0;
+constexpr uint32_t kRestoreRow = 0x2AD0;
+constexpr uint32_t kPlayTimeText = 0x859D8DC4;  // UTF-16, from sub_836AC0C8
+constexpr uint32_t kRowY = 0x1C;  // a row's position: x at +0x18, y here
+constexpr uint32_t kOnOffRow = 0x600;  // a choice row's flag: 1 shows its first choice
 
-// Texts, by index in the Options string table (table 2: "Game Settings"
-// first, strings back to back in 16-byte slots).
-struct Text {
-  uint32_t index;
-  std::u16string_view text;
+// Options strings: table 2 (id 0x20000 + index), strings back to back in
+// 16-byte slots.
+constexpr uint32_t kTable = 0x20000;
+constexpr uint32_t kCategoryName = 0x00;  // Game Settings
+// The other categories' names, blanked.
+constexpr uint32_t kHiddenNames[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x61, 0x97};
+constexpr uint32_t kPlayTimeName = 0x2F;
+// The Music Test's track names: room for our texts.
+constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97;
+constexpr uint32_t kSlotCount = 0x98;  // past the last index used
+
+struct Row {
+  std::u16string_view label;
+  std::array<std::u16string_view, 4> choices;
+  uint32_t count;
+  const char* setting;
 };
-constexpr Text kTexts[] = {
-    {0x97, u"Graphics"},           // Camera Settings
-    {0x06, u"Resolution"},         // 1st-Person Camera Controls
-    {0x07, u"Texture Filtering"},  // 3rd-Person Camera Controls
-    {0x14, u"Low"},                // Default
-    {0x15, u"Medium"},             // Vertical Inverted
-    {0x16, u"High"},               // Horizontal Inverted
-    {0x17, u"Ultra"},              // All Inverted
-    {0xAA, u"Bloom"},              // 1st-Person Cam. Speed
-    {0xAB, u"V-Sync"},             // 3rd-Person Cam. Speed
+constexpr Row kRows[] = {
+    {u"Render Scale", {u"1x", u"2x", u"3x", u"4x"}, 4, "render_scale"},
+    {u"Texture Filtering", {u"Default", u"4x", u"8x", u"16x"}, 4, "anisotropic_filtering"},
+    {u"Bloom", {u"Off", u"Reduced", u"On"}, 3, "bloom"},
+    {u"V-Sync", {u"On", u"Off"}, 2, "vsync"},
+    {u"Fullscreen", {u"On", u"Off"}, 2, "fullscreen"},
 };
+constexpr uint32_t kSettingRows = std::size(kRows);
+constexpr uint32_t kRowCount = kSettingRows + 1;  // and Restore Defaults
+constexpr std::u16string_view kRestoreText = u"Restore Defaults";
+constexpr std::u16string_view kTitle = u"Recomp Settings";
 
 bool g_open = false;
-bool g_changed = false;  // a setting changed while open: save on closing
-// The settings the menu edits, as saved in the config file.
-constexpr const char* kSettingNames[] = {"render_scale", "anisotropic_filtering", "bloom",
-                                         "vsync"};
+bool g_entered = false;  // the category list has opened our page
+// The settings changed while open, as set (fullscreen is applied later, on
+// the UI thread): saved on closing.
+std::map<std::string, std::string, std::less<>> g_written;
+// The game's own Game Settings values in the menu model, which ours replace.
+uint32_t g_modelSlots = 0;
+std::vector<uint8_t> g_savedModel;
 std::filesystem::path g_configPath;
+rex::ui::WindowedAppContext* g_appContext = nullptr;
 struct SavedBytes {
   uint32_t physical;
   std::vector<uint8_t> bytes;  // the game's
   std::vector<uint8_t> ours;   // what we wrote, to check before restoring
 };
 std::vector<SavedBytes> g_savedTexts;
-int32_t g_savedRanges[2][3];
+std::vector<std::pair<std::u16string_view, uint32_t>> g_textIds;  // our texts' string ids
+
+// The page being built, and how far its rows move up for the rows left out.
+uint32_t g_building = 0;
+struct Placed {
+  uint32_t offset;
+  float y;  // where the builder put it
+};
+std::vector<Placed> g_placed;
+float g_shift = 0.0f;
+bool g_lastSkipped = false;
+float g_lastY = 0.0f;
 
 uint32_t LoadBE32(const uint8_t* p) {
   return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
@@ -94,6 +137,17 @@ uint32_t LoadBE32(const uint8_t* p) {
 void StoreBE32(uint8_t* p, uint32_t value) {
   p[0] = uint8_t(value >> 24), p[1] = uint8_t(value >> 16), p[2] = uint8_t(value >> 8);
   p[3] = uint8_t(value);
+}
+void Store32(uint32_t address, uint32_t value) {
+  StoreBE32(guest::Virtual(address), value);
+}
+float LoadFloat(uint32_t address) {
+  return guest::LoadFloat(address);
+}
+void StoreFloat(uint32_t address, float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  Store32(address, bits);
 }
 
 std::vector<uint8_t> Utf16BE(std::u16string_view text) {
@@ -110,7 +164,6 @@ std::vector<uint8_t> Utf16BE(std::u16string_view text) {
 // is kept and checked first: a scan reads all of guest memory.
 std::vector<std::pair<uint32_t, uint32_t>> FindTextSlots() {
   constexpr uint32_t kPhysicalSize = 512u << 20;
-  constexpr uint32_t kSlotCount = 0xAC;  // past the last index used
   static uint32_t knownTable = ~0u;
   const uint8_t* memory = guest::Physical(0);
   std::vector<uint8_t> first = Utf16BE(u"Game Settings");
@@ -156,6 +209,61 @@ std::vector<std::pair<uint32_t, uint32_t>> FindTextSlots() {
   return slots;
 }
 
+// Writes text into a slot, keeping the game's bytes; false if it doesn't fit.
+bool WriteText(const std::pair<uint32_t, uint32_t>& slot, std::u16string_view text) {
+  auto [address, size] = slot;
+  std::vector<uint8_t> bytes = Utf16BE(text);
+  if (bytes.size() + 2 > size) {
+    return false;
+  }
+  uint8_t* at = guest::Physical(address);
+  SavedBytes saved{address, std::vector<uint8_t>(at, at + size), {}};
+  std::memset(at, 0, size);
+  std::memcpy(at, bytes.data(), bytes.size());
+  saved.ours.assign(at, at + size);
+  g_savedTexts.push_back(std::move(saved));
+  return true;
+}
+
+// Our texts into the spare slots, longest first, each in the smallest that
+// fits.
+void PlaceTexts(const std::vector<std::pair<uint32_t, uint32_t>>& slots) {
+  std::vector<std::u16string_view> texts{kRestoreText};
+  for (const Row& row : kRows) {
+    texts.push_back(row.label);
+    texts.insert(texts.end(), row.choices.begin(), row.choices.begin() + row.count);
+  }
+  std::sort(texts.begin(), texts.end(),
+            [](auto a, auto b) { return a.size() > b.size() || (a.size() == b.size() && a < b); });
+  texts.erase(std::unique(texts.begin(), texts.end()), texts.end());
+  std::vector<bool> used(slots.size());
+  for (std::u16string_view text : texts) {
+    uint32_t best = 0;
+    for (uint32_t i = kSpareFirst; i < kSpareEnd && i < slots.size(); i++) {
+      if (!used[i] && slots[i].second >= (text.size() + 1) * 2 &&
+          (!best || slots[i].second < slots[best].second)) {
+        best = i;
+      }
+    }
+    if (best && WriteText(slots[best], text)) {
+      used[best] = true;
+      g_textIds.emplace_back(text, kTable | best);
+    } else {
+      REXLOG_WARN("recomp settings: no room for a text");
+    }
+  }
+}
+
+// The string id of one of our texts (a blank one if it wasn't placed).
+uint32_t TextId(std::u16string_view text) {
+  for (auto [placed, id] : g_textIds) {
+    if (placed == text) {
+      return id;
+    }
+  }
+  return kTable | 0x34;  // an empty string
+}
+
 void Open() {
   if (g_open) {
     return;
@@ -164,29 +272,14 @@ void Open() {
   auto slots = FindTextSlots();
   if (slots.empty()) {
     REXLOG_WARN("recomp settings: Options texts not found");
-  }
-  for (const Text& text : kTexts) {
-    if (text.index >= slots.size()) {
-      continue;
+  } else if (slots.size() == kSlotCount) {
+    // The spare slots first: the table is found by its first name.
+    PlaceTexts(slots);
+    WriteText(slots[kCategoryName], kTitle);
+    for (uint32_t index : kHiddenNames) {
+      WriteText(slots[index], u"");
     }
-    auto [address, size] = slots[text.index];
-    std::vector<uint8_t> bytes = Utf16BE(text.text);
-    if (bytes.size() + 2 > size) {
-      continue;  // doesn't fit the slot
-    }
-    uint8_t* slot = guest::Physical(address);
-    SavedBytes saved{address, std::vector<uint8_t>(slot, slot + size), {}};
-    std::memset(slot, 0, size);
-    std::memcpy(slot, bytes.data(), bytes.size());
-    saved.ours.assign(slot, slot + size);
-    g_savedTexts.push_back(std::move(saved));
-  }
-  for (int i = 0; i < 2; i++) {
-    uint8_t* entry = guest::Virtual(kRangeTable + kSliderEntries[i] * 12);
-    for (int j = 0; j < 3; j++) {
-      g_savedRanges[i][j] = int32_t(LoadBE32(entry + j * 4));
-      StoreBE32(entry + j * 4, uint32_t(kSliderRanges[i][j]));
-    }
+    WriteText(slots[kPlayTimeName], u"");
   }
   REXLOG_INFO("recomp settings: open");
 }
@@ -210,8 +303,8 @@ void SaveSettings() {
       lines.push_back(line);
     }
   }
-  for (const char* name : kSettingNames) {
-    std::string entry = std::string(name) + " = " + rex::cvar::GetFlagByName(name);
+  for (const auto& [name, value] : g_written) {
+    std::string entry = name + " = " + value;
     size_t firstTable = lines.size();
     bool replaced = false;
     for (size_t i = 0; i < lines.size(); i++) {
@@ -243,47 +336,95 @@ void Close() {
     return;
   }
   g_open = false;
-  for (const SavedBytes& saved : g_savedTexts) {
-    uint8_t* slot = guest::Physical(saved.physical);
-    if (std::memcmp(slot, saved.ours.data(), saved.ours.size()) == 0) {
-      std::memcpy(slot, saved.bytes.data(), saved.bytes.size());
+  // Last written first: a slot written twice gets the game's bytes back.
+  for (auto it = g_savedTexts.rbegin(); it != g_savedTexts.rend(); ++it) {
+    uint8_t* slot = guest::Physical(it->physical);
+    if (std::memcmp(slot, it->ours.data(), it->ours.size()) == 0) {
+      std::memcpy(slot, it->bytes.data(), it->bytes.size());
     }
   }
   g_savedTexts.clear();
-  for (int i = 0; i < 2; i++) {
-    uint8_t* entry = guest::Virtual(kRangeTable + kSliderEntries[i] * 12);
-    for (int j = 0; j < 3; j++) {
-      StoreBE32(entry + j * 4, uint32_t(g_savedRanges[i][j]));
-    }
+  g_textIds.clear();
+  if (g_modelSlots) {
+    std::memcpy(guest::Virtual(g_modelSlots), g_savedModel.data(), g_savedModel.size());
+    g_modelSlots = 0;
   }
-  if (g_changed && !g_configPath.empty()) {
+  if (!g_written.empty() && !g_configPath.empty()) {
     SaveSettings();
   }
-  g_changed = false;
+  g_written.clear();
   REXLOG_INFO("recomp settings: closed");
 }
 
-// The settings as the Camera page's four values, and back.
-std::array<uint8_t, 4> ToValues() {
-  int32_t filtering = REXCVAR_GET(anisotropic_filtering);
-  uint8_t filter = filtering >= 5 ? 3 : filtering == 4 ? 2 : filtering == 3 ? 1 : 0;
-  return {uint8_t(std::clamp(REXCVAR_GET(render_scale), 1, 4) - 1), filter,
-          uint8_t(std::clamp(REXCVAR_GET(bloom), 0, 2)), uint8_t(REXCVAR_GET(vsync) ? 1 : 0)};
+// The settings as the rows' choices, and back.
+constexpr int32_t kFiltering[4] = {-1, 3, 4, 5};  // game, 4x, 8x, 16x
+
+// A setting's value, counting one set but not applied yet.
+std::string GetSetting(std::string_view name) {
+  if (auto it = g_written.find(name); it != g_written.end()) {
+    return it->second;
+  }
+  return rex::cvar::GetFlagByName(name);
 }
 
-// Only the rows the page changed: a setting the four choices can't show
-// exactly (filtering off, 1x, 2x) stays as it is until its row is changed.
-void FromValues(const std::array<uint8_t, 4>& before, const std::array<uint8_t, 4>& values) {
-  static constexpr int32_t kFiltering[4] = {-1, 3, 4, 5};  // game, 4x, 8x, 16x
-  std::string text[4] = {std::to_string(std::min<int>(values[0], 3) + 1),
-                         std::to_string(kFiltering[std::min<int>(values[1], 3)]),
-                         std::to_string(std::min<int>(values[2], 2)),
-                         values[3] ? "true" : "false"};
-  for (int i = 0; i < 4; i++) {
-    if (values[i] != before[i] && rex::cvar::GetFlagByName(kSettingNames[i]) != text[i]) {
-      rex::cvar::SetFlagByName(kSettingNames[i], text[i]);
-      g_changed = true;
+int32_t GetInt(std::string_view name) {
+  return std::atoi(GetSetting(name).c_str());
+}
+
+uint32_t ValueOf(uint32_t row) {
+  switch (row) {
+    case 0:
+      return uint32_t(std::clamp(GetInt("render_scale"), 1, 4) - 1);
+    case 1: {
+      int32_t filtering = GetInt("anisotropic_filtering");
+      return filtering >= 5 ? 3 : filtering == 4 ? 2 : filtering == 3 ? 1 : 0;
     }
+    case 2:
+      return uint32_t(std::clamp(GetInt("bloom"), 0, 2));
+    default:  // On, Off
+      return GetSetting(kRows[row].setting) == "true" ? 0 : 1;
+  }
+}
+
+void SetSetting(const char* name, const std::string& text) {
+  if (GetSetting(name) == text) {
+    return;
+  }
+  g_written[name] = text;
+  // The window belongs to the UI thread.
+  if (std::string_view(name) == "fullscreen" && g_appContext) {
+    g_appContext->CallInUIThread([text] { rex::cvar::SetFlagByName("fullscreen", text); });
+    return;
+  }
+  rex::cvar::SetFlagByName(name, text);
+}
+
+void SetValue(uint32_t row, uint32_t value) {
+  switch (row) {
+    case 0:
+      SetSetting(kRows[row].setting, std::to_string(value + 1));
+      break;
+    case 1:
+      SetSetting(kRows[row].setting, std::to_string(kFiltering[value]));
+      break;
+    case 2:
+      SetSetting(kRows[row].setting, std::to_string(value));
+      break;
+    default:
+      SetSetting(kRows[row].setting, value == 0 ? "true" : "false");
+      break;
+  }
+}
+
+void RestoreDefault(const Row& row) {
+  if (const auto* info = rex::cvar::GetFlagInfo(row.setting)) {
+    SetSetting(row.setting, info->default_value);
+  }
+}
+
+void RestoreDefaults() {
+  for (const Row& row : kRows) {
+    RestoreDefault(row);
   }
 }
 
@@ -293,9 +434,78 @@ void SetConfigPath(const std::filesystem::path& path) {
   g_configPath = path;
 }
 
+void SetAppContext(rex::ui::WindowedAppContext* context) {
+  g_appContext = context;
+}
+
 }  // namespace ng2::recomp_settings
 
 using namespace ng2::recomp_settings;
+
+namespace {
+
+// Calls a guest function with r3-r8 below the caller's guest stack (the
+// replaced handler has no frame of its own), leaving the caller's registers
+// as they were.
+uint32_t CallGuest(PPCContext& ctx, uint8_t* base, void (*function)(PPCContext&, uint8_t*),
+                   std::initializer_list<uint32_t> args, double f1 = 0.0) {
+  PPCContext saved = ctx;
+  ctx.r1.u64 = saved.r1.u32 - 0x200;
+  uint64_t* registers[] = {&ctx.r3.u64, &ctx.r4.u64, &ctx.r5.u64,
+                           &ctx.r6.u64, &ctx.r7.u64, &ctx.r8.u64};
+  size_t i = 0;
+  for (uint32_t arg : args) {
+    *registers[i++] = arg;
+  }
+  ctx.f1.f64 = f1;
+  function(ctx, base);
+  uint32_t result = ctx.r3.u32;
+  ctx = saved;
+  return result;
+}
+
+// Where a row of the page being built goes: one of ours (its index), Restore
+// Defaults (kSettingRows), or left out (-1).
+int RowOf(uint32_t offset) {
+  for (uint32_t i = 0; i < kSettingRows; i++) {
+    if (offset == kChoiceRows[i]) {
+      return int(i);
+    }
+  }
+  return offset == kRestoreRow ? int(kSettingRows) : -1;
+}
+
+// The first time the builder hands over a row, after placing it: rows below
+// rows left out move up by the space those took.
+bool FirstSeen(uint32_t offset) {
+  for (const Placed& placed : g_placed) {
+    if (placed.offset == offset) {
+      return false;
+    }
+  }
+  uint32_t address = g_building + offset + kRowY;
+  float y = LoadFloat(address);
+  if (g_lastSkipped) {
+    g_shift += y - g_lastY;
+  }
+  g_placed.push_back({offset, y});
+  g_lastSkipped = RowOf(offset) < 0;
+  g_lastY = y;
+  if (!g_lastSkipped) {
+    StoreFloat(address, y - g_shift);
+  }
+  return true;
+}
+
+}  // namespace
+
+REX_EXTERN(__imp__sub_823E3448);  // a pad direction: (pad state, pad, 1, 0, 0 up 1 down 2 right 3 left)
+REX_EXTERN(__imp__sub_823E3D78);  // Confirm: (&pad state, cursor, enabled[], 0)
+REX_EXTERN(__imp__sub_823E3ED0);  // Back: (&pad state, cursor, 0xFF, 0)
+REX_EXTERN(__imp__sub_823E3FD0);  // Y, a row's default: (&pad state)
+REX_EXTERN(__imp__sub_82429DA8);  // a menu sound: (id), f1
+REX_EXTERN(__imp__sub_83682750);  // a menu transition: (n, flag)
+REX_EXTERN(__imp__sub_83681830);  // the page's state into the menu model
 
 // Opening a screen: the Marketplace message becomes the Options screen with
 // our settings in it.
@@ -316,24 +526,194 @@ REX_HOOK_RAW(sub_823E55B0) {
   Close();
 }
 
-// The Camera Settings page, run with our values in place of the player's.
-REX_EXTERN(__imp__sub_823E7040);
-REX_HOOK_RAW(sub_823E7040) {
+// The loop starts with the first rows picked, and leaves the game's as they
+// were.
+REX_EXTERN(__imp__sub_823E5778);
+REX_HOOK_RAW(sub_823E5778) {
+  uint32_t saved[2] = {ng2::guest::Load32(kCursors), ng2::guest::Load32(kCursors + 4 * kGamePage)};
+  bool ours = g_open;
+  if (ours) {
+    Store32(kCursors, 0);
+    Store32(kCursors + 4 * kGamePage, 0);
+    g_entered = false;
+  }
+  __imp__sub_823E5778(ctx, base);
+  if (ours) {
+    // The game's Options keeps its own rows.
+    Store32(kCursors, saved[0]);
+    Store32(kCursors + 4 * kGamePage, saved[1]);
+  }
+}
+
+// The category list, replaced while ours is open: its first frame picks
+// Recomp Settings as the list's Confirm does, so the page comes in as usual;
+// coming back to it leaves Options.
+REX_EXTERN(__imp__sub_823E5B60);
+REX_HOOK_RAW(sub_823E5B60) {
   if (!g_open) {
-    __imp__sub_823E7040(ctx, base);
+    __imp__sub_823E5B60(ctx, base);
     return;
   }
-  uint32_t settings = ng2::guest::Load32(kSettingsPointer);
-  uint8_t* object = ng2::guest::Virtual(settings);
-  std::array<uint8_t, 4> player, shown = ToValues(), ours = shown;
-  for (int i = 0; i < 4; i++) {
-    player[i] = object[kValueOffsets[i]];
-    object[kValueOffsets[i]] = ours[i];
+  using ng2::guest::Load32;
+  uint32_t page = Load32(kPage);
+  if (!g_entered) {
+    g_entered = true;
+    Store32(kCursors, 0);
+    Store32(kPage, kGamePage);
+    Store32(kDepth, Load32(kDepth) + 1);
+    CallGuest(ctx, base, __imp__sub_83682750, {kEnter, 0});
+  } else {
+    Store32(kPage, kClosed);
+    CallGuest(ctx, base, __imp__sub_83682750, {kLeave, 0});
   }
-  __imp__sub_823E7040(ctx, base);
-  for (int i = 0; i < 4; i++) {
-    ours[i] = object[kValueOffsets[i]];
-    object[kValueOffsets[i]] = player[i];
+  uint32_t values = ctx.r1.u32 - 0x80;
+  for (uint32_t i = 0; i < 8; i++) {
+    Store32(values + 4 * i, 0);
   }
-  FromValues(shown, ours);
+  CallGuest(ctx, base, __imp__sub_83681830,
+            {kMenuModel, Load32(kLastPage), page, kCursors, values, 8});
+}
+
+// The Game Settings page's builder, run once as Options opens.
+REX_EXTERN(__imp__sub_836AC710);
+REX_HOOK_RAW(sub_836AC710) {
+  if (!g_open) {
+    __imp__sub_836AC710(ctx, base);
+    return;
+  }
+  g_building = ctx.r3.u32;
+  g_placed.clear();
+  g_shift = 0.0f;
+  g_lastSkipped = false;
+  // The builder sets each row's choice from the page's model slots, in the
+  // game's row order (ours are its rows 1-5). The game's are put back on
+  // closing, for its own Options.
+  g_modelSlots = ctx.r4.u32 + 0xB0;
+  uint8_t* slots = ng2::guest::Virtual(g_modelSlots);
+  g_savedModel.assign(slots, slots + 0x40);
+  for (uint32_t i = 0; i < kSettingRows; i++) {
+    Store32(ctx.r4.u32 + 0xB0 + 8 * (i + 1), ValueOf(i));
+  }
+  __imp__sub_836AC710(ctx, base);
+  g_building = 0;
+}
+
+// A choice of a row: our row's choices on its first, nothing after.
+REX_EXTERN(__imp__sub_836AA270);
+REX_HOOK_RAW(sub_836AA270) {
+  uint32_t offset = ctx.r3.u32 - g_building;
+  if (!g_building || offset >= kRestoreRow + 0x100) {
+    __imp__sub_836AA270(ctx, base);
+    return;
+  }
+  bool first = FirstSeen(offset);
+  int row = RowOf(offset);
+  if (row < 0 || row >= int(kSettingRows)) {
+    __imp__sub_836AA270(ctx, base);
+    return;
+  }
+  if (!first) {
+    return;
+  }
+  // Values are choice indices: not the game's On/Off rows (1 for the first).
+  Store32(ctx.r3.u32 + kOnOffRow, 0);
+  for (uint32_t i = 0; i < kRows[row].count; i++) {
+    CallGuest(ctx, base, __imp__sub_836AA270, {ctx.r3.u32, TextId(kRows[row].choices[i])});
+  }
+}
+
+// A row onto the page: ours under our label, the others left out.
+REX_EXTERN(__imp__sub_836AB540);
+REX_HOOK_RAW(sub_836AB540) {
+  uint32_t offset = ctx.r5.u32 - g_building;
+  if (!g_building || ctx.r3.u32 != g_building || offset >= kRestoreRow + 0x100) {
+    __imp__sub_836AB540(ctx, base);
+    return;
+  }
+  FirstSeen(offset);
+  int row = RowOf(offset);
+  if (row < 0) {
+    return;
+  }
+  ctx.r4.u64 = TextId(row < int(kSettingRows) ? kRows[row].label : kRestoreText);
+  __imp__sub_836AB540(ctx, base);
+}
+
+// The Game Settings page's handler, replaced while ours is open.
+REX_EXTERN(__imp__sub_823E6490);
+REX_HOOK_RAW(sub_823E6490) {
+  if (!g_open) {
+    __imp__sub_823E6490(ctx, base);
+    return;
+  }
+  using ng2::guest::Load32;
+  uint32_t page = Load32(kPage);
+  uint32_t cursorAddress = kCursors + 4 * page;
+  uint32_t cursor = std::min(Load32(cursorAddress), kRowCount - 1);
+  double sound = LoadFloat(kCursorSound);
+  if (CallGuest(ctx, base, __imp__sub_823E3ED0, {kPadState, cursor, 0xFF, 0})) {
+    // Back leaves Options, as from the category list.
+    Store32(kPage, kClosed);
+    CallGuest(ctx, base, __imp__sub_83682750, {kLeave, 0});
+  } else {
+    uint32_t pad = Load32(kPadState);
+    uint32_t player = *ng2::guest::Virtual(kPlayerPad);
+    auto pressed = [&](uint32_t direction) {
+      return CallGuest(ctx, base, __imp__sub_823E3448, {pad, player, 1, 0, direction}) != 0;
+    };
+    uint32_t moved = cursor;
+    if (pressed(0)) {
+      moved = (moved + kRowCount - 1) % kRowCount;
+    }
+    if (pressed(1)) {
+      moved = (moved + 1) % kRowCount;
+    }
+    if (moved != cursor) {
+      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+      cursor = moved;
+      Store32(cursorAddress, cursor);
+    }
+    if (cursor == kSettingRows) {
+      // Restore Defaults; the enabled[] list is only read for the list page.
+      if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
+        RestoreDefaults();
+        CallGuest(ctx, base, __imp__sub_83682750, {kEnter, 0});
+      }
+    } else {
+      uint32_t count = kRows[cursor].count;
+      uint32_t value = ValueOf(cursor);
+      uint32_t changed = value;
+      bool left = pressed(3);
+      if (left) {
+        changed = (changed + count - 1) % count;
+      }
+      if (pressed(2)) {
+        changed = (changed + 1) % count;
+      }
+      if (changed != value) {
+        CallGuest(ctx, base, __imp__sub_82429DA8, {3}, sound);
+        SetValue(cursor, changed);
+      } else if (CallGuest(ctx, base, __imp__sub_823E3FD0, {kPadState})) {
+        RestoreDefault(kRows[cursor]);
+      }
+      CallGuest(ctx, base, __imp__sub_83682750, {kChoiceChanged, left ? 0u : 1u});
+    }
+  }
+  // The rows' values, below the guest stack, for the menu model.
+  uint32_t values = ctx.r1.u32 - 0x80;
+  for (uint32_t i = 0; i < 8; i++) {
+    Store32(values + 4 * i, i < kSettingRows ? ValueOf(i) : 0);
+  }
+  CallGuest(ctx, base, __imp__sub_83681830,
+            {kMenuModel, Load32(kLastPage), page, kCursors, values, 8});
+}
+
+// The Game Settings page's play time, formatted each frame into a shared
+// string: blank on ours.
+REX_EXTERN(__imp__sub_836AC0C8);
+REX_HOOK_RAW(sub_836AC0C8) {
+  __imp__sub_836AC0C8(ctx, base);
+  if (g_open) {
+    Store32(kPlayTimeText, 0);
+  }
 }

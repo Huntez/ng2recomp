@@ -75,22 +75,46 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   rows; Screen Settings: Aspect Ratio, Video Adjustment, "???"; Audio: three
   sliders, Speaker Output (5.1 / Stereo), "???".
 
-## RECOMP SETTINGS (built 10-29)
+## Options pages (mapped 10-29, second pass)
+
+- Page handlers (input, per frame): 0 category list `sub_823E5B60`, 1 Game
+  `sub_823E6490`, 2 Controller `6AD8`, 3 Camera `7040`, 4 Screen `74E8`, 5
+  Audio `5DB8`, 7 `80B8`, 11 `7A18`; 0xFF (the list's Back) ends the loop.
+  0x83CEB3FC is the page before this frame, 0x83CEB400 the depth, and
+  0x83CEB414 + 4 * page each page's cursor. The loop runs the handler only
+  while the menu model's event is idle (`sub_836827B0`).
+- Handler helpers: `sub_823E3448(*0x84F41264, pad byte 0x84B5030A, 1, 0,
+  dir)` a direction (0 up, 1 down, 2 right, 3 left); `sub_823E3D78(&pad,
+  cursor, enabled[], 0)` Confirm; `sub_823E3ED0(&pad, cursor, n, 0)` Back;
+  `sub_823E3FD0(&pad)` Y (a row's default); `sub_82429DA8(id)` with f1 =
+  *(float*)0x8206EE58 a sound (2 cursor, 3 choice).
+- `sub_83682750(n, flag)`: transition table at 0x82181618 on the model
+  0x85313E30 (5 stores the choice direction flag at model+0x380, 6 enter,
+  7 back); `sub_83681830(model, lastPage, page, cursors, values, n)` keeps
+  cursors and values as (current, previous) pairs (values of page p at
+  0x85313EB0 + 0x40 * p) and raises page / cursor / value events.
+- Page builders run once as Options opens; the category list's is
+  `sub_836B10B8` (label ids as data at +0x34...), the Game page's
+  `sub_836AC710` (vtable 0x822810F4). A choice row is a widget whose
+  choices are added with `sub_836AA270(widget, string id)` (two per line,
+  so any count works), then `sub_836AB540(page, label id, widget)` appends
+  it as the next row. widget+0x14 is the selected choice (first set from
+  the model at build), +0x600 = 1 marks the game's On/Off rows, whose value
+  1 is the first choice.
+
+## RECOMP SETTINGS (built 10-29, reworked the same day)
 
 - src/recomp_settings.cpp: sub_8364CFC8 turns the Marketplace message (13)
-  into Options (9) in recomp mode; sub_823E55B0 (the whole Options run, its
-  loop in sub_823E5778 switching on the page at 0x83CEB3F8) closes it. The
-  Camera page handler sub_823E7040 runs with our four values in the
-  settings object (pointer at 0x84C3B9E4, bytes +0x3B/+0x3C/+0x3E/+0x3F),
-  the player's put back after each frame. Row and choice texts are
-  rewritten in the string table (indices 0x97, 0x06, 0x07, 0x14-0x17,
-  0xAA, 0xAB); slider ranges in the range table at 0x83ADC2D8 (entries
-  0x1A, 0x1B: min, max, default). Changed settings are merged into the
-  config file on closing.
+  into Options (9) in recomp mode; sub_823E55B0 (the whole Options run)
+  closes it. The category list's handler is replaced: its first frame
+  enters the Game page as its Confirm would, and coming back to it leaves
+  Options. The Game page's builder runs with its row and choice calls
+  rewritten (our labels and choices, the language row and Save Method left
+  out, the rows below moved up, +0x600 cleared), and its handler is
+  replaced by ours on the same helpers. Texts go in the Music Test's track
+  name slots (0x63-0x96); the other category names and "Total Play Time"
+  are blanked, and the play time string (0x859D8DC4) is cleared each frame.
+  Changed settings are merged into the config file on closing.
 - src/gpu/menu_label.cpp: the Marketplace label picture (520x90, hash
   f8fb387ec4883ffc) is rebuilt as RECOMP SETTINGS from the entries' atlas
   (520x990, hash 3737e258b350fa36), letters cut at bright-pixel valleys.
-- Known: the sliders keep their SLOW/FAST pictures; strings 0x14-0x17 also
-  show on the Controller page's Swimming Controls while open; Restore
-  Defaults can reset rows 0-1 to 1 when the profile asks for inverted
-  controls (words 0x852AE640+48/+52).
