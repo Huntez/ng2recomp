@@ -119,7 +119,10 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   see guest pixels and texels via XenosRecomp patch 0007; changes apply
   between frames), vsync, anisotropic_filtering (-1 game, 0 off, 1-5 for
   1x-16x). The present shader box-filters a front buffer bigger than the
-  window.
+  window. bloom 0/1/2 (off, half, on) acts on the bloom texture read from
+  slot 1 by tone mapping (ps 2CB124864F1A4460) and the final composite (ps
+  EAE805C57979C8A5); the temporal pass still reads it all. half_pixel_offset
+  moves geometry half a pixel for D3D pixel centers (default on, as Xenia).
 - The xenos plugin draws the in-game 3D black (only the HUD shows), so it
   is no reference for gameplay either.
 - Movie audio is pushed as it decodes, paced by the video queue (about

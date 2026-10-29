@@ -116,6 +116,7 @@ set(NG2_INTERNAL_SHADERS
     "copy_ps:ps_6_0"
     "copy_7e3_ps:ps_6_0"
     "copy_7e3_ms_ps:ps_6_0"
+    "scale_ps:ps_6_0"
     "depth_copy_ps:ps_6_0"
     "depth_copy_ms_ps:ps_6_0"
     "debug_ps:ps_6_0"

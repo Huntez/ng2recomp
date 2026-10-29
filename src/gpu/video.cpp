@@ -56,6 +56,8 @@ extern const uint8_t g_copy_7e3_ps[];
 extern const size_t g_copy_7e3_ps_size;
 extern const uint8_t g_copy_7e3_ms_ps[];
 extern const size_t g_copy_7e3_ms_ps_size;
+extern const uint8_t g_scale_ps[];
+extern const size_t g_scale_ps_size;
 extern const uint8_t g_depth_copy_ps[];
 extern const size_t g_depth_copy_ps_size;
 extern const uint8_t g_depth_copy_ms_ps[];
@@ -68,6 +70,8 @@ REXCVAR_DEFINE_INT32(render_scale, 1, "Video",
                      "each way (1-4)")
     .range(1, 4);
 REXCVAR_DEFINE_BOOL(vsync, true, "Video", "Wait for the display's refresh to present");
+REXCVAR_DEFINE_INT32(bloom, 2, "Video", "The game's bloom: 0 off, 1 reduced (half), 2 on")
+    .range(0, 2);
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "Video",
                     "Shift drawing by half a pixel where the game uses D3D's pixel centers, "
                     "as the console does");
@@ -169,6 +173,7 @@ std::unique_ptr<RenderShader> g_rectListShader;
 std::unique_ptr<RenderShader> g_copyShader;
 std::unique_ptr<RenderShader> g_copy7e3Shader;
 std::unique_ptr<RenderShader> g_copy7e3MsShader;
+std::unique_ptr<RenderShader> g_scaleShader;
 std::unique_ptr<RenderShader> g_debugShader;
 std::unique_ptr<RenderShader> g_depthCopyShader;
 std::unique_ptr<RenderShader> g_depthCopyMsShader;
@@ -1423,6 +1428,92 @@ void ReportUnsupportedTexture(const char* reason, const xenos::xe_gpu_texture_fe
 }
 
 // Descriptor index for a texture fetch constant, 0 if it can't be sampled.
+// The bloom (blurred bright parts, blended with the previous frame's) is
+// added to the picture by two passes, both from fetch slot 1: tone mapping
+// and the last full-screen composite. The bloom setting acts on what those
+// two read; the pass that blends in the previous frame still reads it all.
+constexpr uint64_t kToneMapPixelShader = 0x2CB124864F1A4460;
+constexpr uint64_t kCompositePixelShader = 0xEAE805C57979C8A5;
+constexpr uint32_t kBloomSlot = 1;
+std::unique_ptr<HostTexture> g_reducedBloom;  // bloom 1: the bloom at half strength
+
+// The bloom as the composite should read it (descriptor with the scale bits),
+// for bloom settings below 2.
+uint32_t AdjustBloom(const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t descriptor) {
+  int32_t setting = REXCVAR_GET(bloom);
+  if (setting >= 2 || !descriptor) {
+    return descriptor;
+  }
+  if (setting <= 0) {
+    return DESCRIPTOR_NULL_2D;  // blank: nothing added
+  }
+  // The resolved texture behind the descriptor (GetTexture's lookup).
+  uint32_t base = uint32_t(fetch.base_address) << 12;
+  HostTexture* source = nullptr;
+  if (!ResolveCurrent(base)) {
+    // GetTexture read guest memory instead
+  } else if (auto it = g_resolvedTextures.find(ResolvedKey(base, fetch));
+             it != g_resolvedTextures.end()) {
+    source = it->second.get();
+  } else if (auto last = g_lastResolve.find(base); last != g_lastResolve.end()) {
+    source = last->second;
+  }
+  if (!source || !source->descriptor) {
+    return descriptor;
+  }
+  auto& dest = g_reducedBloom;
+  if (dest && (dest->width != source->width || dest->height != source->height ||
+               dest->format != source->format || dest->scale != source->scale)) {
+    g_garbage[g_frame].push_back(std::move(dest));
+  }
+  if (!dest) {
+    dest = std::make_unique<HostTexture>();
+    dest->width = source->width;
+    dest->height = source->height;
+    dest->format = source->format;
+    dest->scale = source->scale;
+    dest->texture = g_device->createTexture(RenderTextureDesc::Texture2D(
+        dest->width, dest->height, 1, dest->format, RenderTextureFlag::RENDER_TARGET));
+    if (!dest->texture) {
+      dest.reset();
+      return descriptor;
+    }
+    SetDescriptor(*dest);
+  }
+  auto& pipeline = g_copyPipelines[(uint64_t(reinterpret_cast<uintptr_t>(g_scaleShader.get())) << 8) ^
+                                   uint64_t(dest->format)];
+  if (!pipeline) {
+    RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = g_pipelineLayout.get();
+    desc.vertexShader = g_fullscreenShader.get();
+    desc.pixelShader = g_scaleShader.get();
+    desc.renderTargetFormat[0] = dest->format;
+    desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+    desc.renderTargetCount = 1;
+    pipeline = g_device->createGraphicsPipeline(desc);
+  }
+  Transition(*source, RenderTextureLayout::SHADER_READ);
+  BindFramebuffer(dest.get(), nullptr);
+  auto* commandList = CommandList();
+  RenderViewport viewport(0.0f, 0.0f, float(dest->width), float(dest->height));
+  RenderRect scissor(0, 0, int32_t(dest->width), int32_t(dest->height));
+  float factor = 0.5f;
+  uint32_t constants[2] = {source->descriptor, 0};
+  std::memcpy(&constants[1], &factor, sizeof(factor));
+  commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
+  commandList->setPipeline(pipeline.get());
+  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+  commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+  commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+  commandList->setGraphicsPushConstants(0, constants, 0, sizeof(constants));
+  commandList->setViewports(&viewport, 1);
+  commandList->setScissors(&scissor, 1);
+  commandList->drawInstanced(3, 1, 0, 0);
+  Transition(*dest, RenderTextureLayout::SHADER_READ);
+  return dest->descriptor | ((dest->scale - 1) << 20);
+}
+
 uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   StageTimer timer(Stage::kTexture);
   bool oneD = fetch.dimension == xenos::DataDimension::k1D;
@@ -1968,6 +2059,10 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
       dwords[i] = guest::Load32(device + 0x480 + slot * 24 + i * 4);
     }
     uint32_t descriptor = GetTexture(fetch);
+    if (slot == kBloomSlot && ps &&
+        (ps->entry->hash == kToneMapPixelShader || ps->entry->hash == kCompositePixelShader)) {
+      descriptor = AdjustBloom(fetch, descriptor);
+    }
     if (Tracing()) {
       REXLOG_INFO("  tex {} fmt {} {}x{} base {:#x} tiled {} endian {} dim {} sign {}{}{}{} "
                   "swizzle {:#o} exp {} -> {}",
@@ -2484,6 +2579,7 @@ void CreatePipelines() {
   g_copyShader = CreateShader(g_copy_ps, g_copy_ps_size);
   g_copy7e3Shader = CreateShader(g_copy_7e3_ps, g_copy_7e3_ps_size);
   g_copy7e3MsShader = CreateShader(g_copy_7e3_ms_ps, g_copy_7e3_ms_ps_size);
+  g_scaleShader = CreateShader(g_scale_ps, g_scale_ps_size);
   g_debugShader = CreateShader(g_debug_ps, g_debug_ps_size);
   g_depthCopyShader = CreateShader(g_depth_copy_ps, g_depth_copy_ps_size);
   g_depthCopyMsShader = CreateShader(g_depth_copy_ms_ps, g_depth_copy_ms_ps_size);
@@ -2575,6 +2671,8 @@ void DestroyHostDevice() {
   g_copyShader.reset();
   g_copy7e3Shader.reset();
   g_copy7e3MsShader.reset();
+  g_scaleShader.reset();
+  g_reducedBloom.reset();
   g_rectListShader.reset();
   g_framebuffers.clear();
   g_surfaces.clear();
