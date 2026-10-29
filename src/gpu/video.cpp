@@ -68,9 +68,15 @@ extern const size_t g_debug_ps_size;
 
 REXCVAR_DEFINE_INT32(render_scale, 1, "Video",
                      "Internal resolution: render targets at this many times the game's size "
-                     "each way (1-4)")
-    .range(1, 4);
-REXCVAR_DEFINE_BOOL(vsync, true, "Video", "Wait for the display's refresh to present");
+                     "each way (1-8)")
+    .range(1, 8);
+REXCVAR_DEFINE_BOOL(vsync, true, "Video",
+                    "Wait for the display's refresh to present (older setting: present_mode "
+                    "takes over once set)");
+REXCVAR_DEFINE_INT32(present_mode, 1, "Video",
+                     "How frames are shown: 0 off (no V-Sync, may tear), 1 FIFO (V-Sync), "
+                     "2 mailbox (V-Sync, newest frame), 3 adaptive (V-Sync unless late)")
+    .range(0, 3);
 REXCVAR_DEFINE_INT32(bloom, 2, "Video", "The game's bloom: 0 off, 1 reduced (half), 2 on")
     .range(0, 2);
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "Video",
@@ -330,6 +336,12 @@ uint64_t g_frameCount = 0;
 // many host pixels per guest pixel each way (render_scale, applied between
 // frames by ApplyRenderScale).
 uint32_t g_resolutionScale = 1;
+// The Options header picture's guest address, and how much wider ours is
+// than the game's (1: the game's is shown).
+struct MenuHeader {
+  uint32_t base = ~0u;
+  float widthScale = 1.0f;
+} g_menuHeader;
 // The display gamma table (UpdateGammaTable).
 std::unique_ptr<HostTexture> g_gammaTable;
 uint64_t g_gammaTableHash = 0;
@@ -1317,15 +1329,42 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   std::vector<uint8_t> mips(mipData, mipData + mipSize);
   EndianSwap(mips.data(), mips.size(), fetch.endianness);
 
+  // The Options header while RECOMP SETTINGS is open: a wider picture of
+  // ours, one level (its draws are widened to match in Draw).
+  std::vector<uint8_t> header;
+  uint32_t headerWidth = 0;
+  if ((uint32_t(fetch.base_address) << 12) == g_menuHeader.base) {
+    g_menuHeader.widthScale = 1.0f;  // something else there now, unless it's the header again
+  }
+  if (info.format == RenderFormat::R8_UNORM && info.blockSize == 1) {
+    std::vector<uint8_t> level0(size_t(width) * height);
+    CopyLevel(fetch, info, layout.levels[0], base.data(), base.size(), level0.data());
+    bool isHeader = false;
+    bool ours = ReplaceMenuHeader(width, height, level0.data(), header, headerWidth, isHeader);
+    if (isHeader) {
+      g_menuHeader = {uint32_t(fetch.base_address) << 12,
+                      ours ? float(headerWidth) / float(width) : 1.0f};
+    }
+  }
+  TextureLayout replaced;
+  const TextureLayout* used = &layout;
+  if (!header.empty()) {
+    replaced.levels = {LevelLayout{headerWidth, height, 0, 0, 0, 0, header.size()}};
+    used = &replaced;
+    width = headerWidth;
+  }
+
   std::vector<Upload> uploads;
   uint32_t labelRows = 0;  // rows of the base level a menu label rewrote
-  for (size_t i = 0; i < layout.levels.size(); i++) {
-    const LevelLayout& level = layout.levels[i];
+  for (size_t i = 0; i < used->levels.size(); i++) {
+    const LevelLayout& level = used->levels[i];
     uint64_t bytes = uint64_t((level.width + info.blockSize - 1) / info.blockSize) *
                      ((level.height + info.blockSize - 1) / info.blockSize) * info.bytesPerBlock;
     Upload upload = Allocate(bytes, 16);
     std::memset(upload.data, 0, bytes);
-    if (i == 0) {
+    if (!header.empty()) {
+      std::memcpy(upload.data, header.data(), header.size());
+    } else if (i == 0) {
       CopyLevel(fetch, info, level, base.data(), base.size(), upload.data);
       if (info.format == RenderFormat::R8_UNORM &&
           RewriteMenuLabel(level.width, level.height, upload.data, &labelRows) ==
@@ -1336,7 +1375,7 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
     } else {
       CopyLevel(fetch, info, level, mips.data(), mips.size(), upload.data);
       // The rewritten rows' mips: 2x2 averages of the level above.
-      const LevelLayout& above = layout.levels[i - 1];
+      const LevelLayout& above = used->levels[i - 1];
       uint32_t rows = std::min((labelRows + (1u << i) - 1) >> i, level.height);
       for (uint32_t y = 0; labelRows && y < rows; y++) {
         for (uint32_t x = 0; x < level.width; x++) {
@@ -1408,12 +1447,12 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   host->width = width;
   host->height = height;
   host->format = info.format;
-  uint32_t levelCount = uint32_t(layout.levels.size());
+  uint32_t levelCount = uint32_t(used->levels.size());
   host->texture = g_device->createTexture(
       RenderTextureDesc::Texture2D(width, height, levelCount, info.format));
   Transition(*host, RenderTextureLayout::COPY_DEST);
   for (uint32_t i = 0; i < levelCount; i++) {
-    const LevelLayout& level = layout.levels[i];
+    const LevelLayout& level = used->levels[i];
     uint32_t rowTexels = (level.width + info.blockSize - 1) / info.blockSize * info.blockSize;
     CommandList()->copyTextureRegion(
         RenderTextureCopyLocation::Subresource(host->texture.get(), i),
@@ -1593,6 +1632,10 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
     uint64_t hash = XXH3_64bits(data, guestSize) ^
                     (layout.mipsSize ? XXH3_64bits(mipData, layout.mipsSize) * 0x9E3779B97F4A7C15ull
                                      : 0);
+    // The Options header is made again when ours comes or goes.
+    if (info.format == RenderFormat::R8_UNORM && base == g_menuHeader.base) {
+      hash += MenuHeaderGeneration();
+    }
     if (!cached.host || hash != cached.contentHash) {
       if (cached.host) {
         g_garbage[g_frame].push_back(std::move(cached.host));
@@ -1918,6 +1961,7 @@ struct InlineData {
 struct PendingDraw {
   DrawRecord record;
   InlineData data;
+  float widen = 1.0f;  // the Options header's: x by this much from its left edge
 };
 std::optional<PendingDraw> g_pendingDraw;
 
@@ -1967,6 +2011,22 @@ void FlushPendingDraw() {
   PendingDraw pending = std::move(*g_pendingDraw);
   g_pendingDraw.reset();
   auto& data = pending.data;
+  // The header is a quad of inline vertices (position first), made each
+  // frame: wider by as much as the picture, from its left edge.
+  if (pending.widen != 1.0f && data.stride >= 12) {
+    uint32_t count = data.vertexBytes / data.stride;
+    float left = std::numeric_limits<float>::max();
+    for (uint32_t i = 0; i < count; i++) {
+      left = std::min(left, guest::LoadFloat(data.vertexAddress + i * data.stride));
+    }
+    for (uint32_t i = 0; i < count; i++) {
+      uint32_t address = data.vertexAddress + i * data.stride;
+      float x = left + (guest::LoadFloat(address) - left) * pending.widen;
+      uint32_t bits;
+      std::memcpy(&bits, &x, sizeof(bits));
+      *reinterpret_cast<uint32_t*>(guest::Virtual(address)) = rex::byte_swap(bits);
+    }
+  }
   SyncGuestMemory(PhysicalAddress(data.vertexAddress), data.vertexBytes, true);
   if (Tracing()) {
     const uint32_t* v = reinterpret_cast<const uint32_t*>(guest::Virtual(data.vertexAddress));
@@ -2072,6 +2132,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     shared.booleans[i] = guest::Load32(device + 0x2780 + i * 4);
   }
   // Textures: the 32 fetch constants that hold one (24 bytes each).
+  bool widenHeader = false;  // the Options header, ours: a wider picture
   for (uint32_t slot = 0; slot < 32; slot++) {
     if ((guest::Load32(device + 0x480 + slot * 24) & 3) !=
         uint32_t(xenos::FetchConstantType::kTexture)) {
@@ -2083,6 +2144,8 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
       dwords[i] = guest::Load32(device + 0x480 + slot * 24 + i * 4);
     }
     uint32_t descriptor = GetTexture(fetch);
+    widenHeader |= (uint32_t(fetch.base_address) << 12) == g_menuHeader.base &&
+                   g_menuHeader.widthScale != 1.0f;
     if (slot == kBloomSlot && ps &&
         (ps->entry->hash == kToneMapPixelShader || ps->entry->hash == kCompositePixelShader)) {
       descriptor = AdjustBloom(fetch, descriptor);
@@ -2103,6 +2166,8 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
       shared.samplerIndices[slot] = GetSampler(fetch);
     }
   }
+  // The header is a quad of inline vertices (position first) made each
+  // frame: wider by as much as the picture, from its left edge.
   reg::RB_COLORCONTROL colorControl;
   colorControl.value = Register(device, 0x2202);
   shared.alphaThreshold = RegisterFloat(device, 0x210E);
@@ -2359,7 +2424,8 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   record.drawCount = drawCount;
   record.startVertex = startVertex;
   if (inlineData) {
-    g_pendingDraw = PendingDraw{std::move(record), *inlineData};
+    g_pendingDraw = PendingDraw{std::move(record), *inlineData,
+                                widenHeader ? g_menuHeader.widthScale : 1.0f};
   } else {
     SubmitDraw(record);
   }
@@ -2375,7 +2441,19 @@ void Present(HostTexture* frontBuffer) {
     REXLOG_INFO("present frame {}", g_frameCount);
   }
 
-  g_swapChain->setVsyncEnabled(REXCVAR_GET(vsync));  // takes effect through a resize
+  // Takes effect through a resize. vsync = false from older settings means
+  // off until present_mode is set.
+  int32_t mode = REXCVAR_GET(present_mode);
+  if (rex::cvar::GetFlagSource("present_mode") == rex::cvar::Source::kDefault &&
+      !REXCVAR_GET(vsync)) {
+    mode = 0;
+  }
+  static int32_t loggedMode = -1;
+  bool supported = g_swapChain->setPresentMode(RenderPresentMode(std::clamp(mode, 0, 3)));
+  if (mode != loggedMode) {
+    loggedMode = mode;
+    REXLOG_INFO("video: present mode {}{}", mode, supported ? "" : " not supported, FIFO instead");
+  }
   g_swapChainValid &= !g_swapChain->needsResize();
   if (!g_swapChainValid) {
     // Finish what was recorded, then rebuild the swapchain.
@@ -2626,7 +2704,7 @@ bool IsNativeRenderer() {
 
 bool CreateHostDevice() {
   std::lock_guard lock(g_mutex);
-  g_resolutionScale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 4));
+  g_resolutionScale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 8));
   RenderWindow renderWindow{};
   if (!GetRenderWindow(renderWindow)) {
     return false;
@@ -3033,7 +3111,7 @@ void UpdateGammaTable(uint32_t device) {
 // A new render_scale, between frames: the render targets are made again at
 // the new size (their contents start over).
 void ApplyRenderScale() {
-  uint32_t scale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 4));
+  uint32_t scale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 8));
   if (scale == g_resolutionScale) {
     return;
   }

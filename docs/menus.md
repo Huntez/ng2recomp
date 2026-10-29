@@ -128,8 +128,28 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   entry not greyed (and sub_8364CA08 reports it signed out), EXIT GAME
   added as action 7 (pictures by language * 8 + action from the table at
   0x83A93700; action 7 is the atlas's EXIT DEMO band).
-- The Options header ("OPTIONS", a 172x58 picture) is drawn as a full-screen
-  quad (x -2453..1386) placed by its shader's constants; not changed yet.
+- The Options header ("OPTIONS", a 172x58 8-bit picture, hash
+  3e4f94c916758ea1) is a quad of inline vertices (positions 150..322 x
+  41..99) over a full-screen one. While ours is open the renderer makes it
+  a wider single-level picture (src/gpu/menu_label.cpp MakeHeader: the
+  atlas letters at 0.92, faces and outlines brought to the header's levels,
+  a box-blurred glow) and widens that quad from its left edge in
+  FlushPendingDraw (inline data only reaches guest memory by then).
+- Display page: Window Mode (Windowed / Borderless / Fullscreen: rex's
+  fullscreen plus exclusive_fullscreen, the SDL display mode set first on
+  the UI thread), Window Size (windowed_width/windowed_height, ours: rex reads
+  window_width/height as the guest video mode; applied with
+  SDL_SetWindowSize when windowed), V-Sync (present_mode: off, FIFO,
+  mailbox, FIFO relaxed through plume's setPresentMode), Show FPS.
+- show_fps (src/perf_overlay.cpp): a text item (sprite + text part, as the
+  arrow lists' value text) in guest memory, given UI package 0's resource
+  0xA (a text frame like package 0x78's 0x2A, which only Options loads),
+  updated (sub_836E0128) and queued (sub_8366E8B8, layer 0x15) right after
+  the game starts a frame (sub_822F0EF8 flips the 2D lists). Text sprites
+  only draw through their frame's nodes (+0x74), so a resource is needed;
+  the text part sits at +0x90 (string +0xC4, scale +0xC8, position +0xD0
+  from the frame's anchor, flags +0x98, measured +0xF0). Asking the loader
+  for package 0x78 outside Options broke the next level load.
 - src/gpu/menu_label.cpp: the Marketplace label picture (520x90, hash
   f8fb387ec4883ffc) is rebuilt as RECOMP SETTINGS from the entries' atlas
   (520x990, hash 3737e258b350fa36), letters cut at bright-pixel valleys.

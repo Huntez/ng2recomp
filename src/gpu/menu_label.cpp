@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <string>
@@ -198,6 +200,104 @@ bool Compose(std::string_view text, uint8_t* pixels) {
   return true;
 }
 
+// The header picture: "RECOMP SETTINGS" from the atlas's letters, scaled to
+// the header's letter size, with the plate dropped, the letter faces and
+// outlines brought to the header's levels and a soft glow around them.
+constexpr uint64_t kHeaderHash = 0x3e4f94c916758ea1;  // 172x58, OPTIONS
+constexpr uint32_t kHeaderWidth = 172, kHeaderHeight = 58;
+constexpr float kHeaderScale = 0.92f;  // header letters / atlas letters
+constexpr uint32_t kHeaderTop = 14, kHeaderMargin = 12;
+constexpr int kGlowRadius = 4;
+constexpr float kGlowLevel = 70.0f;
+
+// Set by the menu, read where textures are made.
+std::atomic<bool> g_headerWanted = false;
+std::atomic<uint32_t> g_headerGeneration = 0;
+
+// A box blur, each way.
+std::vector<float> Blur(const std::vector<float>& image, uint32_t width, uint32_t height) {
+  std::vector<float> across(image.size()), out(image.size());
+  for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t x = 0; x < width; x++) {
+      float sum = 0.0f;
+      for (int d = -kGlowRadius; d <= kGlowRadius; d++) {
+        int sx = int(x) + d;
+        sum += sx >= 0 && sx < int(width) ? image[y * width + sx] : 0.0f;
+      }
+      across[y * width + x] = sum / (2 * kGlowRadius + 1);
+    }
+  }
+  for (uint32_t y = 0; y < height; y++) {
+    for (uint32_t x = 0; x < width; x++) {
+      float sum = 0.0f;
+      for (int d = -kGlowRadius; d <= kGlowRadius; d++) {
+        int sy = int(y) + d;
+        sum += sy >= 0 && sy < int(height) ? across[sy * width + x] : 0.0f;
+      }
+      out[y * width + x] = sum / (2 * kGlowRadius + 1);
+    }
+  }
+  return out;
+}
+
+bool MakeHeader(std::vector<uint8_t>& out, uint32_t& outWidth) {
+  std::vector<uint8_t> label(kWidth * kBand);
+  if (!Compose(kText, label.data())) {
+    return false;
+  }
+  uint32_t x0 = kWidth, x1 = 0, y0 = kBand, y1 = 0;
+  for (uint32_t y = 0; y < kBand; y++) {
+    for (uint32_t x = 0; x < kWidth; x++) {
+      if (IsLetter(label[y * kWidth + x])) {
+        x0 = std::min(x0, x), x1 = std::max(x1, x + 1);
+        y0 = std::min(y0, y), y1 = std::max(y1, y + 1);
+      }
+    }
+  }
+  if (x0 >= x1) {
+    return false;
+  }
+  outWidth = uint32_t(std::ceil(float(x1 - x0) * kHeaderScale)) + 2 * kHeaderMargin;
+  uint32_t size = outWidth * kHeaderHeight;
+  std::vector<float> value(size), mask(size);
+  // Bilinear over the letter pixels only.
+  for (uint32_t oy = 0; oy < kHeaderHeight; oy++) {
+    for (uint32_t ox = 0; ox < outWidth; ox++) {
+      float sx = float(x0) + (float(ox) - kHeaderMargin + 0.5f) / kHeaderScale - 0.5f;
+      float sy = float(y0) + (float(oy) - kHeaderTop + 0.5f) / kHeaderScale - 0.5f;
+      int ix = int(std::floor(sx)), iy = int(std::floor(sy));
+      float fx = sx - float(ix), fy = sy - float(iy);
+      float sum = 0.0f, weight = 0.0f;
+      for (int k = 0; k < 4; k++) {
+        int x = ix + (k & 1), y = iy + (k >> 1);
+        float w = ((k & 1) ? fx : 1.0f - fx) * ((k >> 1) ? fy : 1.0f - fy);
+        if (x >= 0 && x < int(kWidth) && y >= 0 && y < int(kBand) &&
+            IsLetter(label[y * kWidth + x])) {
+          sum += float(label[y * kWidth + x]) * w;
+          weight += w;
+        }
+      }
+      if (weight > 0.5f) {
+        value[oy * outWidth + ox] = sum / weight;
+        mask[oy * outWidth + ox] = 1.0f;
+      }
+    }
+  }
+  std::vector<float> glow = Blur(Blur(mask, outWidth, kHeaderHeight), outWidth, kHeaderHeight);
+  out.resize(size);
+  for (uint32_t i = 0; i < size; i++) {
+    float v;
+    if (mask[i] > 0.0f) {
+      v = value[i] >= 110.0f ? 150.0f + (value[i] - 110.0f) * (105.0f / 145.0f)  // face
+                             : 30.0f + value[i] * 0.7f;                         // outline
+    } else {
+      v = glow[i] * kGlowLevel;
+    }
+    out[i] = uint8_t(std::clamp(v, 0.0f, 255.0f));
+  }
+  return true;
+}
+
 }  // namespace
 
 LabelResult RewriteMenuLabel(uint32_t width, uint32_t height, uint8_t* pixels, uint32_t* rows) {
@@ -226,5 +326,24 @@ LabelResult RewriteMenuLabel(uint32_t width, uint32_t height, uint8_t* pixels, u
   *rows = kBand;
   return LabelResult::kRewritten;
 }
+
+void SetRecompHeader(bool on) {
+  if (on != g_headerWanted) {
+    g_headerWanted = on;
+    g_headerGeneration++;
+  }
+}
+
+uint32_t MenuHeaderGeneration() {
+  return g_headerGeneration;
+}
+
+bool ReplaceMenuHeader(uint32_t width, uint32_t height, const uint8_t* pixels,
+                       std::vector<uint8_t>& out, uint32_t& outWidth, bool& isHeader) {
+  isHeader = width == kHeaderWidth && height == kHeaderHeight &&
+             XXH3_64bits(pixels, size_t(width) * height) == kHeaderHash;
+  return isHeader && g_headerWanted && !g_atlas.empty() && MakeHeader(out, outWidth);
+}
+
 
 }  // namespace ng2::video

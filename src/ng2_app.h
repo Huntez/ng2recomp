@@ -91,6 +91,7 @@ class Ng2App : public rex::ReXApp {
     if (ng2::video::IsNativeRenderer() && !ng2::video::CreateHostDevice()) {
       REXLOG_ERROR("native renderer: cannot create the Vulkan device");
     }
+    ng2::recomp_settings::ApplyWindowAtStart();
   }
 
   void OnShutdown() override {

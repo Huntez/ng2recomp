@@ -16,5 +16,7 @@ namespace ng2::recomp_settings {
 void SetConfigPath(const std::filesystem::path& path);
 // Where the window's settings are applied (its UI thread).
 void SetAppContext(rex::ui::WindowedAppContext* context);
+// Exclusive fullscreen, if set, once the window is open.
+void ApplyWindowAtStart();
 
 }  // namespace ng2::recomp_settings

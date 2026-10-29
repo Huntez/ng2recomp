@@ -16,6 +16,7 @@ set(NG2_SOURCES
     src/gpu/video.cpp
     src/gpu/menu_label.cpp
     src/gpu/d3d_hooks.cpp
+    src/perf_overlay.cpp
     src/recomp_settings.cpp
     src/movie/movie_hooks.cpp
     src/movie/host_movie.cpp

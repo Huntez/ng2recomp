@@ -35,8 +35,19 @@
 #include <rex/logging.h>
 #include <rex/ui/windowed_app_context.h>
 
+#include <SDL3/SDL.h>
+
 #include "gpu/guest.h"
+#include "gpu/menu_label.h"
 #include "recomp_settings.h"
+
+REXCVAR_DEFINE_INT32(windowed_width, 0, "UI/Window",
+                     "The window's width when not fullscreen (0: the default size)");
+REXCVAR_DEFINE_INT32(windowed_height, 0, "UI/Window",
+                     "The window's height when not fullscreen (0: the default size)");
+REXCVAR_DEFINE_BOOL(exclusive_fullscreen, false, "UI/Window",
+                    "Fullscreen in the desktop's display mode (exclusive) rather than as a "
+                    "borderless window over the desktop");
 
 namespace ng2::recomp_settings {
 namespace {
@@ -93,22 +104,30 @@ constexpr uint32_t kPlayTimeName = 0x2F;
 constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97;
 constexpr uint32_t kSlotCount = 0x98;  // past the last index used
 
-enum class Kind { kScale, kFiltering, kLevel, kOnOff };
+enum class Kind { kScale, kFiltering, kLevel, kOnOff, kPresent, kWindowMode, kWindowSize };
 struct Setting {
   std::u16string_view label;
-  std::array<std::u16string_view, 4> choices;
+  std::array<std::u16string_view, 10> choices;
   uint32_t count;
   const char* name;
   Kind kind;
 };
 constexpr Setting kSettings[] = {
-    {u"Render Scale", {u"1x", u"2x", u"3x", u"4x"}, 4, "render_scale", Kind::kScale},
+    {u"Render Scale", {u"1x", u"2x", u"3x", u"4x", u"5x", u"6x", u"7x", u"8x"}, 8,
+     "render_scale", Kind::kScale},
     {u"Texture Filtering", {u"Default", u"4x", u"8x", u"16x"}, 4, "anisotropic_filtering",
      Kind::kFiltering},
     {u"Bloom", {u"Off", u"Reduced", u"On"}, 3, "bloom", Kind::kLevel},
-    {u"V-Sync", {u"On", u"Off"}, 2, "vsync", Kind::kOnOff},
-    {u"Fullscreen", {u"On", u"Off"}, 2, "fullscreen", Kind::kOnOff},
+    {u"Window Mode", {u"Windowed", u"Borderless", u"Fullscreen"}, 3, "fullscreen",
+     Kind::kWindowMode},
+    {u"Window Size", {u"1280x720", u"1600x900", u"1920x1080", u"2560x1440", u"3840x2160"}, 5,
+     "windowed_width", Kind::kWindowSize},
+    {u"V-Sync", {u"Off", u"FIFO", u"Mailbox", u"Adaptive"}, 4, "present_mode", Kind::kPresent},
+    {u"Show FPS", {u"On", u"Off"}, 2, "show_fps", Kind::kOnOff},
 };
+// Window Size's choices.
+constexpr std::pair<int32_t, int32_t> kWindowSizes[] = {
+    {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
 
 struct PageRow {
   uint32_t setting;
@@ -128,7 +147,12 @@ constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
      {{{0, 0x1E0, true, false}, {1, 0x450, true, true}, {2, 0x450 + kListSize, true, true}}},
      3},
-    {u"Display", 2, 0x1CC0, 0x1A20, {{{3, 0x1E0, false, false}, {4, 0x7F0, false, false}}}, 2},
+    {u"Display", 2, 0x1CC0, 0x1A20,
+     {{{3, 0x1E0, true, true},
+       {4, 0x1E0 + kListSize, true, true},
+       {5, 0x7F0, true, true},
+       {6, 0xE00, false, false}}},
+     4},
 };
 constexpr uint32_t kPageCount = std::size(kPages);
 constexpr std::u16string_view kRestoreText = u"Restore Defaults";
@@ -314,6 +338,7 @@ void Open() {
   }
   g_open = true;
   PutBackGame();
+  ng2::video::SetRecompHeader(true);
   auto slots = FindTextSlots();
   if (slots.empty()) {
     REXLOG_WARN("recomp settings: Options texts not found");
@@ -378,6 +403,7 @@ void SaveSettings() {
 // The game's texts and menu values back, once nothing draws ours: on the
 // title menu's next build, or before Options is next built or opened.
 void PutBackGame() {
+  ng2::video::SetRecompHeader(false);
   // Last written first: a slot written twice gets the game's bytes back.
   for (auto it = g_savedTexts.rbegin(); it != g_savedTexts.rend(); ++it) {
     uint8_t* slot = guest::Physical(it->physical);
@@ -402,6 +428,8 @@ void Close() {
   REXLOG_INFO("recomp settings: closed");
 }
 
+constexpr const char* kExclusive = "exclusive_fullscreen";
+
 // The settings as the rows' choices, and back.
 constexpr int32_t kFiltering[4] = {-1, 3, 4, 5};  // game, 4x, 8x, 16x
 
@@ -420,7 +448,7 @@ int32_t GetInt(std::string_view name) {
 uint32_t ValueOf(const Setting& setting) {
   switch (setting.kind) {
     case Kind::kScale:
-      return uint32_t(std::clamp(GetInt(setting.name), 1, 4) - 1);
+      return uint32_t(std::clamp(GetInt(setting.name), 1, int32_t(setting.count)) - 1);
     case Kind::kFiltering: {
       int32_t filtering = GetInt(setting.name);
       return filtering >= 5 ? 3 : filtering == 4 ? 2 : filtering == 3 ? 1 : 0;
@@ -429,8 +457,83 @@ uint32_t ValueOf(const Setting& setting) {
       return uint32_t(std::clamp(GetInt(setting.name), 0, int32_t(setting.count) - 1));
     case Kind::kOnOff:
       return GetSetting(setting.name) == "true" ? 0 : 1;
+    case Kind::kPresent:
+      // vsync = false from older settings means off until present_mode is set.
+      if (!g_written.contains(setting.name) &&
+          rex::cvar::GetFlagSource(setting.name) == rex::cvar::Source::kDefault &&
+          GetSetting("vsync") == "false") {
+        return 0;
+      }
+      return uint32_t(std::clamp(GetInt(setting.name), 0, int32_t(setting.count) - 1));
+    case Kind::kWindowMode:
+      return GetSetting("fullscreen") != "true" ? 0 : GetSetting(kExclusive) == "true" ? 2 : 1;
+    case Kind::kWindowSize:
+      for (uint32_t i = 0; i < std::size(kWindowSizes); i++) {
+        if (GetInt("windowed_width") == kWindowSizes[i].first &&
+            GetInt("windowed_height") == kWindowSizes[i].second) {
+          return i;
+        }
+      }
+      return 0;
   }
   return 0;
+}
+
+// The window's settings, applied on the UI thread (the window belongs to
+// it): the fullscreen display mode before fullscreen itself, the windowed
+// size after leaving it.
+bool IsWindowSetting(std::string_view name) {
+  return name == "fullscreen" || name == kExclusive || name == "windowed_width" ||
+         name == "windowed_height";
+}
+
+void ApplyWindow(bool fullscreen) {
+  int count = 0;
+  SDL_Window** windows = SDL_GetWindows(&count);
+  SDL_Window* window = (windows && count > 0) ? windows[0] : nullptr;
+  SDL_free(windows);
+  if (!window) {
+    return;
+  }
+  if (fullscreen) {
+    const SDL_DisplayMode* mode =
+        rex::cvar::Query<bool>(kExclusive)
+            ? SDL_GetDesktopDisplayMode(SDL_GetDisplayForWindow(window))
+            : nullptr;
+    SDL_SetWindowFullscreenMode(window, mode);
+  }
+  // Through the cvar: the runtime keeps its own fullscreen state.
+  rex::cvar::SetFlagByName("fullscreen", fullscreen ? "true" : "false");
+  if (!fullscreen) {
+    int32_t width = rex::cvar::Query<int32_t>("windowed_width");
+    int32_t height = rex::cvar::Query<int32_t>("windowed_height");
+    if (width <= 0 || height <= 0) {
+      width = kWindowSizes[0].first, height = kWindowSizes[0].second;
+    }
+    SDL_SetWindowSize(window, width, height);
+  }
+}
+
+bool g_windowChanged = false;
+
+void ScheduleWindow() {
+  g_windowChanged = false;
+  if (!g_appContext) {
+    return;
+  }
+  std::vector<std::pair<std::string, std::string>> values;
+  for (const auto& [name, value] : g_written) {
+    if (IsWindowSetting(name) && name != "fullscreen") {
+      values.emplace_back(name, value);
+    }
+  }
+  bool fullscreen = GetSetting("fullscreen") == "true";
+  g_appContext->CallInUIThread([values, fullscreen] {
+    for (const auto& [name, value] : values) {
+      rex::cvar::SetFlagByName(name, value);
+    }
+    ApplyWindow(fullscreen);
+  });
 }
 
 void SetSetting(const char* name, const std::string& text) {
@@ -438,9 +541,8 @@ void SetSetting(const char* name, const std::string& text) {
     return;
   }
   g_written[name] = text;
-  // The window belongs to the UI thread.
-  if (std::string_view(name) == "fullscreen" && g_appContext) {
-    g_appContext->CallInUIThread([text] { rex::cvar::SetFlagByName("fullscreen", text); });
+  if (IsWindowSetting(name)) {
+    g_windowChanged = true;  // applied once the row's settings are all set
     return;
   }
   rex::cvar::SetFlagByName(name, text);
@@ -460,12 +562,35 @@ void SetValue(const Setting& setting, uint32_t value) {
     case Kind::kOnOff:
       SetSetting(setting.name, value == 0 ? "true" : "false");
       break;
+    case Kind::kPresent:
+      // The older vsync setting would keep it off otherwise.
+      SetSetting("vsync", value == 0 ? "false" : "true");
+      SetSetting(setting.name, std::to_string(value));
+      break;
+    case Kind::kWindowMode:
+      SetSetting(kExclusive, value == 2 ? "true" : "false");
+      SetSetting("fullscreen", value != 0 ? "true" : "false");
+      break;
+    case Kind::kWindowSize:
+      SetSetting("windowed_width", std::to_string(kWindowSizes[value].first));
+      SetSetting("windowed_height", std::to_string(kWindowSizes[value].second));
+      break;
   }
 }
 
 void RestoreDefault(const Setting& setting) {
-  if (const auto* info = rex::cvar::GetFlagInfo(setting.name)) {
-    SetSetting(setting.name, info->default_value);
+  auto reset = [](const char* name) {
+    if (const auto* info = rex::cvar::GetFlagInfo(name)) {
+      SetSetting(name, info->default_value);
+    }
+  };
+  reset(setting.name);
+  if (setting.kind == Kind::kPresent) {
+    reset("vsync");
+  } else if (setting.kind == Kind::kWindowMode) {
+    reset(kExclusive);
+  } else if (setting.kind == Kind::kWindowSize) {
+    reset("windowed_height");
   }
 }
 
@@ -827,6 +952,9 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
       CallGuest(ctx, base, __imp__sub_83682750, {kChoiceChanged, left ? 0u : 1u});
     }
   }
+  if (g_windowChanged) {
+    ScheduleWindow();
+  }
   CallGuest(ctx, base, __imp__sub_83681830,
             {kMenuModel, Load32(kLastPage), number, kCursors, StoreValues(ctx, &page), 8});
 }
@@ -947,5 +1075,15 @@ REX_HOOK_RAW(sub_836AC0C8) {
   __imp__sub_836AC0C8(ctx, base);
   if (g_open) {
     Store32(kPlayTimeText, 0);
+  }
+}
+
+void ng2::recomp_settings::ApplyWindowAtStart() {
+  // The runtime opens the window fullscreen as a borderless window, or at its
+  // default size: the exclusive mode or our windowed size is set over it.
+  bool fullscreen = rex::cvar::Query<bool>("fullscreen");
+  if (g_appContext && (fullscreen ? rex::cvar::Query<bool>(kExclusive)
+                                  : rex::cvar::Query<int32_t>("windowed_width") > 0)) {
+    g_appContext->CallInUIThread([fullscreen] { ApplyWindow(fullscreen); });
   }
 }

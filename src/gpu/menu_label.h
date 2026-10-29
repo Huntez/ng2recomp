@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 namespace ng2::video {
 
@@ -15,5 +16,16 @@ enum class LabelResult { kUnchanged, kRewritten, kRetry };
 // Marketplace label (kRetry: seen before the atlas, upload it again later).
 // rows: how many rows from the top were rewritten, for the mips.
 LabelResult RewriteMenuLabel(uint32_t width, uint32_t height, uint8_t* pixels, uint32_t* rows);
+
+// The Options screen's "OPTIONS" header (a 172x58 8-bit picture) reads
+// "RECOMP SETTINGS" while ours is open: a wider picture made from the
+// atlas's letters in the header's look. ReplaceMenuHeader gives it for the
+// header's base level (false: keep the game's); MenuHeaderGeneration changes
+// whenever the wanted picture does, so a cached one is made again.
+void SetRecompHeader(bool on);
+uint32_t MenuHeaderGeneration();
+// (isHeader: the picture is the header, ours or not.)
+bool ReplaceMenuHeader(uint32_t width, uint32_t height, const uint8_t* pixels,
+                       std::vector<uint8_t>& out, uint32_t& outWidth, bool& isHeader);
 
 }  // namespace ng2::video
