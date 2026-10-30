@@ -87,6 +87,10 @@ constexpr uint32_t kListVtable = 0x82281010;  // an arrow list ("<- value ->")
 constexpr uint32_t kListSize = 0x270;
 constexpr uint32_t kListTexts = 0x20;        // up to 10 value texts
 constexpr uint32_t kListShown = 0x234;       // the value text shown
+constexpr uint32_t kLeftArrow = 0x50, kRightArrow = 0xE0;  // the arrows' sprites
+constexpr uint32_t kSpriteX = 0x30;          // an arrow's offset across, from the
+                                             // value (it grows towards it)
+constexpr float kArrowSpread = 32.0f;
 constexpr uint32_t kWidgetValue = 0x14;
 constexpr uint32_t kWidgetX = 0x18, kWidgetY = 0x1C;
 constexpr uint32_t kOnOffRow = 0x600;  // a choice row's flag: 1 shows its first choice
@@ -116,8 +120,11 @@ struct Setting {
   Kind kind;
 };
 constexpr Setting kSettings[] = {
-    {u"Render Scale", {u"1x", u"2x", u"3x", u"4x", u"5x", u"6x", u"7x", u"8x"}, 8,
-     "render_scale", Kind::kScale},
+    // With what the game's 3D (1120x584) is drawn at, as the NGB recomp's.
+    {u"Render Scale",
+     {u"1x 1120x584", u"2x 2240x1168", u"3x 3360x1752", u"4x 4480x2336", u"5x 5600x2920",
+      u"6x 6720x3504", u"7x 7840x4088", u"8x 8960x4672"},
+     8, "render_scale", Kind::kScale},
     {u"Texture Filtering", {u"Default", u"4x", u"8x", u"16x"}, 4, "anisotropic_filtering",
      Kind::kFiltering},
     {u"Bloom", {u"Off", u"Reduced", u"On"}, 3, "bloom", Kind::kLevel},
@@ -860,6 +867,10 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
         Store32(widget + kListTexts + 4 * k, text(setting.choices[std::min(k, setting.count - 1)]));
       }
       Store32(widget + kListShown, Load32(widget + kListTexts + 4 * value));
+      // The arrows further apart than the game's, for the longer values
+      // (Render Scale's resolutions).
+      StoreFloat(widget + kLeftArrow + kSpriteX, LoadFloat(widget + kLeftArrow + kSpriteX) + kArrowSpread);
+      StoreFloat(widget + kRightArrow + kSpriteX, LoadFloat(widget + kRightArrow + kSpriteX) - kArrowSpread);
       // The list's parts are placed for the page's first row only.
       for (uint32_t part : {0x50u + 0x34u, 0xE0u + 0x34u, 0x244u}) {
         StoreFloat(widget + part, LoadFloat(widget + part) + y);

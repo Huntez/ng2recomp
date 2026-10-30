@@ -73,7 +73,7 @@ Not yet. The code builds for Windows in principle, but there is no Windows packa
 Everything is in the game's own menus: **RECOMP SETTINGS** on the title menu, and **Recomp
 Settings** in the in-game menu (Back, under Save Method). Changes apply at once and are saved.
 
-- **Graphics**: render scale (1x–8x), texture filtering (the game's, or 4x–16x anisotropic), bloom
+- **Graphics**: render scale (1x–8x, with the resolution it draws at, as "2x 2240x1168"), texture filtering (the game's, or 4x–16x anisotropic), bloom
   (off, reduced, on), anti-aliasing (off, or 2x as on the console, 4x, 8x MSAA)
 - **Display**: window mode (windowed, borderless, fullscreen), window size, V-Sync (Off, FIFO,
   Mailbox, Adaptive; a mode the driver lacks falls back to FIFO), show FPS
