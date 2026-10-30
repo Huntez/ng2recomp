@@ -12,6 +12,7 @@
 
 #include "video.h"
 
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -313,6 +314,31 @@ void ReportHitch() {
   f.enabled = enabled;
   f.lastSwap = now;
   f.lastMs = lastMs;
+}
+
+// NG2_LATENCY_LOG=1: from the game starting a frame (it reads the pad then)
+// to that frame's present call, averaged and worst over each second.
+std::atomic<int64_t> g_frameStartNs{0};
+void ReportLatency() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("NG2_LATENCY_LOG");
+    return v && v[0] == '1';
+  }();
+  int64_t start = g_frameStartNs.exchange(0);
+  if (!enabled || !start) {
+    return;
+  }
+  static double sum = 0.0, worst = 0.0;
+  static uint32_t count = 0;
+  static auto last = std::chrono::steady_clock::now();
+  auto now = std::chrono::steady_clock::now();
+  double ms = (now.time_since_epoch().count() - start) / 1e6;
+  sum += ms, worst = std::max(worst, ms), count++;
+  if (now - last >= std::chrono::seconds(1)) {
+    REXLOG_INFO("latency frame start to present: avg {:.2f} ms, worst {:.2f} ms ({} frames)",
+                sum / count, worst, count);
+    sum = worst = 0.0, count = 0, last = now;
+  }
 }
 
 void ReportProfile() {
@@ -2846,6 +2872,7 @@ void Present(HostTexture* frontBuffer) {
                                  g_commandFences[g_frame].get());
     g_commandListPending[g_frame] = true;
     g_swapChainValid = g_swapChain->present(index, signalSemaphores, 1);
+    ReportLatency();
   } else {
     g_queue->executeCommandLists(commandList, g_commandFences[g_frame].get());
     g_commandListPending[g_frame] = true;
@@ -3057,6 +3084,10 @@ bool CreateHostDevice() {
   StartPipelineWorkers();
   MakeListedPipelines();
   return true;
+}
+
+void MarkFrameStart() {
+  g_frameStartNs = std::chrono::steady_clock::now().time_since_epoch().count();
 }
 
 void SetPipelineListPath(const std::filesystem::path& path) {

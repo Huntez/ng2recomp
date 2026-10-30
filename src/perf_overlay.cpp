@@ -21,6 +21,7 @@
 #include <rex/logging.h>
 
 #include "gpu/guest.h"
+#include "gpu/video.h"
 
 REXCVAR_DEFINE_BOOL(show_fps, false, "Video",
                     "Show the frame rate and frame time in the top left corner");
@@ -134,6 +135,7 @@ uint32_t FindTextFrame() {
 REX_EXTERN(__imp__sub_822F0EF8);
 REX_HOOK_RAW(sub_822F0EF8) {
   __imp__sub_822F0EF8(ctx, base);
+  ng2::video::MarkFrameStart();
   auto now = std::chrono::steady_clock::now();
   static const bool logFps = [] {
     const char* v = std::getenv("NG2_FPS_LOG");

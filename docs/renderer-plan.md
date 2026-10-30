@@ -217,4 +217,11 @@ paused). The hook in d3d_hooks.cpp lets a thread also leave once its own byte
 is cleared (only a completed barrier does that) and clears with a CAS from the
 whole value it saw. Caught in a gdb soak 5 min in (tools: a watcher signalling
 SIGUSR1 to gdb when two threads spin 30 s); two 30-min soaks clean after.
+The barrier hook uses byte accesses only (the masks are 4 mod 8: an 8-byte
+lock could split a cache line, which Linux may throttle): only the lowest
+taking part clears, a byte at a time, its own last. Another 30-min soak clean.
 Test audio (NG2_TEST_AUDIO=disk) is ~70 MB a minute: keep it off a full /tmp.
+
+Latency (NG2_LATENCY_LOG=1, frame start to present, Chapter 1 fight): 16.63 ms
+average, 18.75 worst with the GPU-wait sleep, 16.63 / 18.60 spinning; CPU 2.36
+vs 3.03 cores. On Windows the sleep is a yield (a sleep there is >= 1 ms).

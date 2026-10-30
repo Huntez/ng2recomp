@@ -193,19 +193,26 @@ REX_HOOK_RAW(sub_83737AE0) {
   }
   __imp__sub_83737AE0(ctx, base);
   if (ctx.r3.u32 != 0 && ++spins > 64) {
+#if defined(_WIN32)
+    std::this_thread::yield();  // a sleep there is a millisecond or more
+#else
     std::this_thread::sleep_for(std::chrono::microseconds(100));
+#endif
   }
 }
 
 // The audio engine's barrier (XAudio2's voice processing, sub_8374F078): each
-// thread taking part sets its processor's byte in a 64-bit mask and waits
-// until the mask holds all of them, and the first to see that clears it. A
-// waiting thread only left on seeing the mask whole or cleared; if the OS
+// thread taking part sets its processor's byte in an 8-byte mask and waits
+// until the mask holds all of them; the first to see that cleared it, and a
+// waiting thread only left on seeing the mask whole or cleared. If the OS
 // paused it right then, the other thread could clear the mask and set its
 // byte again for the next pass first, leaving both waiting for good (the
-// sound stops; on the console the hardware threads aren't paused). Here a
-// thread also leaves once its own byte is cleared, which only a completed
-// barrier does.
+// sound stops; on the console the hardware threads aren't paused). Here only
+// the lowest-numbered thread taking part clears the mask, a byte at a time and
+// its own last, and the others leave once their own byte is cleared: a byte is
+// only cleared by a completed barrier and only set again by its own thread
+// after that. Byte accesses only: the mask needn't be 8-byte aligned, and an
+// 8-byte lock across a cache line would be a split lock.
 REX_EXTERN(__imp__sub_8374F078);
 REX_HOOK_RAW(sub_8374F078) {
   uint32_t engine = ctx.r3.u32;
@@ -214,39 +221,40 @@ REX_HOOK_RAW(sub_8374F078) {
   }
   uint8_t cpu = *ng2::guest::Virtual(ctx.r13.u32 + 0x10C);
   if (cpu >= 6) {
-    __imp__sub_8374F078(ctx, base);
+    __imp__sub_8374F078(ctx, base);  // not a processor that takes part
     return;
   }
-  // 4-byte aligned in the engine (x86 keeps it atomic within a cache line).
-  auto* word = reinterpret_cast<uint64_t*>(ng2::guest::Virtual(ctx.r4.u32));
-  if ((reinterpret_cast<uintptr_t>(word) & 63) > 56) {
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      REXLOG_WARN("audio barrier: the mask at {:08x} crosses a cache line", ctx.r4.u32);
-    }
-  }
-  // Who takes part, read once as the game does: bytes 0-5 one per processor.
-  uint8_t expected[8] = {};
+  uint8_t* mask = ng2::guest::Virtual(ctx.r4.u32);
+  auto load = [&](uint32_t i) { return __atomic_load_n(mask + i, __ATOMIC_ACQUIRE); };
+  auto store = [&](uint32_t i, uint8_t v) { __atomic_store_n(mask + i, v, __ATOMIC_SEQ_CST); };
+  // Who takes part, read once as the game does: one byte per processor.
+  bool expected[6];
+  int clearer = -1;
   for (uint32_t i = 0; i < 6; i++) {
     expected[i] = ng2::guest::Load32(engine + 0x134 + 4 * i) != 0;
+    if (expected[i] && clearer < 0) {
+      clearer = int(i);
+    }
   }
-  __atomic_store_n(reinterpret_cast<uint8_t*>(word) + cpu, uint8_t(1), __ATOMIC_SEQ_CST);
+  store(cpu, 1);
   for (uint32_t spins = 0;; spins++) {
-    uint64_t seen = __atomic_load_n(word, __ATOMIC_SEQ_CST);
-    uint8_t bytes[8];
-    std::memcpy(bytes, &seen, sizeof(bytes));
-    if (seen == 0 || bytes[cpu] == 0) {
-      return;  // completed (and maybe already entered again by another)
+    if (load(cpu) == 0) {
+      return;  // completed
     }
-    bool whole = true;
-    for (uint32_t i = 0; i < 8; i++) {
-      whole &= (bytes[i] != 0) == (expected[i] != 0);
-    }
-    // Cleared only as seen whole: a late clear can't take a byte set since.
-    if (whole && __atomic_compare_exchange_n(word, &seen, uint64_t(0), false, __ATOMIC_SEQ_CST,
-                                             __ATOMIC_SEQ_CST)) {
-      return;
+    if (int(cpu) == clearer) {
+      bool whole = true;
+      for (uint32_t i = 0; i < 6; i++) {
+        whole &= (load(i) != 0) == expected[i];
+      }
+      if (whole) {
+        for (uint32_t i = 0; i < 8; i++) {
+          if (i != cpu) {
+            store(i, 0);
+          }
+        }
+        store(cpu, 0);
+        return;
+      }
     }
     if (spins >= 4096) {
       std::this_thread::yield();
