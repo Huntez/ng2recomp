@@ -15,6 +15,11 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <deque>
+#include <filesystem>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -77,6 +82,11 @@ REXCVAR_DEFINE_INT32(present_mode, 1, "Video",
                      "How frames are shown: 0 off (no V-Sync, may tear), 1 FIFO (V-Sync), "
                      "2 mailbox (V-Sync, newest frame), 3 adaptive (V-Sync unless late)")
     .range(0, 3);
+REXCVAR_DEFINE_BOOL(async_pipelines, true, "Video",
+                    "Make render pipelines on background threads: a new object or effect can "
+                    "appear a frame or two late instead of the game stalling");
+REXCVAR_DEFINE_BOOL(log_hitches, false, "Video",
+                    "Log each frame that takes over 25 ms, with what the renderer spent it on");
 REXCVAR_DEFINE_INT32(antialiasing, 2, "Video",
                      "MSAA samples for the render targets the game multisamples (its main "
                      "picture): 0 off, 2 as the game, 4 or 8")
@@ -207,19 +217,61 @@ struct Profile {
   std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 } g_profile;
 
+// log_hitches (or NG2_HITCHES=1): a frame that took over 25 ms, and well
+// over the one before, is logged with what the renderer spent its time on
+// and what it had to make.
+struct FrameStats {
+  bool enabled = false;
+  uint64_t nanoseconds[size_t(Stage::kCount)] = {};
+  uint32_t pipelines = 0, shaders = 0, textures = 0;
+  uint64_t pipelineNs = 0, shaderNs = 0, textureNs = 0, textureBytes = 0;
+  std::chrono::steady_clock::time_point lastSwap;
+  double lastMs = 0.0;
+} g_frameStats;
+
+bool Timing() {
+  return g_profile.enabled || g_frameStats.enabled;
+}
+
+// Times one thing made during the frame (a pipeline, shader or texture).
+class MakeTimer {
+ public:
+  MakeTimer(uint32_t& count, uint64_t& ns) : count_(count), ns_(ns) {
+    if (g_frameStats.enabled) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+  ~MakeTimer() {
+    if (g_frameStats.enabled) {
+      count_++;
+      ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::steady_clock::now() - start_)
+                 .count();
+    }
+  }
+
+ private:
+  uint32_t& count_;
+  uint64_t& ns_;
+  std::chrono::steady_clock::time_point start_;
+};
+
 class StageTimer {
  public:
   explicit StageTimer(Stage stage) : stage_(stage) {
-    if (g_profile.enabled) {
+    if (Timing()) {
       start_ = std::chrono::steady_clock::now();
     }
   }
   ~StageTimer() {
-    if (g_profile.enabled) {
-      g_profile.nanoseconds[size_t(stage_)] +=
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - start_)
-              .count();
+    if (Timing()) {
+      uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - start_)
+                        .count();
+      if (g_profile.enabled) {
+        g_profile.nanoseconds[size_t(stage_)] += ns;
+      }
+      g_frameStats.nanoseconds[size_t(stage_)] += ns;
     }
   }
 
@@ -228,7 +280,43 @@ class StageTimer {
   std::chrono::steady_clock::time_point start_;
 };
 
+void ReportHitch() {
+  g_frameStats.enabled = REXCVAR_GET(log_hitches) || [] {
+    const char* v = std::getenv("NG2_HITCHES");
+    return v && v[0] == '1';
+  }();
+  auto now = std::chrono::steady_clock::now();
+  auto& f = g_frameStats;
+  if (f.enabled && f.lastSwap != std::chrono::steady_clock::time_point()) {
+    double ms = std::chrono::duration<double, std::milli>(now - f.lastSwap).count();
+    // Over 25 ms and well over the frame before (cutscenes run at 30 fps).
+    if (ms > 25.0 && ms > 1.6 * f.lastMs) {
+      // Sync, texture and pipeline time is spent inside draws.
+      double renderer = (f.nanoseconds[size_t(Stage::kDraw)] +
+                         f.nanoseconds[size_t(Stage::kResolve)] +
+                         f.nanoseconds[size_t(Stage::kPresent)]) / 1e6;
+      std::string stages;
+      for (size_t i = 0; i < size_t(Stage::kCount); i++) {
+        stages += fmt::format(" {} {:.1f}", kStageNames[i], f.nanoseconds[i] / 1e6);
+      }
+      REXLOG_INFO("video: hitch {:.1f} ms (renderer {:.1f}:{}); made {} pipelines {:.1f} ms, "
+                  "{} shaders {:.1f} ms, {} textures {:.1f} ms {:.1f} MB",
+                  ms, renderer, stages, f.pipelines, f.pipelineNs / 1e6, f.shaders,
+                  f.shaderNs / 1e6, f.textures, f.textureNs / 1e6, f.textureBytes / 1048576.0);
+    }
+  }
+  bool enabled = f.enabled;
+  double lastMs = f.lastSwap != std::chrono::steady_clock::time_point()
+                      ? std::chrono::duration<double, std::milli>(now - f.lastSwap).count()
+                      : 0.0;
+  f = FrameStats{};
+  f.enabled = enabled;
+  f.lastSwap = now;
+  f.lastMs = lastMs;
+}
+
 void ReportProfile() {
+  ReportHitch();
   g_profile.frames++;
   auto now = std::chrono::steady_clock::now();
   if (!g_profile.enabled || now - g_profile.last < std::chrono::seconds(1)) {
@@ -1037,25 +1125,27 @@ const ShaderCacheEntry* FindShaderCacheEntry(uint64_t hash) {
   return (it != end && it->hash == hash) ? it : nullptr;
 }
 
-RenderShader* GetHostShader(GuestShader& guestShader) {
-  if (!guestShader.entry) {
-    return nullptr;
-  }
-  auto& host = g_hostShaders[guestShader.entry];
+RenderShader* HostShader(const ShaderCacheEntry* entry) {
+  auto& host = g_hostShaders[entry];
   if (!host) {
     if (!g_spirvCache) {
       g_spirvCache = std::make_unique<uint8_t[]>(g_spirvCacheDecompressedSize);
       ZSTD_decompress(g_spirvCache.get(), g_spirvCacheDecompressedSize, g_compressedSpirvCache,
                       g_spirvCacheCompressedSize);
     }
-    const uint8_t* encoded = g_spirvCache.get() + guestShader.entry->spirvOffset;
-    size_t size = smolv::GetDecodedBufferSize(encoded, guestShader.entry->spirvSize);
+    const uint8_t* encoded = g_spirvCache.get() + entry->spirvOffset;
+    size_t size = smolv::GetDecodedBufferSize(encoded, entry->spirvSize);
     std::vector<uint8_t> spirv(size);
-    if (smolv::Decode(encoded, guestShader.entry->spirvSize, spirv.data(), size)) {
+    if (smolv::Decode(encoded, entry->spirvSize, spirv.data(), size)) {
+      MakeTimer made(g_frameStats.shaders, g_frameStats.shaderNs);
       host = g_device->createShader(spirv.data(), size, "main", RenderShaderFormat::SPIRV);
     }
   }
   return host.get();
+}
+
+RenderShader* GetHostShader(GuestShader& guestShader) {
+  return guestShader.entry ? HostShader(guestShader.entry) : nullptr;
 }
 
 
@@ -1670,6 +1760,8 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
         g_garbage[g_frame].push_back(std::move(cached.host));
       }
       bool retry = false;  // made differently once another texture is seen
+      MakeTimer made(g_frameStats.textures, g_frameStats.textureNs);
+      g_frameStats.textureBytes += guestSize + layout.mipsSize;
       cached.host =
           CreateTexture(fetch, info, layout, data, guestSize, mipData, layout.mipsSize, &retry);
       cached.contentHash = retry ? 0 : hash;
@@ -1853,16 +1945,12 @@ struct PipelineKey {
   uint32_t alphaToCoverage;
   float depthBias;  // host units (PolygonOffset)
   float slopeDepthBias;
+  uint32_t padding = 0;  // hashed and listed: no unset bytes
 };
+static_assert(sizeof(PipelineKey) == 96);
 
-RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
-                            RenderShader* pixelShader) {
-  StageTimer timer(Stage::kPipeline);
-  uint64_t hash = XXH3_64bits(&key, sizeof(key));
-  auto& pipeline = g_pipelines[hash];
-  if (pipeline) {
-    return pipeline.get();
-  }
+std::unique_ptr<RenderPipeline> MakePipeline(const PipelineKey& key, RenderShader* vertexShader,
+                                             RenderShader* pixelShader) {
   RenderGraphicsPipelineDesc desc;
   desc.pipelineLayout = g_pipelineLayout.get();
   desc.vertexShader = vertexShader;
@@ -1956,7 +2044,203 @@ RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
   RenderSpecConstant specConstant(0, key.alphaTest ? 0x2u : 0u);  // SPEC_CONSTANT_ALPHA_TEST
   desc.specConstants = &specConstant;
   desc.specConstantsCount = 1;
-  pipeline = g_device->createGraphicsPipeline(desc);
+  return g_device->createGraphicsPipeline(desc);
+}
+
+// Pipelines are made on worker threads (async_pipelines): a draw whose
+// pipeline isn't made yet is left out until it is, rather than the game
+// waiting tens of milliseconds for the driver. Every pipeline made is kept
+// in a list next to the settings (ng2-pipelines.bin), and those are made in
+// the background when the game starts, before they're needed again.
+struct PipelineJob {
+  uint64_t hash;
+  PipelineKey key;
+  RenderShader* vertexShader;
+  RenderShader* pixelShader;
+};
+struct PipelineWorkers {
+  std::mutex mutex;
+  std::condition_variable wake;
+  std::deque<PipelineJob> jobs;
+  std::vector<std::pair<uint64_t, std::unique_ptr<RenderPipeline>>> made;
+  std::vector<std::thread> threads;
+  bool stop = false;
+} g_pipelineWorkers;
+std::unordered_set<uint64_t> g_pendingPipelines;  // asked of the workers, not taken yet
+std::filesystem::path g_pipelineListPath;
+std::unordered_set<uint64_t> g_listedPipelines;   // in the list file
+constexpr uint32_t kPipelineListMagic = 0x4E473250;  // "NG2P"
+constexpr uint32_t kPipelineListVersion = 1;
+
+void PipelineWorker() {
+  auto& w = g_pipelineWorkers;
+  for (;;) {
+    PipelineJob job;
+    {
+      std::unique_lock lock(w.mutex);
+      w.wake.wait(lock, [&] { return w.stop || !w.jobs.empty(); });
+      if (w.stop) {
+        return;
+      }
+      job = w.jobs.front();
+      w.jobs.pop_front();
+    }
+    auto pipeline = MakePipeline(job.key, job.vertexShader, job.pixelShader);
+    std::lock_guard lock(w.mutex);
+    w.made.emplace_back(job.hash, std::move(pipeline));
+  }
+}
+
+void StartPipelineWorkers() {
+  uint32_t count = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 4u);
+  for (uint32_t i = 0; i < count; i++) {
+    g_pipelineWorkers.threads.emplace_back(PipelineWorker);
+  }
+}
+
+void StopPipelineWorkers() {
+  auto& w = g_pipelineWorkers;
+  {
+    std::lock_guard lock(w.mutex);
+    w.stop = true;
+    w.jobs.clear();
+  }
+  w.wake.notify_all();
+  for (auto& thread : w.threads) {
+    thread.join();
+  }
+  w.threads.clear();
+  w.made.clear();
+  w.stop = false;
+  g_pendingPipelines.clear();
+}
+
+// A draw's pipeline goes first; the listed ones (early) wait their turn.
+void AskForPipeline(uint64_t hash, const PipelineKey& key, RenderShader* vertexShader,
+                    RenderShader* pixelShader, bool early = false) {
+  if (!g_pendingPipelines.insert(hash).second) {
+    return;
+  }
+  {
+    std::lock_guard lock(g_pipelineWorkers.mutex);
+    PipelineJob job{hash, key, vertexShader, pixelShader};
+    if (early) {
+      g_pipelineWorkers.jobs.push_back(job);
+    } else {
+      g_pipelineWorkers.jobs.push_front(job);
+    }
+  }
+  g_pipelineWorkers.wake.notify_one();
+}
+
+void TakeMadePipelines() {
+  std::vector<std::pair<uint64_t, std::unique_ptr<RenderPipeline>>> made;
+  {
+    std::lock_guard lock(g_pipelineWorkers.mutex);
+    made.swap(g_pipelineWorkers.made);
+  }
+  for (auto& [hash, pipeline] : made) {
+    g_pendingPipelines.erase(hash);
+    // Kept only if none was made meanwhile (async_pipelines turned off):
+    // that one may already be in a recorded command list.
+    if (pipeline) {
+      g_pipelines.try_emplace(hash, std::move(pipeline));
+    }
+  }
+}
+
+// A new pipeline into the list file (not the debug shader's).
+void ListPipeline(uint64_t hash, const PipelineKey& key) {
+  if (g_pipelineListPath.empty() || key.pixelShader == 0 ||
+      !g_listedPipelines.insert(hash).second) {
+    return;
+  }
+  bool fresh = !std::filesystem::exists(g_pipelineListPath);
+  if (FILE* f = std::fopen(g_pipelineListPath.string().c_str(), "ab")) {
+    if (fresh) {
+      uint32_t header[3] = {kPipelineListMagic, kPipelineListVersion, uint32_t(sizeof(key))};
+      std::fwrite(header, sizeof(header), 1, f);
+    }
+    std::fwrite(&key, sizeof(key), 1, f);
+    std::fclose(f);
+  }
+}
+
+RenderShader* HostShader(const ShaderCacheEntry* entry);
+
+// The listed pipelines, asked of the workers at start.
+void MakeListedPipelines() {
+  if (g_pipelineListPath.empty()) {
+    return;
+  }
+  FILE* f = std::fopen(g_pipelineListPath.string().c_str(), "rb");
+  if (!f) {
+    return;
+  }
+  uint32_t header[3] = {};
+  if (std::fread(header, sizeof(header), 1, f) != 1 || header[0] != kPipelineListMagic ||
+      header[1] != kPipelineListVersion || header[2] != sizeof(PipelineKey)) {
+    std::fclose(f);
+    REXLOG_WARN("video: {} is from another version; starting a new one",
+                g_pipelineListPath.string());
+    std::filesystem::remove(g_pipelineListPath);
+    return;
+  }
+  // A record cut short (the game stopped while writing it) is cut off, so
+  // later ones line up.
+  uint64_t size = std::filesystem::file_size(g_pipelineListPath);
+  uint64_t whole = sizeof(header) + (size - sizeof(header)) / sizeof(PipelineKey) * sizeof(PipelineKey);
+  if (whole != size) {
+    std::fclose(f);
+    std::filesystem::resize_file(g_pipelineListPath, whole);
+    f = std::fopen(g_pipelineListPath.string().c_str(), "rb");
+    if (!f || std::fseek(f, sizeof(header), SEEK_SET) != 0) {
+      if (f) {
+        std::fclose(f);
+      }
+      return;
+    }
+  }
+  PipelineKey key;
+  uint32_t asked = 0;
+  while (std::fread(&key, sizeof(key), 1, f) == 1) {
+    uint64_t hash = XXH3_64bits(&key, sizeof(key));
+    if (!g_listedPipelines.insert(hash).second) {
+      continue;
+    }
+    const ShaderCacheEntry* vs = FindShaderCacheEntry(key.vertexShader);
+    const ShaderCacheEntry* ps = key.pixelShader == 1 ? nullptr : FindShaderCacheEntry(key.pixelShader);
+    RenderShader* vertexShader = vs ? HostShader(vs) : nullptr;
+    RenderShader* pixelShader = ps ? HostShader(ps) : nullptr;
+    if (!vertexShader || (key.pixelShader != 1 && !pixelShader)) {
+      continue;
+    }
+    AskForPipeline(hash, key, vertexShader, pixelShader, true);
+    asked++;
+  }
+  std::fclose(f);
+  REXLOG_INFO("video: making {} listed pipelines in the background", asked);
+}
+
+RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,
+                            RenderShader* pixelShader) {
+  StageTimer timer(Stage::kPipeline);
+  uint64_t hash = XXH3_64bits(&key, sizeof(key));
+  if (auto it = g_pipelines.find(hash); it != g_pipelines.end()) {
+    return it->second.get();
+  }
+  TakeMadePipelines();
+  if (auto it = g_pipelines.find(hash); it != g_pipelines.end()) {
+    return it->second.get();
+  }
+  ListPipeline(hash, key);
+  if (REXCVAR_GET(async_pipelines) && !g_pipelineWorkers.threads.empty()) {
+    AskForPipeline(hash, key, vertexShader, pixelShader);
+    return nullptr;  // the draw is left out until it's made
+  }
+  MakeTimer made(g_frameStats.pipelines, g_frameStats.pipelineNs);
+  auto& pipeline = g_pipelines[hash];
+  pipeline = MakePipeline(key, vertexShader, pixelShader);
   return pipeline.get();
 }
 
@@ -2770,7 +3054,13 @@ bool CreateHostDevice() {
   g_swapChainValid = !g_swapChain->needsResize();
 
   CreatePipelines();
+  StartPipelineWorkers();
+  MakeListedPipelines();
   return true;
+}
+
+void SetPipelineListPath(const std::filesystem::path& path) {
+  g_pipelineListPath = path;
 }
 
 void DestroyHostDevice() {
@@ -2782,6 +3072,7 @@ void DestroyHostDevice() {
     }
     WaitForGPU();
   }
+  StopPipelineWorkers();
   g_pipelines.clear();
   g_guestShaders.clear();
   g_hostShaders.clear();

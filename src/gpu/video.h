@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <filesystem>
+
 #include <cstdint>
 
 namespace ng2::video {
@@ -17,6 +19,8 @@ bool IsNativeRenderer();
 bool CreateHostDevice();
 
 void DestroyHostDevice();
+// Where the pipelines made are listed, to make them early next time.
+void SetPipelineListPath(const std::filesystem::path& path);
 
 // Called from the D3D hooks on the game's D3D thread, after the original
 // function ran (guest addresses; docs/d3d-map-*.md has the signatures).

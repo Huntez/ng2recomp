@@ -161,3 +161,19 @@ SDL driver only if this turns out worse.
 
 License: copying Unleashed code makes this project GPL-3.0-or-later
 (Unleashed is GPL-3.0; ReXGlue is BSD-3-Clause; plume and XenosRecomp MIT).
+
+## Stutter: pipelines (10-30)
+
+- log_hitches (or NG2_HITCHES=1) logs frames over 25 ms (and 1.6x the one
+  before: cutscenes run at 30 fps) with the time per renderer stage and what
+  was made. On a first run (no driver cache) the level load spent 764 ms
+  making 62 pipelines and new areas 75-600 ms; single pipelines take 17-75
+  ms on RADV. Textures were small by comparison.
+- Pipelines are now made on worker threads (async_pipelines, on by default):
+  a draw whose pipeline isn't made yet is left out until it is (a frame or
+  two). Every pipeline key made is appended to ng2-pipelines.bin next to the
+  config (header "NG2P", version, key size; whole 96-byte keys, a torn last
+  one trimmed), and those are asked of the workers at start, behind any a
+  draw needs. With the list from one run, the next had no pipeline hitches.
+- Left: game-side frames (loading, renderer ~1 ms) and the title's label
+  drawing from the atlas glyphs (~48 ms once).

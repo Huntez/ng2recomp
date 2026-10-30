@@ -38,6 +38,7 @@ class Ng2App : public rex::ReXApp {
       paths.config_path = config;
     }
     ng2::recomp_settings::SetConfigPath(paths.config_path);
+    ng2::video::SetPipelineListPath(paths.config_path.parent_path() / "ng2-pipelines.bin");
     ng2::recomp_settings::SetAppContext(&app_context());
   }
 
