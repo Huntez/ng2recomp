@@ -157,6 +157,20 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   model 0x8530B8B0. String tables: sub_823E0E60(*0x83BBC138, language,
   table << 16 | index); table 2 Options, 3 inventory, 4 this list, 8
   Xbox LIVE messages, 12/13 item texts.
+- RECOMP SETTINGS there (src/recomp_settings.cpp, end): a 13th row (label
+  row class 0x82280C80, made as the list's constructor sub_8366DD78 makes
+  Return to Game) at list+0x38, added to the list's 12-row methods
+  (sub_83672908 reset, sub_83672960 update, sub_83672A40 draw: x in r5's
+  high word, y in the low; sub_83672AF8 event 1). The handler's moves onto
+  and off it are ours (its own pad queries held back meanwhile). Confirm
+  swaps the 12 row pointers for ours: 8 choice rows (class 0x82280C5C,
+  constructor sub_8366E078, set up by sub_8366FCA0; 4 choices at most, so
+  Render Scale and Window Size show their value alone), Back and 3 empty
+  rows of no height. Rows only show a value when it changes (the model
+  keeps the game's), so ours are pushed a dummy value first. Sending the
+  list's event 1 (sub_83672AF8) closes the whole menu: ours get it row by
+  row. The row the cursor last named must stay valid (the highlight reads
+  it), so our entry stays at +0x38 throughout.
 - show_fps (src/perf_overlay.cpp): a text item (sprite + text part, as the
   arrow lists' value text) in guest memory, given UI package 0's resource
   0xA (a text frame like package 0x78's 0x2A, which only Options loads),

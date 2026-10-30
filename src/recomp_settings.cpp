@@ -33,6 +33,7 @@
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
+#include <rex/ppc/func.h>
 #include <rex/ui/windowed_app_context.h>
 
 #include <SDL3/SDL.h>
@@ -1100,4 +1101,469 @@ void ng2::recomp_settings::ApplyWindowAtStart() {
                                   : rex::cvar::Query<int32_t>("windowed_width") > 0)) {
     g_appContext->CallInUIThread([fullscreen] { ApplyWindow(fullscreen); });
   }
+}
+
+// RECOMP SETTINGS in gameplay: the Back button's "IN-GAME MANUAL AND OPTIONS"
+// list (docs/menus.md) gets a RECOMP SETTINGS row after its twelve. Choosing
+// it puts our settings in the list's twelve rows (eight choice rows of the
+// game's own class, Back, and three empty rows of no height) until Back.
+// The list's own methods walk its twelve rows, so the extra row is added to
+// them by the hooks below.
+namespace {
+
+constexpr uint32_t kInGameState = 0x83CEB3B4;    // 0: the list
+constexpr uint32_t kInGameCursors = 0x83CEB3C4;  // + 4 * state
+constexpr uint32_t kInGameModel = 0x8530B8C0;    // cursor, last cursor
+constexpr uint32_t kInGameViews[] = {0x8530B930, 0x8530BB80, 0x85310AE0};  // told of moves
+constexpr uint32_t kGameRows = 12;
+constexpr uint32_t kEntryIndex = 12;
+constexpr uint32_t kRowsAt = 8;                 // the list's row pointers
+constexpr uint32_t kChoiceRowSize = 0x780, kLabelRowSize = 0x130;
+constexpr uint32_t kLabelRowVtable = 0x82280C80;  // Return to Game's class
+constexpr uint32_t kRowLabel = 0xE4;              // a row's text
+constexpr uint32_t kChoiceText = 0x434;           // + 0x100 per choice
+constexpr uint32_t kRowHeight = 0x18;
+constexpr uint32_t kLineHeight = 0x821821B4;      // the float the builder gives rows
+constexpr uint32_t kAnyText = 0x40018;            // a string id, for the setup call
+constexpr uint32_t kGuestAlloc = 0xB2800000;
+constexpr uint32_t kChoicesShown = 4;             // a choice row's room
+
+constexpr std::u16string_view kEntryText = u"Recomp Settings";
+constexpr std::u16string_view kBackText = u"Back";
+
+uint32_t g_list = 0;            // the list object, once built
+uint32_t g_arena = 0, g_arenaUsed = 0, g_arenaSize = 0;
+uint32_t g_entry = 0;           // our row in the list
+uint32_t g_settingRows[std::size(kSettings)] = {};
+uint32_t g_valueText[std::size(kSettings)] = {};  // rows with too many choices show one
+uint32_t g_backRow = 0, g_emptyRows[3] = {};
+uint32_t g_gameRows[kGameRows] = {};
+bool g_inGameOurs = false;      // our settings are in the list
+uint32_t g_suppress = 0;        // directions (bit per sub_823E3448 direction) and Confirm (bit 4)
+
+uint32_t ArenaAlloc(uint32_t size) {
+  size = (size + 15) & ~15u;
+  if (g_arenaUsed + size > g_arenaSize) {
+    return 0;
+  }
+  uint32_t at = g_arena + g_arenaUsed;
+  g_arenaUsed += size;
+  return at;
+}
+
+// A UTF-16 string in guest memory, with room for chars more.
+uint32_t GuestText(std::u16string_view text, uint32_t room = 0) {
+  uint32_t chars = uint32_t(std::max<size_t>(text.size(), room)) + 1;
+  uint32_t at = ArenaAlloc(chars * 2);
+  if (at) {
+    std::vector<uint8_t> bytes = Utf16BE(text);
+    std::memset(ng2::guest::Virtual(at), 0, chars * 2);
+    std::memcpy(ng2::guest::Virtual(at), bytes.data(), bytes.size());
+  }
+  return at;
+}
+
+void SetGuestText(uint32_t at, std::u16string_view text) {
+  std::vector<uint8_t> bytes = Utf16BE(text);
+  bytes.push_back(0), bytes.push_back(0);
+  std::memcpy(ng2::guest::Virtual(at), bytes.data(), bytes.size());
+}
+
+}  // namespace
+
+REX_EXTERN(__imp__sub_83810258);  // XMemAlloc(size, attributes)
+REX_EXTERN(__imp__sub_8366E078);  // a choice row's constructor
+REX_EXTERN(__imp__sub_8366FCA0);  // a choice row's setup: (row, label id, ids, count, reversed)
+REX_EXTERN(__imp__sub_8366E238);  // a row's value: (row, value)
+REX_EXTERN(__imp__sub_8366F158);  // an event to a view: (view, event, model)
+
+namespace {
+
+// A guest function by address (a vtable's), as generated code calls them.
+void CallAt(PPCContext& ctx, uint8_t* base, uint32_t address, std::initializer_list<uint64_t> args) {
+  PPCContext saved = ctx;
+  ctx.r1.u64 = saved.r1.u32 - 0x200;
+  uint64_t* registers[] = {&ctx.r3.u64, &ctx.r4.u64, &ctx.r5.u64, &ctx.r6.u64};
+  size_t i = 0;
+  for (uint64_t arg : args) {
+    *registers[i++] = arg;
+  }
+  rex::runtime::ResolveIndirectFunction(address)(ctx, base);
+  ctx = saved;
+}
+
+uint32_t Method(uint32_t object, uint32_t slot) {
+  return ng2::guest::Load32(ng2::guest::Load32(object) + 4 * slot);
+}
+
+// A row as the list's builder sets one up: index, init, line height.
+void InitRow(PPCContext& ctx, uint8_t* base, uint32_t row, uint32_t index, bool empty = false) {
+  Store32(row + 8, index);
+  Store32(row + 12, 0);
+  Store32(row + 4, 0);
+  CallAt(ctx, base, Method(row, 0), {row});
+  Store32(row + 0x14, 0x1C);
+  StoreFloat(row + kRowHeight, empty ? 0.0f : LoadFloat(kLineHeight));
+}
+
+// A label row, as the list's constructor makes Return to Game.
+void MakeLabelRow(PPCContext& ctx, uint8_t* base, uint32_t row) {
+  std::memset(ng2::guest::Virtual(row), 0, kLabelRowSize);
+  Store32(row, kLabelRowVtable);
+  CallGuest(ctx, base, __imp__sub_836DFDE0, {row + 0x20});
+  CallGuest(ctx, base, __imp__sub_823E41F0, {row + 0xB0});
+  Store32(row + 0x110, 1);
+}
+
+std::u16string ValueText(const Setting& setting) {
+  return std::u16string(setting.choices[std::min(ValueOf(setting), setting.count - 1)]);
+}
+
+// Our rows and their texts, made once.
+uint32_t g_ids = 0;  // string ids for the choice rows' setup call
+uint32_t g_entryText = 0, g_backText = 0, g_emptyText = 0;
+uint32_t g_labelText[std::size(kSettings)] = {};
+uint32_t g_choiceTexts[std::size(kSettings)][kChoicesShown] = {};
+
+bool MakeInGameRowsOnce(PPCContext& ctx, uint8_t* base) {
+  if (g_arena) {
+    return true;
+  }
+  constexpr uint32_t kSize = 0x8000;
+  uint32_t arena = CallGuest(ctx, base, __imp__sub_83810258, {kSize, kGuestAlloc});
+  if (!arena) {
+    return false;
+  }
+  std::memset(ng2::guest::Virtual(arena), 0, kSize);
+  g_arena = arena, g_arenaSize = kSize, g_arenaUsed = 0;
+  g_entry = ArenaAlloc(kLabelRowSize);
+  g_backRow = ArenaAlloc(kLabelRowSize);
+  for (uint32_t& row : g_emptyRows) {
+    row = ArenaAlloc(kLabelRowSize);
+  }
+  for (uint32_t& row : g_settingRows) {
+    row = ArenaAlloc(kChoiceRowSize);
+  }
+  g_ids = ArenaAlloc(4 * kChoicesShown);
+  g_entryText = GuestText(kEntryText);
+  g_backText = GuestText(kBackText);
+  g_emptyText = GuestText(u"");
+  for (uint32_t i = 0; i < std::size(kSettings); i++) {
+    const Setting& setting = kSettings[i];
+    g_labelText[i] = GuestText(setting.label);
+    if (setting.count > kChoicesShown) {
+      g_valueText[i] = GuestText(u"", 12);  // the value alone, cycled
+    } else {
+      for (uint32_t k = 0; k < setting.count; k++) {
+        g_choiceTexts[i][k] = GuestText(setting.choices[k]);
+      }
+    }
+  }
+  if (!g_valueText[5] || !g_labelText[std::size(kSettings) - 1]) {
+    REXLOG_WARN("recomp settings: no room for the in-game rows");
+    return false;
+  }
+  for (uint32_t k = 0; k < kChoicesShown; k++) {
+    Store32(g_ids + 4 * k, kAnyText);
+  }
+  for (uint32_t row : {g_entry, g_backRow, g_emptyRows[0], g_emptyRows[1], g_emptyRows[2]}) {
+    MakeLabelRow(ctx, base, row);
+  }
+  for (uint32_t row : g_settingRows) {
+    CallGuest(ctx, base, __imp__sub_8366E078, {row});
+  }
+  return true;
+}
+
+// Our rows set up again, as the game's builder does its own each time.
+bool SetUpInGameRows(PPCContext& ctx, uint8_t* base) {
+  if (!MakeInGameRowsOnce(ctx, base)) {
+    return false;
+  }
+  InitRow(ctx, base, g_entry, kEntryIndex);
+  Store32(g_entry + kRowLabel, g_entryText);
+  InitRow(ctx, base, g_backRow, uint32_t(std::size(kSettings)));
+  Store32(g_backRow + kRowLabel, g_backText);
+  for (uint32_t i = 0; i < std::size(g_emptyRows); i++) {
+    InitRow(ctx, base, g_emptyRows[i], uint32_t(std::size(kSettings)) + 1 + i, true);
+    Store32(g_emptyRows[i] + kRowLabel, g_emptyText);
+  }
+  for (uint32_t i = 0; i < std::size(kSettings); i++) {
+    const Setting& setting = kSettings[i];
+    uint32_t row = g_settingRows[i];
+    InitRow(ctx, base, row, i);
+    bool one = g_valueText[i] != 0;
+    CallGuest(ctx, base, __imp__sub_8366FCA0,
+              {row, kAnyText, g_ids, one ? 1u : setting.count, 0});
+    Store32(row + kRowLabel, g_labelText[i]);
+    if (one) {
+      SetGuestText(g_valueText[i], ValueText(setting));
+      Store32(row + kChoiceText, g_valueText[i]);
+    } else {
+      for (uint32_t k = 0; k < setting.count; k++) {
+        Store32(row + kChoiceText + 0x100 * k, g_choiceTexts[i][k]);
+      }
+    }
+  }
+  return true;
+}
+
+// Tells the list's views the cursor moved (as the game's handler does).
+void NotifyCursor(PPCContext& ctx, uint8_t* base, uint32_t cursor) {
+  uint32_t last = ng2::guest::Load32(kInGameModel);
+  if (last == cursor) {
+    return;
+  }
+  Store32(kInGameModel + 4, last);
+  Store32(kInGameModel, cursor);
+  for (uint32_t view : kInGameViews) {
+    CallGuest(ctx, base, __imp__sub_8366F158, {view, 2, kInGameModel});
+  }
+}
+
+void PushValues(PPCContext& ctx, uint8_t* base) {
+  for (uint32_t i = 0; i < std::size(kSettings); i++) {
+    if (g_valueText[i]) {
+      SetGuestText(g_valueText[i], ValueText(kSettings[i]));
+    }
+    CallGuest(ctx, base, __imp__sub_8366E238, {i, g_valueText[i] ? 0 : ValueOf(kSettings[i])});
+  }
+}
+
+void SetListRows(const uint32_t* rows) {
+  for (uint32_t i = 0; i < kGameRows; i++) {
+    Store32(g_list + kRowsAt + 4 * i, rows[i]);
+  }
+}
+
+}  // namespace
+
+REX_EXTERN(__imp__sub_83672AF8);  // the list's event 1, to all its rows: (list, model)
+
+namespace {
+
+void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours) {
+  if (ours) {
+    for (uint32_t i = 0; i < kGameRows; i++) {
+      g_gameRows[i] = ng2::guest::Load32(g_list + kRowsAt + 4 * i);
+    }
+    uint32_t rows[kGameRows];
+    for (uint32_t i = 0; i < std::size(kSettings); i++) {
+      rows[i] = g_settingRows[i];
+    }
+    rows[std::size(kSettings)] = g_backRow;
+    for (uint32_t i = 0; i < std::size(g_emptyRows); i++) {
+      rows[std::size(kSettings) + 1 + i] = g_emptyRows[i];
+    }
+    SetListRows(rows);
+    // Our row stays after them: the move off it still names it.
+    g_inGameOurs = true;
+    // Event 1 (as the list's rows get when it opens), to ours only: the
+    // list's own sends it to its view too, which closes the menu.
+    for (uint32_t i = 0; i < kGameRows; i++) {
+      CallGuest(ctx, base, __imp__sub_8366F158, {rows[i], 1, kInGameModel});
+    }
+  } else {
+    SetListRows(g_gameRows);
+    g_inGameOurs = false;
+  }
+}
+
+void LeaveInGameRows(PPCContext& ctx, uint8_t* base) {
+  ShowInGameRows(ctx, base, false);
+  Store32(kInGameCursors, kEntryIndex);
+  NotifyCursor(ctx, base, kEntryIndex);
+  if (g_windowChanged) {
+    ScheduleWindow();
+  }
+  if (!g_written.empty() && !g_configPath.empty()) {
+    SaveSettings();
+  }
+  g_written.clear();
+}
+
+}  // namespace
+
+// The list's builder, run as it first opens: our row after its twelve.
+REX_EXTERN(__imp__sub_836722A8);
+REX_HOOK_RAW(sub_836722A8) {
+  uint32_t list = ctx.r3.u32;
+  __imp__sub_836722A8(ctx, base);
+  if (g_inGameOurs && !g_written.empty() && !g_configPath.empty()) {
+    SaveSettings();  // the list was made again while ours was shown
+    g_written.clear();
+  }
+  g_inGameOurs = false;
+  if (SetUpInGameRows(ctx, base)) {
+    g_list = list;
+    Store32(g_list + kRowsAt + 4 * kGameRows, g_entry);
+  }
+}
+
+// The list's methods over its rows: ours too.
+REX_EXTERN(__imp__sub_83672908);
+REX_HOOK_RAW(sub_83672908) {  // reset
+  uint32_t list = ctx.r3.u32;
+  __imp__sub_83672908(ctx, base);
+  if (list == g_list && !g_inGameOurs) {
+    CallAt(ctx, base, Method(g_entry, 1), {g_entry});
+  }
+}
+REX_EXTERN(__imp__sub_83672960);
+REX_HOOK_RAW(sub_83672960) {  // update
+  uint32_t list = ctx.r3.u32;
+  __imp__sub_83672960(ctx, base);
+  if (list == g_list && !g_inGameOurs) {
+    CallAt(ctx, base, Method(g_entry, 2), {g_entry});
+  }
+}
+REX_HOOK_RAW(sub_83672AF8) {  // event 1 to every row
+  uint32_t list = ctx.r3.u32, model = ctx.r4.u32;
+  __imp__sub_83672AF8(ctx, base);
+  if (list == g_list && !g_inGameOurs) {
+    CallGuest(ctx, base, __imp__sub_8366F158, {g_entry, 1, model});
+  }
+}
+REX_EXTERN(__imp__sub_83672A40);
+REX_HOOK_RAW(sub_83672A40) {  // draw: the rows one under another
+  uint32_t list = ctx.r3.u32;
+  uint64_t layer = ctx.r4.u64, position = ctx.r5.u64;
+  __imp__sub_83672A40(ctx, base);
+  if (list == g_list && !g_inGameOurs) {
+    uint32_t bits = uint32_t(position);
+    float y;
+    std::memcpy(&y, &bits, sizeof(y));
+    for (uint32_t i = 0; i < kGameRows; i++) {
+      y += LoadFloat(ng2::guest::Load32(g_list + kRowsAt + 4 * i) + kRowHeight);
+    }
+    std::memcpy(&bits, &y, sizeof(bits));
+    // x in the high word, y in the low one, as each row gets them.
+    CallAt(ctx, base, Method(g_entry, 3),
+           {g_entry, layer, (position & 0xFFFFFFFF00000000ull) | bits});
+  }
+}
+
+// Pad queries held back from the game's handler while ours acts.
+REX_HOOK_RAW(sub_823E3448) {
+  if (g_suppress & (1u << ctx.r7.u32)) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_823E3448(ctx, base);
+}
+REX_HOOK_RAW(sub_823E3D78) {
+  if (g_suppress & 0x10) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_823E3D78(ctx, base);
+}
+
+// The list's handler: moves onto and off our row, and our settings while
+// they're shown.
+REX_EXTERN(__imp__sub_823E84F8);
+REX_HOOK_RAW(sub_823E84F8) {
+  using ng2::guest::Load32;
+  uint32_t state = Load32(kInGameState);
+  if (!g_list || state != 0) {
+    __imp__sub_823E84F8(ctx, base);
+    return;
+  }
+  uint32_t cursorAddress = kInGameCursors;
+  uint32_t cursor = Load32(cursorAddress);
+  uint32_t pad = Load32(kPadState);
+  uint32_t player = *ng2::guest::Virtual(kPlayerPad);
+  auto pressed = [&](uint32_t direction) {
+    return CallGuest(ctx, base, __imp__sub_823E3448, {pad, player, 1, 0, direction}) != 0;
+  };
+  double sound = LoadFloat(kCursorSound);
+
+  if (g_inGameOurs) {
+    constexpr uint32_t kRows = uint32_t(std::size(kSettings)) + 1;  // and Back
+    cursor = std::min(cursor, kRows - 1);
+    if (CallGuest(ctx, base, __imp__sub_823E3ED0, {kPadState, cursor, 0xFF, 0})) {
+      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+      LeaveInGameRows(ctx, base);
+      return;
+    }
+    uint32_t moved = cursor;
+    if (pressed(0)) {
+      moved = (moved + kRows - 1) % kRows;
+    }
+    if (pressed(1)) {
+      moved = (moved + 1) % kRows;
+    }
+    if (moved != cursor) {
+      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+      cursor = moved;
+      Store32(cursorAddress, cursor);
+    }
+    if (cursor == kRows - 1) {
+      if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
+        CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+        LeaveInGameRows(ctx, base);
+        return;
+      }
+    } else {
+      const Setting& setting = kSettings[cursor];
+      uint32_t value = ValueOf(setting), changed = value;
+      if (pressed(3)) {
+        changed = (changed + setting.count - 1) % setting.count;
+      }
+      if (pressed(2)) {
+        changed = (changed + 1) % setting.count;
+      }
+      if (changed != value) {
+        CallGuest(ctx, base, __imp__sub_82429DA8, {3}, sound);
+        SetValue(setting, changed);
+      } else if (CallGuest(ctx, base, __imp__sub_823E3FD0, {kPadState})) {
+        RestoreDefault(setting);
+      }
+    }
+    if (g_windowChanged) {
+      ScheduleWindow();
+    }
+    NotifyCursor(ctx, base, cursor);
+    PushValues(ctx, base);
+    return;
+  }
+
+  // The game's list, with our row last: the game's handler wraps between
+  // its first and last rows, so the moves to and from ours are made here.
+  uint32_t last = kGameRows - 1;
+  bool up = pressed(0), down = pressed(1);
+  uint32_t to = cursor;
+  if (cursor == kEntryIndex) {
+    to = up ? last : down ? 0 : cursor;
+  } else if (cursor == last && down) {
+    to = kEntryIndex;
+  } else if (cursor == 0 && up) {
+    to = kEntryIndex;
+  }
+  if (to != cursor) {
+    CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+    Store32(cursorAddress, to);
+    cursor = to;
+    g_suppress |= 0x3;  // the game's handler doesn't move it again
+  }
+  if (cursor == kEntryIndex) {
+    g_suppress |= 0xC;  // no left and right either
+    if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
+      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+      ShowInGameRows(ctx, base, true);
+      Store32(cursorAddress, 0);
+      NotifyCursor(ctx, base, 0);
+      // A row shows a value once it changes: the game's rows' values are
+      // still in the model, so each is changed twice.
+      for (uint32_t i = 0; i < std::size(kSettings); i++) {
+        CallGuest(ctx, base, __imp__sub_8366E238, {i, 0xFF});
+      }
+      PushValues(ctx, base);
+      g_suppress = 0;
+      return;
+    }
+    g_suppress |= 0x10;  // the game's own Confirm reads past its rows
+  }
+  __imp__sub_823E84F8(ctx, base);
+  g_suppress = 0;
 }
