@@ -24,7 +24,8 @@ set(NG2_SOURCES
 )
 
 if(WIN32)
-    add_executable(ng2 WIN32 ${NG2_SOURCES})
+    # The executable's icon.
+    add_executable(ng2 WIN32 ${NG2_SOURCES} packaging/windows/ng2.rc)
 else()
     add_executable(ng2 ${NG2_SOURCES})
 endif()

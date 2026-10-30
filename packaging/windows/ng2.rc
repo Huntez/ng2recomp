@@ -1,0 +1,2 @@
+// The executable's icon (Windows builds, CMakeLists.txt).
+1 ICON "ng2.ico"
