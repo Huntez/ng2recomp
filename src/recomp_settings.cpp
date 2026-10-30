@@ -766,7 +766,20 @@ REX_HOOK_RAW(sub_8364D0C0) {
       Load32(kTitleEntries + cursor * kTitleEntrySize + kEntryAction) == kExitAction &&
       g_appContext) {
     REXLOG_INFO("title menu: exit");
-    g_appContext->RequestDeferredQuit();
+    // As the window's close button: the runtime ends the title and exits
+    // (a plain quit runs a teardown that can wait on the game's threads).
+    g_appContext->CallInUIThread([] {
+      int count = 0;
+      SDL_Window** windows = SDL_GetWindows(&count);
+      SDL_Window* window = (windows && count > 0) ? windows[0] : nullptr;
+      SDL_free(windows);
+      if (window) {
+        SDL_Event event{};
+        event.type = SDL_EVENT_WINDOW_CLOSE_REQUESTED;
+        event.window.windowID = SDL_GetWindowID(window);
+        SDL_PushEvent(&event);
+      }
+    });
   }
 }
 
@@ -1116,10 +1129,22 @@ constexpr uint32_t kInGameCursors = 0x83CEB3C4;  // + 4 * state
 constexpr uint32_t kInGameModel = 0x8530B8C0;    // cursor, last cursor
 constexpr uint32_t kInGameViews[] = {0x8530B930, 0x8530BB80, 0x85310AE0};  // told of moves
 constexpr uint32_t kGameRows = 12;
-constexpr uint32_t kEntryIndex = 12;
+constexpr uint32_t kEntryIndex = 12;   // our row's index, as the game's handler sees it
+constexpr uint32_t kEntryShownAt = 10;   // where it's shown: after Save Method
+
+// Our row is shown after Save Method, but the game's handler and the list
+// keep their own indices (10 Quit Game, 11 Return to Game; ours is 12):
+// only moving up and down goes by the order shown.
+uint32_t ToShown(uint32_t index) {
+  return index < kEntryShownAt ? index : index == kEntryIndex ? kEntryShownAt : index + 1;
+}
+uint32_t ToGameIndex(uint32_t shown) {
+  return shown < kEntryShownAt ? shown : shown == kEntryShownAt ? kEntryIndex : shown - 1;
+}
 constexpr uint32_t kRowsAt = 8;                 // the list's row pointers
 constexpr uint32_t kChoiceRowSize = 0x780, kLabelRowSize = 0x130;
 constexpr uint32_t kLabelRowVtable = 0x82280C80;  // Return to Game's class
+constexpr uint32_t kQuitRowVtable = 0x82280CC8;   // Quit Game's
 constexpr uint32_t kRowLabel = 0xE4;              // a row's text
 constexpr uint32_t kChoiceText = 0x434;           // + 0x100 per choice
 constexpr uint32_t kRowHeight = 0x18;
@@ -1308,6 +1333,12 @@ bool SetUpInGameRows(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+bool g_inGameShownOrder = false;  // the game's rows placed with ours among them
+
+void SendCursorEvent(PPCContext& ctx, uint8_t* base, uint32_t view) {
+  CallGuest(ctx, base, __imp__sub_8366F158, {view, 2, kInGameModel});
+}
+
 // Tells the list's views the cursor moved (as the game's handler does).
 void NotifyCursor(PPCContext& ctx, uint8_t* base, uint32_t cursor) {
   uint32_t last = ng2::guest::Load32(kInGameModel);
@@ -1317,7 +1348,7 @@ void NotifyCursor(PPCContext& ctx, uint8_t* base, uint32_t cursor) {
   Store32(kInGameModel + 4, last);
   Store32(kInGameModel, cursor);
   for (uint32_t view : kInGameViews) {
-    CallGuest(ctx, base, __imp__sub_8366F158, {view, 2, kInGameModel});
+    SendCursorEvent(ctx, base, view);
   }
 }
 
@@ -1336,6 +1367,36 @@ void SetListRows(const uint32_t* rows) {
   }
 }
 
+
+// The game's rows in their own slots (other code finds Quit Game's by
+// index), ours in the 13th.
+void ArrangeGameRows() {
+  SetListRows(g_gameRows);
+  Store32(g_list + kRowsAt + 4 * kGameRows, g_entry);
+}
+
+// A row is drawn at the place its index (set when it's set up) gives it:
+// ours and the two shown after it get those places.
+void PlaceGameRows(PPCContext& ctx, uint8_t* base) {
+  for (uint32_t shown = kEntryShownAt; shown <= kGameRows; shown++) {
+    uint32_t index = ToGameIndex(shown);
+    uint32_t row = index == kEntryIndex ? g_entry : g_gameRows[index];
+    // Its texts, which the builder set after the setup: Quit Game's class
+    // has its label at +0xF4 and its question's texts at +0x20..+0x28.
+    bool quit = ng2::guest::Load32(row) == kQuitRowVtable;
+    std::vector<uint32_t> keep = quit ? std::vector<uint32_t>{0x20, 0x24, 0x28, 0xF4}
+                                      : std::vector<uint32_t>{kRowLabel};
+    std::vector<uint32_t> values;
+    for (uint32_t offset : keep) {
+      values.push_back(ng2::guest::Load32(row + offset));
+    }
+    InitRow(ctx, base, row, shown);
+    for (size_t i = 0; i < keep.size(); i++) {
+      Store32(row + keep[i], values[i]);
+    }
+  }
+}
+
 }  // namespace
 
 REX_EXTERN(__imp__sub_83672AF8);  // the list's event 1, to all its rows: (list, model)
@@ -1344,9 +1405,6 @@ namespace {
 
 void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours) {
   if (ours) {
-    for (uint32_t i = 0; i < kGameRows; i++) {
-      g_gameRows[i] = ng2::guest::Load32(g_list + kRowsAt + 4 * i);
-    }
     uint32_t rows[kGameRows];
     for (uint32_t i = 0; i < std::size(kSettings); i++) {
       rows[i] = g_settingRows[i];
@@ -1356,7 +1414,7 @@ void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours) {
       rows[std::size(kSettings) + 1 + i] = g_emptyRows[i];
     }
     SetListRows(rows);
-    // Our row stays after them: the move off it still names it.
+    // The 13th stays: the move off our row still names index 12.
     g_inGameOurs = true;
     // Event 1 (as the list's rows get when it opens), to ours only: the
     // list's own sends it to its view too, which closes the menu.
@@ -1364,7 +1422,7 @@ void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours) {
       CallGuest(ctx, base, __imp__sub_8366F158, {rows[i], 1, kInGameModel});
     }
   } else {
-    SetListRows(g_gameRows);
+    ArrangeGameRows();
     g_inGameOurs = false;
   }
 }
@@ -1394,9 +1452,15 @@ REX_HOOK_RAW(sub_836722A8) {
     g_written.clear();
   }
   g_inGameOurs = false;
+  g_inGameShownOrder = false;
   if (SetUpInGameRows(ctx, base)) {
     g_list = list;
-    Store32(g_list + kRowsAt + 4 * kGameRows, g_entry);
+    for (uint32_t i = 0; i < kGameRows; i++) {
+      g_gameRows[i] = ng2::guest::Load32(g_list + kRowsAt + 4 * i);
+    }
+    ArrangeGameRows();
+    PlaceGameRows(ctx, base);
+    g_inGameShownOrder = true;
   }
 }
 
@@ -1406,7 +1470,8 @@ REX_HOOK_RAW(sub_83672908) {  // reset
   uint32_t list = ctx.r3.u32;
   __imp__sub_83672908(ctx, base);
   if (list == g_list && !g_inGameOurs) {
-    CallAt(ctx, base, Method(g_entry, 1), {g_entry});
+    uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
+    CallAt(ctx, base, Method(row, 1), {row});
   }
 }
 REX_EXTERN(__imp__sub_83672960);
@@ -1414,14 +1479,16 @@ REX_HOOK_RAW(sub_83672960) {  // update
   uint32_t list = ctx.r3.u32;
   __imp__sub_83672960(ctx, base);
   if (list == g_list && !g_inGameOurs) {
-    CallAt(ctx, base, Method(g_entry, 2), {g_entry});
+    uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
+    CallAt(ctx, base, Method(row, 2), {row});
   }
 }
 REX_HOOK_RAW(sub_83672AF8) {  // event 1 to every row
   uint32_t list = ctx.r3.u32, model = ctx.r4.u32;
   __imp__sub_83672AF8(ctx, base);
   if (list == g_list && !g_inGameOurs) {
-    CallGuest(ctx, base, __imp__sub_8366F158, {g_entry, 1, model});
+    uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
+    CallGuest(ctx, base, __imp__sub_8366F158, {row, 1, model});
   }
 }
 REX_EXTERN(__imp__sub_83672A40);
@@ -1438,8 +1505,8 @@ REX_HOOK_RAW(sub_83672A40) {  // draw: the rows one under another
     }
     std::memcpy(&bits, &y, sizeof(bits));
     // x in the high word, y in the low one, as each row gets them.
-    CallAt(ctx, base, Method(g_entry, 3),
-           {g_entry, layer, (position & 0xFFFFFFFF00000000ull) | bits});
+    uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
+    CallAt(ctx, base, Method(row, 3), {row, layer, (position & 0xFFFFFFFF00000000ull) | bits});
   }
 }
 
@@ -1528,18 +1595,17 @@ REX_HOOK_RAW(sub_823E84F8) {
     return;
   }
 
-  // The game's list, with our row last: the game's handler wraps between
-  // its first and last rows, so the moves to and from ours are made here.
-  uint32_t last = kGameRows - 1;
+  // The game's list, our row shown after Save Method: the moves onto and
+  // off it are made here, in the order shown, the rest by the game's
+  // handler in its own indices.
   bool up = pressed(0), down = pressed(1);
-  uint32_t to = cursor;
-  if (cursor == kEntryIndex) {
-    to = up ? last : down ? 0 : cursor;
-  } else if (cursor == last && down) {
-    to = kEntryIndex;
-  } else if (cursor == 0 && up) {
-    to = kEntryIndex;
+  uint32_t shown = ToShown(cursor), toShown = shown;
+  if (shown == kEntryShownAt) {
+    toShown = up ? kEntryShownAt - 1 : down ? kEntryShownAt + 1 : shown;
+  } else if ((shown == kEntryShownAt - 1 && down) || (shown == kEntryShownAt + 1 && up)) {
+    toShown = kEntryShownAt;
   }
+  uint32_t to = ToGameIndex(toShown);
   if (to != cursor) {
     CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
     Store32(cursorAddress, to);
@@ -1566,4 +1632,18 @@ REX_HOOK_RAW(sub_823E84F8) {
   }
   __imp__sub_823E84F8(ctx, base);
   g_suppress = 0;
+}
+
+
+// The list's cursor event: it lights the row by index, then the cursor
+// mark is drawn at the slot it keeps (+0x4EC0), which goes by the order
+// shown.
+REX_EXTERN(__imp__sub_83672BE8);
+REX_HOOK_RAW(sub_83672BE8) {
+  uint32_t list = ctx.r3.u32;
+  __imp__sub_83672BE8(ctx, base);
+  if (list == g_list && g_inGameShownOrder && !g_inGameOurs) {
+    constexpr uint32_t kMarkSlot = 0x4EC0;
+    Store32(list + kMarkSlot, ToShown(ng2::guest::Load32(list + kMarkSlot)));
+  }
 }
