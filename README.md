@@ -29,7 +29,7 @@ played through, and there are no releases yet. Test builds are posted in issues.
 
 ## Performance
 
-Measured on one machine (Ryzen CPU, Radeon RX 9070, Mesa RADV, Linux), in the same Chapter 1 fight,
+Measured on one machine (Ryzen 7 9800X3D, Radeon RX 9070, Mesa RADV, Linux), in the same Chapter 1 fight,
 headless at 1280x720, 30 seconds each. All held 60 fps; what differs is how hard the GPU works to do
 it (GPU busy, of which about 5% is the desktop) and the CPU time used.
 
