@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <chrono>
 #include <thread>
 
@@ -193,5 +194,64 @@ REX_HOOK_RAW(sub_83737AE0) {
   __imp__sub_83737AE0(ctx, base);
   if (ctx.r3.u32 != 0 && ++spins > 64) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
+  }
+}
+
+// The audio engine's barrier (XAudio2's voice processing, sub_8374F078): each
+// thread taking part sets its processor's byte in a 64-bit mask and waits
+// until the mask holds all of them, and the first to see that clears it. A
+// waiting thread only left on seeing the mask whole or cleared; if the OS
+// paused it right then, the other thread could clear the mask and set its
+// byte again for the next pass first, leaving both waiting for good (the
+// sound stops; on the console the hardware threads aren't paused). Here a
+// thread also leaves once its own byte is cleared, which only a completed
+// barrier does.
+REX_EXTERN(__imp__sub_8374F078);
+REX_HOOK_RAW(sub_8374F078) {
+  uint32_t engine = ctx.r3.u32;
+  if (ng2::guest::Load32(engine + 0x130) == 0) {
+    return;
+  }
+  uint8_t cpu = *ng2::guest::Virtual(ctx.r13.u32 + 0x10C);
+  if (cpu >= 6) {
+    __imp__sub_8374F078(ctx, base);
+    return;
+  }
+  // 4-byte aligned in the engine (x86 keeps it atomic within a cache line).
+  auto* word = reinterpret_cast<uint64_t*>(ng2::guest::Virtual(ctx.r4.u32));
+  if ((reinterpret_cast<uintptr_t>(word) & 63) > 56) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      REXLOG_WARN("audio barrier: the mask at {:08x} crosses a cache line", ctx.r4.u32);
+    }
+  }
+  // Who takes part, read once as the game does: bytes 0-5 one per processor.
+  uint8_t expected[8] = {};
+  for (uint32_t i = 0; i < 6; i++) {
+    expected[i] = ng2::guest::Load32(engine + 0x134 + 4 * i) != 0;
+  }
+  __atomic_store_n(reinterpret_cast<uint8_t*>(word) + cpu, uint8_t(1), __ATOMIC_SEQ_CST);
+  for (uint32_t spins = 0;; spins++) {
+    uint64_t seen = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+    uint8_t bytes[8];
+    std::memcpy(bytes, &seen, sizeof(bytes));
+    if (seen == 0 || bytes[cpu] == 0) {
+      return;  // completed (and maybe already entered again by another)
+    }
+    bool whole = true;
+    for (uint32_t i = 0; i < 8; i++) {
+      whole &= (bytes[i] != 0) == (expected[i] != 0);
+    }
+    // Cleared only as seen whole: a late clear can't take a byte set since.
+    if (whole && __atomic_compare_exchange_n(word, &seen, uint64_t(0), false, __ATOMIC_SEQ_CST,
+                                             __ATOMIC_SEQ_CST)) {
+      return;
+    }
+    if (spins >= 4096) {
+      std::this_thread::yield();
+    } else {
+      __builtin_ia32_pause();
+    }
   }
 }

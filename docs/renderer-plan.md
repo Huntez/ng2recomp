@@ -202,3 +202,19 @@ passes a fence) spins until the next vblank, a whole core on the title screen
 (95% of one thread, per perf -t). After 64 steps each step now sleeps 100 us:
 title 106% -> 16% of a core, the Chapter 1 fight 3.04 -> 2.36 cores, still 60
 fps.
+
+## Audio stopping in play (10-30)
+
+The sound sometimes stopped for good while the game ran on: two threads spun
+forever in XAudio2's voice processing barrier (sub_8374F078, from
+sub_8374EF40: the main pass sub_8374E740/EDE8 and a worker sub_8374E808).
+Each thread sets its processor's byte (PCR r13+0x10C) in a 64-bit mask and
+waits for it to hold all of them; the first to see that clears it. A thread
+only left on seeing the mask whole or zero, so if the OS paused it there, the
+other could clear the mask, start the next pass and set its byte in the same
+mask again first, leaving both waiting (the console's hardware threads aren't
+paused). The hook in d3d_hooks.cpp lets a thread also leave once its own byte
+is cleared (only a completed barrier does that) and clears with a CAS from the
+whole value it saw. Caught in a gdb soak 5 min in (tools: a watcher signalling
+SIGUSR1 to gdb when two threads spin 30 s); two 30-min soaks clean after.
+Test audio (NG2_TEST_AUDIO=disk) is ~70 MB a minute: keep it off a full /tmp.
