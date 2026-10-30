@@ -161,8 +161,10 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   place their index gives them (set at setup, vt slot 0), so ours and
   Quit Game / Return to Game get indices 10-12 while the list keeps the
   game's order (other code, like Quit Game's question, finds rows by the
-  handler's index); the cursor mark's slot (+0x4EC0, set by the list's
-  cursor event sub_83672BE8) is moved to the shown place. Quit Game's class
+  handler's index). Rows light up when the cursor equals their index, so
+  the list's cursor event (sub_83672BE8) is replaced: rows found by the
+  handler's indices, given the cursors in the shown order, and the cursor
+  mark's slot (+0x4EC0) set to the shown place. Quit Game's class
   keeps its label at +0xF4 and its question's texts at +0x20..+0x28.
 - RECOMP SETTINGS there (src/recomp_settings.cpp, end): a 13th row (label
   row class 0x82280C80, made as the list's constructor sub_8366DD78 makes

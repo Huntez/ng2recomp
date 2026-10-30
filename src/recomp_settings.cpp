@@ -1635,15 +1635,29 @@ REX_HOOK_RAW(sub_823E84F8) {
 }
 
 
-// The list's cursor event: it lights the row by index, then the cursor
-// mark is drawn at the slot it keeps (+0x4EC0), which goes by the order
-// shown.
+// The list's cursor event, as the game's (sub_83672BE8) but for rows
+// placed in the order shown: the rows to light and unlight are found by
+// the handler's indices, and they compare the cursor with their own index
+// (their place), so they get the cursors in the order shown; the cursor
+// mark's slot (+0x4EC0) is the shown place too.
 REX_EXTERN(__imp__sub_83672BE8);
 REX_HOOK_RAW(sub_83672BE8) {
-  uint32_t list = ctx.r3.u32;
-  __imp__sub_83672BE8(ctx, base);
-  if (list == g_list && g_inGameShownOrder && !g_inGameOurs) {
-    constexpr uint32_t kMarkSlot = 0x4EC0;
-    Store32(list + kMarkSlot, ToShown(ng2::guest::Load32(list + kMarkSlot)));
+  uint32_t list = ctx.r3.u32, model = ctx.r4.u32;
+  if (list != g_list || !g_inGameShownOrder || g_inGameOurs) {
+    __imp__sub_83672BE8(ctx, base);
+    return;
   }
+  using ng2::guest::Load32;
+  uint32_t cursor = Load32(model), last = Load32(model + 4);
+  Store32(model, ToShown(cursor));
+  Store32(model + 4, int32_t(last) >= 0 ? ToShown(last) : last);
+  if (int32_t(last) >= 0) {
+    CallGuest(ctx, base, __imp__sub_8366F158,
+              {Load32(list + kRowsAt + 4 * last), 2, model});
+  }
+  CallGuest(ctx, base, __imp__sub_8366F158, {Load32(list + kRowsAt + 4 * cursor), 2, model});
+  Store32(model, cursor);
+  Store32(model + 4, last);
+  Store32(list + 0x4EC0, ToShown(cursor));
+  ctx.r3.u64 = 1;
 }
