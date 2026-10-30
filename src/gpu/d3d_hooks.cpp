@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <thread>
 
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -171,5 +172,22 @@ REX_HOOK_RAW(sub_837452C0) {
   }
   if (StatsEnabled()) {
     ReportStats();
+  }
+}
+
+// One step of the D3D library's wait for the GPU (sub_8373A4D0 calls it until
+// the GPU's read pointer passes a fence; 1: still waiting). The console spins
+// here; on a PC that's a whole core busy until the next vblank, so once it
+// has spun a while each step sleeps a little.
+REX_EXTERN(__imp__sub_83737AE0);
+REX_HOOK_RAW(sub_83737AE0) {
+  thread_local uint32_t spins = 0;
+  __imp__sub_83737AE0(ctx, base);
+  if (ctx.r3.u32 == 0) {
+    spins = 0;
+    return;
+  }
+  if (++spins > 64) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 }

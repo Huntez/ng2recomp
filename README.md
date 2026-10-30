@@ -35,7 +35,7 @@ it (GPU busy, of which about 5% is the desktop) and the CPU time used.
 
 | | GPU busy, 1x | GPU busy, 3x | CPU cores |
 |---|---|---|---|
-| This port's Vulkan renderer | 13% | 21% | 2.8-3.0 |
+| This port's Vulkan renderer | 13% | 21% | 2.4 |
 | The same recompiled game on ReXGlue's GPU emulation (Xenia's) | 80% | 85% | 3.4-3.5 |
 | Xenia Edge (the emulator) | 18% | 54% | 2.3 |
 

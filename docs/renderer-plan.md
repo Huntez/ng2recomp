@@ -195,3 +195,10 @@ recomp's pad script, and for Xenia xdotool keys inside gamescope (`--keybind_a=J
 semicolon, doesn't reach it there; its sign-in prompt is Right, Return). The SDK's GPU emulation is
 much heavier than current Xenia Edge; the recomp's own CPU time is higher than Xenia's (its threads
 spin more), worth a look.
+
+CPU (10-30): the recomp used more than Xenia because the game's D3D wait for
+the GPU (sub_8373A4D0, stepping sub_83737AE0 until the GPU's read pointer
+passes a fence) spins until the next vblank, a whole core on the title screen
+(95% of one thread, per perf -t). After 64 steps each step now sleeps 100 us:
+title 106% -> 16% of a core, the Chapter 1 fight 3.04 -> 2.36 cores, still 60
+fps.
