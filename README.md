@@ -27,6 +27,21 @@ played through, and there are no releases yet. Test builds are posted in issues.
 - **RECOMP SETTINGS** on the title menu and in the in-game menu; **EXIT GAME** on the title menu
 - The game's movies decoded on the PC (FFmpeg)
 
+## Performance
+
+Measured on one machine (Ryzen CPU, Radeon RX 9070, Mesa RADV, Linux), in the same Chapter 1 fight,
+headless at 1280x720, 30 seconds each. All held 60 fps; what differs is how hard the GPU works to do
+it (GPU busy, of which about 5% is the desktop) and the CPU time used.
+
+| | GPU busy, 1x | GPU busy, 3x | CPU cores |
+|---|---|---|---|
+| This port's Vulkan renderer | 13% | 21% | 2.8-3.0 |
+| The same recompiled game on ReXGlue's GPU emulation (Xenia's) | 80% | 85% | 3.4-3.5 |
+| Xenia Edge (the emulator) | 18% | 54% | 2.3 |
+
+The native renderer leaves the GPU most of its time free at 3x, where GPU emulation is near its
+limit; that headroom is what allows 4x-8x and MSAA on top.
+
 ## Getting started
 
 ### Linux

@@ -177,3 +177,21 @@ License: copying Unleashed code makes this project GPL-3.0-or-later
   draw needs. With the list from one run, the next had no pipeline hitches.
 - Left: game-side frames (loading, renderer ~1 ms) and the title's label
   drawing from the atlas glyphs (~48 ms once).
+
+## Performance against GPU emulation and Xenia (10-30)
+
+Same scene (Chapter 1's first fight, from the scripted pad), headless gamescope 1280x720, RX 9070
+(RADV), 30 s windows; GPU busy from amdgpu's gpu_busy_percent (the desktop adds about 5%), CPU from
+the process's /proc time. All ran at 60 fps (Xenia's not logged, held visually).
+
+| | GPU 1x | GPU 3x | CPU cores 1x / 3x |
+|---|---|---|---|
+| native (NG2_RENDERER=native, render_scale) | 13% | 21% | 3.04 / 2.78 |
+| recomp on the xenos plugin (draw_resolution_scale) | 80% | 85% | 3.49 / 3.43 |
+| Xenia Edge (draw_resolution_scale) | 18% | 54% | 2.35 / 2.34 |
+
+Scripts: a sampler following the test run's own process (the player's game may run too), the
+recomp's pad script, and for Xenia xdotool keys inside gamescope (`--keybind_a=J`: the default A key,
+semicolon, doesn't reach it there; its sign-in prompt is Right, Return). The SDK's GPU emulation is
+much heavier than current Xenia Edge; the recomp's own CPU time is higher than Xenia's (its threads
+spin more), worth a look.
