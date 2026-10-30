@@ -175,19 +175,23 @@ REX_HOOK_RAW(sub_837452C0) {
   }
 }
 
-// One step of the D3D library's wait for the GPU (sub_8373A4D0 calls it until
-// the GPU's read pointer passes a fence; 1: still waiting). The console spins
-// here; on a PC that's a whole core busy until the next vblank, so once it
-// has spun a while each step sleeps a little.
+// The D3D library's waits for the GPU: each fills a wait block (with the
+// time base at +20 when it starts) and calls sub_83737AE0 until the GPU's
+// read pointer passes a fence (1: still waiting). The console spins here; on
+// a PC that's a whole core busy until the next vblank, so once a wait has
+// spun a while each step sleeps a little. The count starts again with each
+// wait, told apart by that time stamp (they end on the read pointer, not on
+// a step's 0).
 REX_EXTERN(__imp__sub_83737AE0);
 REX_HOOK_RAW(sub_83737AE0) {
-  thread_local uint32_t spins = 0;
-  __imp__sub_83737AE0(ctx, base);
-  if (ctx.r3.u32 == 0) {
+  thread_local uint32_t spins = 0, lastStamp = 0;
+  uint32_t stamp = ng2::guest::Load32(ctx.r3.u32 + 20);
+  if (stamp != lastStamp) {
+    lastStamp = stamp;
     spins = 0;
-    return;
   }
-  if (++spins > 64) {
+  __imp__sub_83737AE0(ctx, base);
+  if (ctx.r3.u32 != 0 && ++spins > 64) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 }
