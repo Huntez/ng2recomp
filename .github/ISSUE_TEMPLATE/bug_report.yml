@@ -1,0 +1,56 @@
+name: Bug report
+description: Something goes wrong in the game, the menus or starting it.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the [known issues](../blob/main/README.md#known-issues) first.
+        Never attach game files or disc images.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The test build you are running, or the commit if you built it.
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      description: For example "Arch Linux", "Fedora 43" or "Ubuntu 24.04".
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      description: For example "AMD Ryzen 5 5600X" or "Intel i7-12700".
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: For example "AMD RX 6700 XT, Mesa 25.2" or "NVIDIA RTX 3060, 580.95".
+  - type: input
+    id: settings
+    attributes:
+      label: RECOMP SETTINGS
+      description: Render scale, anti-aliasing, bloom, window mode and V-Sync, if they differ from the defaults.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead. Screenshots or a short video help.
+    validations:
+      required: true
+  - type: textarea
+    id: where
+    attributes:
+      label: Where in the game
+      description: Chapter and place, or the menu, and what you did just before.
+  - type: textarea
+    id: files
+    attributes:
+      label: Log
+      description: |
+        For a crash, a freeze or a problem starting: `~/.local/share/ng2-recomp/ng2.log`.
+        For stutter: set `log_hitches = true` in `~/.config/ng2-recomp/ng2.toml`, play the part that
+        stutters, then attach the log. See CONTRIBUTING.md.

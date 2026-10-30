@@ -18,6 +18,7 @@
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
+#include <rex/logging.h>
 
 #include "gpu/guest.h"
 
@@ -134,9 +135,26 @@ REX_EXTERN(__imp__sub_822F0EF8);
 REX_HOOK_RAW(sub_822F0EF8) {
   __imp__sub_822F0EF8(ctx, base);
   auto now = std::chrono::steady_clock::now();
+  static const bool logFps = [] {
+    const char* v = std::getenv("NG2_FPS_LOG");
+    return v && v[0] == '1';
+  }();
+  static double logSeconds = 0.0;
+  static uint32_t logFrames = 0;
   if (g_last != std::chrono::steady_clock::time_point()) {
-    g_seconds += std::chrono::duration<double>(now - g_last).count();
+    double frame = std::chrono::duration<double>(now - g_last).count();
+    g_seconds += frame;
     g_frames++;
+    // NG2_FPS_LOG=1: the game's frame rate in the log once a second.
+    if (logFps) {
+      logSeconds += frame;
+      logFrames++;
+      if (logSeconds >= 1.0) {
+        REXLOG_INFO("fps {:.1f}", logFrames / logSeconds);
+        logSeconds = 0.0;
+        logFrames = 0;
+      }
+    }
   }
   g_last = now;
   if (!REXCVAR_GET(show_fps) || (!g_item && !MakeItem(ctx, base))) {

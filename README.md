@@ -1,24 +1,94 @@
-# Ninja Gaiden II recompiled
+# Ninja Gaiden II Recompiled
 
-A static recompilation of Ninja Gaiden II (Xbox 360, 2008) to native Linux,
-built on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk). The
-renderer is being rebuilt after the Vulkan path of
-[Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp); until
-then ReXGlue's Xenos GPU emulation plugin draws the game.
+**A PC port of Ninja Gaiden II by static recompilation.**
 
-You need your own copy of the game. Nothing from the disc is in this repository.
+A native Linux version of *Ninja Gaiden II* (Xbox 360, 2008), made by statically recompiling the
+game's own PowerPC code to run directly on a PC, not an emulator. It is built on the
+[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) and draws with its own Vulkan renderer, which
+takes over the game's Direct3D calls instead of emulating the Xbox 360 GPU. It adds PC options in the
+game's own menus: higher render resolutions, anti-aliasing, window modes, V-Sync modes and more.
 
-## Status
+**You need your own copy of the game.** This project contains none of the game's data (graphics,
+sound, movies, text): on first start it asks for your disc image or extracted game folder. It is made
+for the **World release** (title ID `544307D5`).
 
-Boots to the title screen on Linux (Vulkan, xenos plugin). Not playable yet.
+**Status: early.** The game is playable from the start of Chapter 1 on Linux, but it has not been
+played through, and there are no releases yet. Test builds are posted in issues.
 
-## Build
+## Features
 
-Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader, FFmpeg
-(libavformat, libavcodec, libswresample, libswscale). No GTK
-(ReXGlue's docs list GTK3, but v0.10 does not use it); dialogs will use Qt.
+- Native Linux build (AppImage)
+- Its own Vulkan renderer: render resolution up to 8x, anti-aliasing (MSAA up to 8x), anisotropic
+  filtering, the game's bloom on, reduced or off
+- Window modes (windowed, borderless, fullscreen) and window size, V-Sync (Off, FIFO, Mailbox,
+  Adaptive), a frame-rate counter in the game's own font
+- Render pipelines made in the background and remembered between sessions, so new areas don't
+  stutter
+- **RECOMP SETTINGS** on the title menu and in the in-game menu; **EXIT GAME** on the title menu
+- The game's movies decoded on the PC (FFmpeg)
 
-1. Build and install the SDK (pinned at v0.10.0):
+## Getting started
+
+### Linux
+
+1. Download `NinjaGaiden2-x86_64.AppImage` from a test build and make it executable (`chmod +x`, or
+   Properties → Allow executing).
+2. Run it. On the first start a window asks for your copy of the game: a disc image (`.iso`) or the
+   `default.xex` of an extracted copy. A disc image is extracted once into the data folder.
+
+Needs a 64-bit Linux, a GPU with Vulkan 1.3 drivers, FFmpeg's libraries (libavformat, libavcodec,
+libswresample, libswscale) and `kdialog` for the first-start window. The test AppImages use the
+system's libraries, so a recent distribution is safest.
+
+### Windows
+
+Not yet. The code builds for Windows in principle, but there is no Windows package.
+
+### Where things are kept
+
+| | Linux |
+|---|---|
+| Extracted game (from a disc image), saves, log (`ng2.log`) | `~/.local/share/ng2-recomp` |
+| Settings (`ng2.toml`), the chosen game folder, the pipeline list (`ng2-pipelines.bin`) | `~/.config/ng2-recomp` |
+
+`NG2_GAME_DIR=<folder>` starts with that game folder instead of the remembered one.
+
+## Settings
+
+Everything is in the game's own menus: **RECOMP SETTINGS** on the title menu, and **Recomp
+Settings** in the in-game menu (Back, under Save Method). Changes apply at once and are saved.
+
+- **Graphics**: render scale (1x–8x), texture filtering (the game's, or 4x–16x anisotropic), bloom
+  (off, reduced, on), anti-aliasing (off, or 2x as on the console, 4x, 8x MSAA)
+- **Display**: window mode (windowed, borderless, fullscreen), window size, V-Sync (Off, FIFO,
+  Mailbox, Adaptive; a mode the driver lacks falls back to FIFO), show FPS
+
+The game's own Options (camera, controller, sound, screen) are where they always were.
+
+Some settings have no menu entry yet; they go in `ng2.toml`:
+
+- `async_pipelines = false`: make render pipelines as they're needed instead of in the background
+  (a new effect can stutter, but never appears a frame late)
+- `log_hitches = true`: log every frame that takes over 25 ms with what the renderer spent it on
+- `half_pixel_offset = false`: drop the console's half-pixel shift
+
+## Controls
+
+A controller works as on the Xbox 360. Keyboard and mouse go through ReXGlue's mapping and aren't
+tuned for this game yet.
+
+## Known issues
+
+- Only Chapter 1 has been tested; later chapters may show glitches the renderer doesn't handle yet.
+- Some cutscene sounds may play a little late.
+
+## Building from source
+
+The build needs the game's code, so it starts from your own disc image. Requirements: clang 20+,
+CMake 3.25+, Ninja, Python 3, the Vulkan headers and loader, FFmpeg (libavformat, libavcodec,
+libswresample, libswscale).
+
+1. The ReXGlue SDK, pinned at v0.10.0, with this port's patches:
 
        git clone --recursive https://github.com/rexglue/rexglue-sdk thirdparty/rexglue-sdk
        cd thirdparty/rexglue-sdk && git checkout v0.10.0 && git submodule update --init --recursive
@@ -26,59 +96,52 @@ Requirements: clang 20+, CMake 3.25+, Ninja, Vulkan headers/loader, FFmpeg
        cmake --preset linux-amd64
        cmake --build out/build/linux-amd64 --config Release --target install
 
-2. Get XenosRecomp (shader translator) with the NG2 patch:
+2. XenosRecomp (the shader translator) and plume (the Vulkan layer of Unleashed Recompiled), with
+   this port's patches:
 
        git clone --recursive https://github.com/hedge-dev/XenosRecomp thirdparty/XenosRecomp
        cd thirdparty/XenosRecomp && git checkout 990d03b && git submodule update --init --recursive
        git am ../../patches/xenosrecomp/*.patch
 
-   And plume (Vulkan RHI from Unleashed Recompiled) with Wayland support:
-
        git clone https://github.com/renderbag/plume thirdparty/plume
        cd thirdparty/plume && git checkout 1192686 && git submodule update --init contrib/volk contrib/VulkanMemoryAllocator contrib/Vulkan-Headers
        git am ../../patches/plume/*.patch
 
-3. Extract the disc (World release, title 544307D5) into `game_files/`:
+3. Extract the disc into `game_files/`:
 
        python3 tools/xdvdfs_extract.py "Ninja Gaiden II (World).iso" game_files
 
-4. Build (runs codegen, ~560 MB of generated C++, and translates the
-   game's shaders, see docs/shaders.md):
+4. Build. This generates about 560 MB of C++ from the game's code and translates its shaders
+   (see [docs/shaders.md](docs/shaders.md)):
 
        cmake --preset linux-amd64-release
        cmake --build out/build/linux-amd64-release
 
-5. Run:
+5. Run it, or pack an AppImage with `packaging/appimage/build.sh`:
 
-       out/build/linux-amd64-release/ng2 --gpu_plugin=xenos --game_data_root=game_files
+       NG2_RENDERER=native out/build/linux-amd64-release/ng2 --game_data_root=game_files
 
-## Layout
+How it works: [docs/renderer-plan.md](docs/renderer-plan.md) (the renderer),
+[docs/menus.md](docs/menus.md) (the menus), [docs/shaders.md](docs/shaders.md). How to contribute:
+[CONTRIBUTING.md](CONTRIBUTING.md); the layout, tools and test rules, also for coding agents:
+[AGENTS.md](AGENTS.md).
 
-- `ng2_manifest.toml`: ReXGlue project manifest.
-- `ng2_codegen.toml`: codegen overrides (function boundaries, fiber hooks,
-  setjmp/longjmp).
-- `ng2_pointer_funcs.toml`: functions only reached through pointers, found by
-  `tools/find_pointer_funcs.py` on an image dumped with `NG2_DUMP_IMAGE=<file>`.
-- `src/`: the host application.
-- `patches/xenosrecomp/`: XenosRecomp changes for NG2's shaders.
-- `docs/`: renderer plan, shader pipeline, D3D function table, NGB reuse notes.
-- `tools/run-headless.sh`: silent test runs in a headless gamescope
-  (`NG2_SHOTS="30 60"` takes screenshots, `NG2_WRAP` runs under gdb).
+## Credits
 
-## Environment
+- [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) by Tom Clay: the recompiler and Xbox 360
+  runtime this is built on, itself derived from [Xenia](https://xenia.jp) (BSD-3-Clause)
+- [Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp) by hedge-dev: the native
+  renderer follows its Vulkan renderer (GPL-3.0)
+- [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) by hedge-dev: the shader translator (MIT)
+- [plume](https://github.com/renderbag/plume) by renderbag: the Vulkan layer (MIT)
 
-- `NG2_AUDIO=0`: no audio device; the game's audio still runs.
-- `NG2_RENDERER=native`: the native Vulkan renderer instead of GPU emulation
-  (work in progress: menus and the first chapter render). The GPU plugin's null
-  backend (patches/rexglue-sdk) keeps the game's D3D library running.
-  Wayland or X11, whichever SDL uses (`--video_driver=wayland|x11` to choose).
-- `NG2_DUMP_IMAGE=<file>`: write the loaded XEX image for analysis.
-- `NG2_D3D_STATS=1`: log D3D draw/clear/resolve/swap counts every second.
-- `NG2_PROFILE=1`: log time spent per native renderer stage every second.
-- `NG2_MOVIES=xmedia`: use the game's own movie player instead of host
-  decoding (FFmpeg); `NG2_MOVIE_TRACE=1` logs movie player calls.
-- `NG2_PAD_SCRIPT=12000:start,16000:a,19000:a:400`: a scripted controller for
-  test runs (`<ms>:<button>[+<button>...][:<hold ms>]`, `@file` reads a file);
-  `NG2_PAD_LIVE=<file>` presses each line appended to the file. Buttons and
-  details in src/script_input.h. Add `--headless` so system prompts (storage
-  device) take their defaults.
+*Ninja Gaiden* is a trademark of Koei Tecmo. This project is not affiliated with or endorsed by Koei
+Tecmo or Team Ninja.
+
+## License
+
+This project's code is free software: you can redistribute it and/or modify it under the terms of
+the GNU General Public License as published by the Free Software Foundation, either version 3 of the
+License, or (at your option) any later version (`GPL-3.0-or-later`; the text is in
+[LICENSE](LICENSE)). It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY.
+The parts it is built from keep their own licenses: see [THIRD_PARTY.md](THIRD_PARTY.md).
