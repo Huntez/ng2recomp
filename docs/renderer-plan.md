@@ -133,8 +133,7 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   check against captures from hardware.
 - Mipmaps, cube and 3D textures, the formats that need conversion
   (5_6_5, 1_5_5_5, 4_4_4_4, 2_10_10_10, 10_11_11, 11_11_10).
-- Depth resolves, scissor (PA_SC_WINDOW_SCISSOR isn't in the device's
-  register shadows; find D3D's scissor storage), polygon offset, MSAA
+- Depth resolves, polygon offset, MSAA
   alpha-to-coverage, gamma (k_8_8_8_8_GAMMA, PWL ramp).
 - EDRAM aliasing between surfaces that share EDRAM (Xenia's render target
   cache is the reference).

@@ -180,6 +180,44 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   list's event 1 (sub_83672AF8) closes the whole menu: ours get it row by
   row. The row the cursor last named must stay valid (the highlight reads
   it), so our entry stays at +0x38 throughout.
+- Since 10-31 the in-game RECOMP SETTINGS is laid out as the title's: the
+  list's 12 rows hold the categories (label rows), the chosen one's
+  settings and Restore Defaults, then empty rows. Rows ignore the draw
+  position the list passes: each sprite is placed by its slot's frame in the
+  list's layout plus its own offset at +0x30/+0x34 (label +0x20, choice mark
+  +0x120, choices from +0x370 every 0x100, strokes from +0x1C0 every 0x90,
+  choice count +0x770). Labels and choices start at 0; the row's setup
+  (sub_8366FCA0) sets the strokes'; its update (sub_8366F5A8, states 1 and
+  3) sets the choice mark's from the value and the row's index. So page rows
+  get +344 across (where the title's pages are) and -2 rows. The cursor mark
+  (list +0x4ED0) is placed by the list's update (sub_83672960) at the heights
+  of the rows above its slot (+0x4EC0): moved after it. Settings with more
+  than two choices show "‹ value ›" as one choice (the font has no
+  solid arrows; the title's arrow sprites are in UI package 120, which can't
+  load in gameplay: its memory region is taken, see below). The header
+  (521x58, the same lettering as the Options header) gets the same RECOMP
+  SETTINGS picture, pasted at its own width.
+- UI packages (10-31): sub_83668D50(id) queues a load (and a language
+  companion), sub_836690C0(id) says if loaded, sub_836691F8(id) releases;
+  the queue (manager 0x85309E08 + 3608, count + 4632) is run one job a frame
+  from sub_822F0EF8 (sub_83668208). Each package has a fixed memory region
+  (sub_83669B80): in gameplay package 120's is taken, so its job is dropped
+  (sub_83669510 returns with state 0) and nothing loads.
+- Cheats (10-31): a third category, on the Camera Settings page (3, builder
+  sub_836ADE10, handler sub_823E7040): its two four-choice rows (+0x1E0,
+  +0x7F0) hold Infinite Health and Infinite Ninpo, Restore Defaults is at
+  +0x1300 (its sliders, +0xE00 and +0x1080, are left out). In game, Restore
+  Defaults follows the page's last row, so a shorter page leaves more empty
+  rows. What the cheats change is in src/cheats.cpp: the game's own
+  player-only no-damage flag (0x83C786DE = 2) around its three damage
+  functions, and a ninpo cost of 0 (ninpo is a u16 at character +0x5942,
+  200 a charge, the most at +0x5940; the player's character is the first
+  word of the record at 0x84C23C70).
+- The game's UI clips with D3D's scissor (draw-list helpers sub_8366EF58 /
+  sub_8367C908 set D3DRS_SCISSORTESTENABLE and a widget's rect): the in-game
+  camera speed sliders' fill stops at the knob through it. The renderer
+  takes it from the device at each draw (since 10-31; before, the fill drew
+  to the end).
 - show_fps (src/perf_overlay.cpp): a text item (sprite + text part, as the
   arrow lists' value text) in guest memory, given UI package 0's resource
   0xA (a text frame like package 0x78's 0x2A, which only Options loads),

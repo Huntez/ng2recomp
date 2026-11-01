@@ -21,6 +21,8 @@ set(NG2_SOURCES
     src/movie/movie_hooks.cpp
     src/movie/host_movie.cpp
     src/debug_waits.cpp
+    src/room_jump.cpp
+    src/cheats.cpp
 )
 
 if(WIN32)

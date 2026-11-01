@@ -40,7 +40,11 @@ devices, and none of the player's settings or saves.
   buttons and sticks in `src/script_input.h`). From boot, `30000:start,34000:a,37000:a,40000:a,
   58000:a,63000:a,262000:a` reaches Chapter 1's first fight at about 262 s; Back about 268 s opens
   the in-game menu.
-- Use the native renderer (`NG2_RENDERER=native`) unless comparing with Xenia's (`unset`).
+- `NG2_ROOM_JUMP=<from>:<to>` swaps a room in the story script (src/room_jump.cpp lists the rooms
+  with cutscenes): with the New Game path above, `3:5` plays the cutscene before Chapter 2 at about
+  80-110 s.
+- Use the native renderer (`NG2_RENDERER=native`) unless comparing with Xenia's (`unset` it and
+  add `--gpu_plugin=xenos --headless`; Xenia's draws cutscenes black in this build).
 
 ## Environment
 
@@ -51,8 +55,15 @@ devices, and none of the player's settings or saves.
 - `NG2_PROFILE=1`: time per renderer stage, once a second. `NG2_HITCHES=1` (or `log_hitches`): slow
   frames with what they were spent on. `NG2_FPS_LOG=1`: the game's frame rate once a second.
 - `NG2_TRACE_FRAME=t<sec>+<count>`: log every draw of those frames.
+- F7, or `NG2_TRACE_FILE=<file>` (starts when the file appears): every draw of the next
+  `NG2_TRACE_FRAMES` (60) frames and a small picture every 10, in `~/ng2-trace-<n>` (`HOME` decides
+  where).
 - `NG2_DUMP_TEXTURES=<dir>`: write decoded textures (PGM/PAM/DDS).
-- `NG2_DEBUG_HIGHLIGHT=<vs hash>|cycle:<s>|all`: draw a vertex shader's draws in magenta.
+- `NG2_DEBUG_HIGHLIGHT=<vs hash>|<hash>,<hash>...|cycle:<s>|all|rigid`: draw a vertex shader's
+  draws in magenta (a list or all: a colour per shader, logged; rigid: the unskinned ones;
+  `NG2_DEBUG_EXCLUDE=<hash>,...` leaves some out).
+- `tools/xtr_draws.py <trace.xtr>`: draws, constants (`--consts`), registers (`--regs`) and
+  buffers (`--dump`) of a Xenia Edge GPU trace, to compare a frame with ours.
 - `NG2_DUMP_IMAGE=<file>`: write the loaded XEX image for analysis.
 - `NG2_D3D_STATS=1`: D3D draw, clear, resolve and swap counts every second.
 - `NG2_MOVIES=xmedia`: the game's own movie player instead of FFmpeg; `NG2_MOVIE_TRACE=1` logs it.

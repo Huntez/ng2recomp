@@ -21,11 +21,15 @@ LabelResult RewriteMenuLabel(uint32_t width, uint32_t height, uint8_t* pixels, u
 // "RECOMP SETTINGS" while ours is open: a wider picture made from the
 // atlas's letters in the header's look. ReplaceMenuHeader gives it for the
 // header's base level (false: keep the game's); MenuHeaderGeneration changes
-// whenever the wanted picture does, so a cached one is made again.
+// whenever the wanted picture does, so a cached one is made again. The
+// in-game list's header (521x58, same lettering) reads the same while ours is
+// shown there, at its own width.
 void SetRecompHeader(bool on);
+void SetInGameRecompHeader(bool on);
 uint32_t MenuHeaderGeneration();
-// (isHeader: the picture is the header, ours or not.)
+// (kind: which header the picture is, ours or not.)
+enum class MenuHeaderKind { kNone, kOptions, kInGame };
 bool ReplaceMenuHeader(uint32_t width, uint32_t height, const uint8_t* pixels,
-                       std::vector<uint8_t>& out, uint32_t& outWidth, bool& isHeader);
+                       std::vector<uint8_t>& out, uint32_t& outWidth, MenuHeaderKind& kind);
 
 }  // namespace ng2::video

@@ -373,7 +373,8 @@ uint8_t* g_guestMemoryShadow = nullptr;
 // Ranges synced: the frame they were last checked in and the frame they last
 // changed in. A range that hasn't changed for a frame is checked once a
 // frame; one that has (a dynamic buffer the game fills in batches, which the
-// null backend never stalls) is checked on every draw.
+// null backend never stalls) is checked on every draw, and so is one caught
+// written between its draws (dynamic) until it stays unchanged for 8 frames.
 //
 // Some buffers are written after the draw that reads them: the game's jobs
 // fill bone matrices while the render thread goes on, since the console's
@@ -381,11 +382,20 @@ uint8_t* g_guestMemoryShadow = nullptr;
 // at the end of a frame it was drawn in becomes late: its copy is still
 // recorded at its first draw in a frame, but filled from guest memory just
 // before the frame is submitted.
+//
+// Bone palettes (fetch slot 94) are late from their first draw: they rotate
+// through three buffers, and a buffer the jobs fill only after the frame's
+// draws looked unchanged at its draws, was never caught being written after
+// them, and its draws used the bones of three frames before (Ryu's eyelids
+// in cutscenes; how far the jobs get depends on CPU timing).
 struct GuestMemoryRange {
   uint64_t checkedFrame = ~0ull;
   uint64_t changedFrame = 0;
   uint64_t lateFrame = ~0ull;  // frame its late copy was recorded in
   bool late = false;
+  // Found written between its draws while checked once a frame: checked at every draw until
+  // it stays unchanged for a while.
+  bool dynamic = false;
 };
 std::unordered_map<uint64_t, GuestMemoryRange> g_guestMemoryRanges;
 struct FrameRange {
@@ -484,6 +494,9 @@ struct MenuHeader {
   uint32_t base = ~0u;
   float widthScale = 1.0f;
 } g_menuHeader;
+// The in-game list's header picture's guest address (ours is drawn at the
+// game's width).
+uint32_t g_inGameHeaderBase = ~0u;
 // The display gamma table (UpdateGammaTable).
 std::unique_ptr<HostTexture> g_gammaTable;
 uint64_t g_gammaTableHash = 0;
@@ -492,15 +505,20 @@ uint64_t g_gammaTableHash = 0;
 // =cycle:<seconds>: from that long after the first draw, each vertex shader
 // seen in turn for 2 s (logged), to find which draws are which.
 // =all: every skinned vertex shader in its own color (DebugColor, logged).
+// =rigid: the unskinned ones, small draws only. =<hash>,<hash>...: those, a
+// color each.
 bool Highlighted(uint64_t vertexShader) {
   static const char* spec = std::getenv("NG2_DEBUG_HIGHLIGHT");
   if (!spec) {
     return false;
   }
-  if (std::strcmp(spec, "all") == 0) {
+  if (std::strcmp(spec, "all") == 0 || std::strcmp(spec, "rigid") == 0) {
     return true;
   }
   static const bool cycle = std::strncmp(spec, "cycle:", 6) == 0;
+  if (!cycle && std::strchr(spec, ',')) {  // <hash>,<hash>...: any of them
+    return std::strstr(spec, fmt::format("{:016X}", vertexShader).c_str()) != nullptr;
+  }
   if (!cycle) {
     static const uint64_t hash = std::strtoull(spec, nullptr, 16);
     return vertexShader == hash;
@@ -525,10 +543,11 @@ bool Highlighted(uint64_t vertexShader) {
 }
 
 // The highlight color for a vertex shader: magenta, or with
-// NG2_DEBUG_HIGHLIGHT=all one from its hash, logged the first time.
+// NG2_DEBUG_HIGHLIGHT=all, rigid or a list one from its hash, logged the first time.
 void DebugColor(uint64_t vertexShader, float color[4]) {
   static const char* spec = std::getenv("NG2_DEBUG_HIGHLIGHT");
-  if (!spec || std::strcmp(spec, "all") != 0) {
+  if (!spec || (std::strcmp(spec, "all") != 0 && std::strcmp(spec, "rigid") != 0 &&
+                !std::strchr(spec, ','))) {
     color[0] = 1.0f, color[1] = 0.0f, color[2] = 1.0f, color[3] = 1.0f;
     return;
   }
@@ -545,10 +564,43 @@ void DebugColor(uint64_t vertexShader, float color[4]) {
   color[3] = 1.0f;
 }
 
+// F7: the next frames' draws (NG2_TRACE_FRAMES, 60 by default) into
+// ~/ng2-trace-<n>/draws.txt, with a small picture every 10 frames, for bug
+// reports. The key is seen on SDL's event thread; the trace starts at the
+// next present.
+std::atomic<bool> g_traceRequest{false};
+FILE* g_traceFile = nullptr;
+std::string g_traceDir;
+int64_t g_traceFrames = 0, g_traceLeft = 0;
+// F7's first frame: each draw's vertex shader constants (256 x 16 bytes, as
+// the guest has them: big-endian), in draw order, beside its draw lines.
+FILE* g_traceConstants = nullptr;
+
+bool SDLCALL WatchTraceKey(void*, SDL_Event* event) {
+  if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F7 && !event->key.repeat) {
+    g_traceRequest = true;
+  }
+  return true;
+}
+
+// A line of a trace: into F7's file while it records, else the log.
+template <typename... Args>
+void TraceLog(fmt::format_string<Args...> format, Args&&... args) {
+  if (g_traceFile) {
+    fmt::print(g_traceFile, format, std::forward<Args>(args)...);
+    std::fputc('\n', g_traceFile);
+  } else {
+    REXLOG_INFO("{}", fmt::format(format, std::forward<Args>(args)...));
+  }
+}
+
 // NG2_TRACE_FRAME=<n>: log what frame n draws; t<seconds>: the first frame
 // that starts that long after the first draw. A +<count> suffix traces that
 // many frames from there.
 bool Tracing() {
+  if (g_traceFile) {
+    return true;
+  }
   static const char* spec = std::getenv("NG2_TRACE_FRAME");
   static const bool byTime = spec && spec[0] == 't';
   static int64_t frame = spec && !byTime ? std::strtoll(spec, nullptr, 10) : -1ll;
@@ -920,7 +972,7 @@ bool ResolveCurrent(uint32_t address) {
     memory.checkedFrame = g_frameCount;
     memory.stale = XXH3_64bits(guest::Physical(address), memory.size) != memory.hash;
     if (memory.stale && Tracing()) {
-      REXLOG_INFO("video: resolve memory {:#x} overwritten", address);
+      TraceLog("video: resolve memory {:#x} overwritten", address);
     }
   }
   return !memory.stale;
@@ -1052,12 +1104,16 @@ void RecordGuestMemoryCopy(uint32_t address, const Upload& upload, uint32_t size
 
 // Makes guest physical [address, address + size) current in g_guestMemory.
 // always: inline vertex data in the ring buffer, rewritten at any time.
-void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false) {
+// bones: a bone palette (fetch slot 94), late from the start (see GuestMemoryRange).
+void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool bones = false) {
   if (!size || uint64_t(address) + size > GUEST_MEMORY_SIZE) {
     return;
   }
   StageTimer timer(Stage::kSync);
   auto& range = g_guestMemoryRanges[(uint64_t(address) << 32) | size];
+  if (bones) {
+    range.late = true;
+  }
   if (range.late) {
     if (range.lateFrame != g_frameCount) {
       range.lateFrame = g_frameCount;
@@ -1071,7 +1127,11 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false) {
   if (!always && range.checkedFrame != g_frameCount) {
     g_frameRanges.push_back({address, size, &range, nullptr});
   }
-  bool stable = !first && range.changedFrame + 1 < g_frameCount;
+  // Unchanged for a while (memory reused, a buffer patched once): back to once a frame.
+  if (range.dynamic && range.changedFrame + 8 < g_frameCount) {
+    range.dynamic = false;
+  }
+  bool stable = !first && !range.dynamic && range.changedFrame + 1 < g_frameCount;
   if (!always && stable && range.checkedFrame == g_frameCount) {
     return;
   }
@@ -1125,9 +1185,10 @@ void FinishGuestMemory() {
       REXLOG_DEBUG("video: {:#x} ({} bytes) is written after its draws", frameRange.address,
                    frameRange.size);
     } else {
-      // Checked once this frame: next frame, check it at every draw first
-      // (it may only be filled between two of its draws).
+      // Checked once this frame: it may be filled between two of its draws, so from now on
+      // check it at every draw.
       range.changedFrame = g_frameCount;
+      range.dynamic = true;
     }
   }
   for (auto& frameRange : g_frameRanges) {
@@ -1151,6 +1212,33 @@ const ShaderCacheEntry* FindShaderCacheEntry(uint64_t hash) {
   return (it != end && it->hash == hash) ? it : nullptr;
 }
 
+// Vertex shaders ask for round toward zero (docs/shaders.md); a GPU without
+// it gets them without: the capability, its extension and the mode removed.
+void DropRoundTowardZero(std::vector<uint8_t>& spirv) {
+  constexpr uint32_t kOpExtension = 10, kOpExecutionMode = 16, kOpCapability = 17;
+  constexpr uint32_t kRoundingModeRTZ = 4463, kCapabilityRTZ = 4468;
+  std::vector<uint32_t> words(spirv.size() / 4);
+  std::memcpy(words.data(), spirv.data(), words.size() * 4);
+  std::vector<uint32_t> kept(words.begin(), words.begin() + std::min<size_t>(5, words.size()));
+  for (size_t at = 5; at < words.size();) {
+    uint32_t opcode = words[at] & 0xFFFF, count = words[at] >> 16;
+    if (count == 0 || at + count > words.size()) {
+      return;  // not well formed: left alone
+    }
+    bool drop = (opcode == kOpCapability && words[at + 1] == kCapabilityRTZ) ||
+                (opcode == kOpExecutionMode && count > 2 && words[at + 2] == kRoundingModeRTZ) ||
+                (opcode == kOpExtension &&
+                 std::strncmp(reinterpret_cast<const char*>(&words[at + 1]), "SPV_KHR_float_controls",
+                              (count - 1) * 4) == 0);
+    if (!drop) {
+      kept.insert(kept.end(), words.begin() + at, words.begin() + at + count);
+    }
+    at += count;
+  }
+  spirv.resize(kept.size() * 4);
+  std::memcpy(spirv.data(), kept.data(), spirv.size());
+}
+
 RenderShader* HostShader(const ShaderCacheEntry* entry) {
   auto& host = g_hostShaders[entry];
   if (!host) {
@@ -1164,7 +1252,10 @@ RenderShader* HostShader(const ShaderCacheEntry* entry) {
     std::vector<uint8_t> spirv(size);
     if (smolv::Decode(encoded, entry->spirvSize, spirv.data(), size)) {
       MakeTimer made(g_frameStats.shaders, g_frameStats.shaderNs);
-      host = g_device->createShader(spirv.data(), size, "main", RenderShaderFormat::SPIRV);
+      if (!g_device->getCapabilities().roundingModeRTZ) {
+        DropRoundTowardZero(spirv);
+      }
+      host = g_device->createShader(spirv.data(), spirv.size(), "main", RenderShaderFormat::SPIRV);
     }
   }
   return host.get();
@@ -1481,14 +1572,19 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   if ((uint32_t(fetch.base_address) << 12) == g_menuHeader.base) {
     g_menuHeader.widthScale = 1.0f;  // something else there now, unless it's the header again
   }
+  if ((uint32_t(fetch.base_address) << 12) == g_inGameHeaderBase) {
+    g_inGameHeaderBase = ~0u;
+  }
   if (info.format == RenderFormat::R8_UNORM && info.blockSize == 1) {
     std::vector<uint8_t> level0(size_t(width) * height);
     CopyLevel(fetch, info, layout.levels[0], base.data(), base.size(), level0.data());
-    bool isHeader = false;
-    bool ours = ReplaceMenuHeader(width, height, level0.data(), header, headerWidth, isHeader);
-    if (isHeader) {
+    MenuHeaderKind kind = MenuHeaderKind::kNone;
+    bool ours = ReplaceMenuHeader(width, height, level0.data(), header, headerWidth, kind);
+    if (kind == MenuHeaderKind::kOptions) {
       g_menuHeader = {uint32_t(fetch.base_address) << 12,
                       ours ? float(headerWidth) / float(width) : 1.0f};
+    } else if (kind == MenuHeaderKind::kInGame) {
+      g_inGameHeaderBase = uint32_t(fetch.base_address) << 12;
     }
   }
   TextureLayout replaced;
@@ -1777,8 +1873,9 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
     uint64_t hash = XXH3_64bits(data, guestSize) ^
                     (layout.mipsSize ? XXH3_64bits(mipData, layout.mipsSize) * 0x9E3779B97F4A7C15ull
                                      : 0);
-    // The Options header is made again when ours comes or goes.
-    if (info.format == RenderFormat::R8_UNORM && base == g_menuHeader.base) {
+    // The headers are made again when ours comes or goes.
+    if (info.format == RenderFormat::R8_UNORM &&
+        (base == g_menuHeader.base || base == g_inGameHeaderBase)) {
       hash += MenuHeaderGeneration();
     }
     if (!cached.host || hash != cached.contentHash) {
@@ -1892,6 +1989,10 @@ uint32_t ElementFlags(uint32_t declType) {
   }
   return flags;
 }
+
+// D3D's scissor state in the device (docs/d3d-map-c.md, SetScissorRect):
+// D3DRS_SCISSORTESTENABLE, and the rect (left, top, right, bottom).
+constexpr uint32_t kScissorEnable = 11848, kScissorRect = 12668;
 
 // Shared constants, laid out as docs/shaders.md describes.
 struct SharedConstants {
@@ -2369,7 +2470,7 @@ void FlushPendingDraw() {
   SyncGuestMemory(PhysicalAddress(data.vertexAddress), data.vertexBytes, true);
   if (Tracing()) {
     const uint32_t* v = reinterpret_cast<const uint32_t*>(guest::Virtual(data.vertexAddress));
-    REXLOG_INFO("  inline vertices at {:#x} ({} bytes): {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+    TraceLog("  inline vertices at {:#x} ({} bytes): {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
                 data.vertexAddress, data.vertexBytes, rex::byte_swap(v[0]), rex::byte_swap(v[1]),
                 rex::byte_swap(v[2]), rex::byte_swap(v[3]), rex::byte_swap(v[4]),
                 rex::byte_swap(v[5]));
@@ -2490,7 +2591,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
       descriptor = AdjustBloom(fetch, descriptor);
     }
     if (Tracing()) {
-      REXLOG_INFO("  tex {} fmt {} {}x{} base {:#x} tiled {} endian {} dim {} sign {}{}{}{} "
+      TraceLog("  tex {} fmt {} {}x{} base {:#x} tiled {} endian {} dim {} sign {}{}{}{} "
                   "swizzle {:#o} exp {} -> {}",
                   slot, uint32_t(fetch.format), fetch.size_2d.width + 1,
                   fetch.size_2d.height + 1, uint32_t(fetch.base_address) << 12,
@@ -2574,7 +2675,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     uint32_t address = word0 & 0xFFFFFFFC;
     uint32_t size = word1 & 0x3FFFFFC;  // size in dwords at bit 2: bytes
     if (size && size <= (16u << 20)) {
-      SyncGuestMemory(address & 0x1FFFFFFF, size);
+      SyncGuestMemory(address & 0x1FFFFFFF, size, false, i == 94);
     }
   }
 
@@ -2632,6 +2733,9 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 
   // Float constants, little-endian.
   Upload vsConstants = Allocate(256 * 16);
+  if (g_traceConstants) {
+    std::fwrite(guest::Virtual(device + 0x780), 1, 256 * 16, g_traceConstants);
+  }
   Upload psConstants = Allocate(224 * 16);
   const uint32_t* vsSource = reinterpret_cast<const uint32_t*>(guest::Virtual(device + 0x780));
   const uint32_t* psSource = reinterpret_cast<const uint32_t*>(guest::Virtual(device + 0x1780));
@@ -2715,8 +2819,17 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   // =all colors the skinned draws only (bones in fetch slot 94): other
   // shaders include full-screen passes that would cover them.
   bool skinned = (vs->entry->vertexFetchMask[2] >> 30) & 1;
+  // =rigid: the unskinned ones instead, small draws only (not full-screen
+  // passes or level geometry).
+  static const char* highlight = std::getenv("NG2_DEBUG_HIGHLIGHT");
+  bool rigid = highlight && std::strcmp(highlight, "rigid") == 0;
+  bool all = highlight && std::strcmp(highlight, "all") == 0;
   if (Highlighted(vs->entry->hash) &&
-      (skinned || std::strcmp(std::getenv("NG2_DEBUG_HIGHLIGHT"), "all") != 0)) {
+      (rigid ? !skinned && count > 6 && count < 3000 : skinned || !all) &&
+      [&] {  // NG2_DEBUG_EXCLUDE=<hash>,<hash>: never these (full-screen passes)
+        static const char* exclude = std::getenv("NG2_DEBUG_EXCLUDE");
+        return !exclude || !std::strstr(exclude, fmt::format("{:016X}", vs->entry->hash).c_str());
+      }()) {
     key.pixelShader = 0;  // the debug shader's pipelines
     pixelShader = g_debugShader.get();
     DebugColor(vs->entry->hash, reinterpret_cast<SharedConstants*>(sharedUpload.data)->debugColor);
@@ -2728,24 +2841,34 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 
   if (Tracing()) {
     for (size_t slot = 0; slot < vs->elements.size(); slot++) {
-      REXLOG_INFO("  element {} usage {}/{}: fetch {} offset {} stride {} flags {:#x}", slot,
+      TraceLog("  element {} usage {}/{}: fetch {} offset {} stride {} flags {:#x}", slot,
                   vs->elements[slot].first, vs->elements[slot].second,
                   shared.vertexElements[slot][0], shared.vertexElements[slot][1],
                   shared.vertexElements[slot][2], shared.vertexElements[slot][3]);
     }
-    REXLOG_INFO("  fetch95 {:08x} {:08x} vs container {:#x} ps container {:#x}",
-                shared.vertexFetch[95][0], shared.vertexFetch[95][1], vs->container,
+    TraceLog("  fetch95 {:08x} {:08x} fetch94 {:08x} {:08x} vs container {:#x} ps container {:#x}",
+                shared.vertexFetch[95][0], shared.vertexFetch[95][1], shared.vertexFetch[94][0],
+                shared.vertexFetch[94][1], vs->container,
                 ps ? ps->container : 0);
-    REXLOG_INFO("draw prim {} count {} indexed {} vs {:016X} ps {:016X} target {}x{} fmt {} "
+    TraceLog("draw prim {} count {} indexed {} vs {:016X} ps {:016X} target {}x{} fmt {} "
                 "targets {} mask {:#x} blend {:#x} depth {:#x} vte {:#x} vp {} {} {} {} "
                 "base {} indx_offset {:#x} min/max {:#x}/{:#x} colorcontrol {:#x} bools {:08x} "
-                "bias {} {}",
+                "bias {} {} cull {} depthfmt {} depthtex {:x} scissor {} {} {} {} {} key {:016X} "
+                "vport {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} z {} {} clip {:#x} mode {:#x} vtx {:#x} {:#x} {:#x}",
                 primitive, count, indexed, vs->entry->hash, ps ? ps->entry->hash : 0,
                 sizeSource->width, sizeSource->height, uint32_t(sizeSource->format), targetCount,
                 key.colorMask, key.blendControls[0], key.depthControl, vte.value, viewport.x, viewport.y,
                 viewport.width, viewport.height, startVertex, Register(device, 0x2102),
                 Register(device, 0x2101), Register(device, 0x2100), colorControl.value,
-                shared.booleans[4], key.depthBias, key.slopeDepthBias);
+                shared.booleans[4], key.depthBias, key.slopeDepthBias, key.cull, key.depthFormat,
+                reinterpret_cast<uintptr_t>(depth), guest::Load32(device + kScissorEnable),
+                int32_t(guest::Load32(device + kScissorRect)), int32_t(guest::Load32(device + kScissorRect + 4)),
+                int32_t(guest::Load32(device + kScissorRect + 8)), int32_t(guest::Load32(device + kScissorRect + 12)),
+                XXH3_64bits(&key, sizeof(key)), Register(device, 0x210F), Register(device, 0x2110),
+                Register(device, 0x2111), Register(device, 0x2112), Register(device, 0x2113),
+                Register(device, 0x2114), viewport.minDepth, viewport.maxDepth, Register(device, 0x2204),
+                Register(device, 0x2205), Register(device, 0x2300), Register(device, 0x2301),
+                Register(device, 0x2302));
   }
   DrawRecord record;
   record.pipeline = pipeline;
@@ -2755,6 +2878,18 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   record.depth = depth;
   record.viewport = viewport;
   record.scissor = RenderRect(0, 0, int32_t(targetWidth), int32_t(targetHeight));
+  // The game's scissor (D3D's SetScissorRect, while D3DRS_SCISSORTESTENABLE
+  // is set) in guest pixels: the HUD clips gauges with it.
+  if (guest::Load32(device + kScissorEnable)) {
+    auto edge = [&](uint32_t offset, float limit) {
+      float at = float(int32_t(guest::Load32(device + kScissorRect + offset))) * scale;
+      return int32_t(std::clamp(at, 0.0f, limit));
+    };
+    int32_t left = edge(0, targetWidth), top = edge(4, targetHeight);
+    // An inverted rect clips everything, as an empty one.
+    record.scissor = RenderRect(left, top, std::max(left, edge(8, targetWidth)),
+                                std::max(top, edge(12, targetHeight)));
+  }
   record.pushConstants[0] = vsConstants.address;
   record.pushConstants[1] = psConstants.address;
   record.pushConstants[2] = sharedUpload.address;
@@ -2772,12 +2907,171 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 
 // Present ---------------------------------------------------------------------
 
+// F7's pictures: the front buffer copied to a readback buffer, written once
+// the GPU is done with it (at the next present).
+struct TracePicture {
+  std::unique_ptr<RenderBuffer> buffer;
+  uint64_t size = 0;
+  std::string path;
+  uint32_t width = 0, height = 0, rowWidth = 0;
+  RenderFormat format = RenderFormat::UNKNOWN;
+  bool pending = false;
+};
+TracePicture g_tracePicture;
+
+// One in four pixels each way, as a PPM.
+void WriteTracePicture() {
+  TracePicture& picture = g_tracePicture;
+  picture.pending = false;
+  bool wide = picture.format == RenderFormat::R16G16B16A16_UNORM;
+  uint32_t texel = wide ? 8 : 4;
+  const auto* data = static_cast<const uint8_t*>(picture.buffer->map());
+  FILE* file = data ? std::fopen(picture.path.c_str(), "wb") : nullptr;
+  if (file) {
+    constexpr uint32_t kStep = 4;
+    uint32_t width = picture.width / kStep, height = picture.height / kStep;
+    fmt::print(file, "P6\n{} {}\n255\n", width, height);
+    std::vector<uint8_t> row(width * 3);
+    for (uint32_t y = 0; y < height; y++) {
+      for (uint32_t x = 0; x < width; x++) {
+        const uint8_t* at = data + (size_t(y * kStep) * picture.rowWidth + x * kStep) * texel;
+        for (uint32_t c = 0; c < 3; c++) {
+          row[x * 3 + c] = wide ? at[c * 2 + 1] : at[c];  // the high byte of a 16-bit channel
+        }
+      }
+      std::fwrite(row.data(), 1, row.size(), file);
+    }
+    std::fclose(file);
+  }
+  if (data) {
+    picture.buffer->unmap();
+  }
+}
+
+// F7's memory: every readable mapping inside guest memory, as records of
+// <guest address u32><size u32><bytes>, zstd-compressed, for finding what the
+// game held in the traced frame.
+void WriteTraceMemory(const std::string& path) {
+  uintptr_t low = reinterpret_cast<uintptr_t>(guest::Virtual(0));
+  uintptr_t high = low + 0x100000000ull;
+  FILE* maps = std::fopen("/proc/self/maps", "r");
+  FILE* file = std::fopen(path.c_str(), "wb");
+  ZSTD_CCtx* zstd = ZSTD_createCCtx();
+  ZSTD_CCtx_setParameter(zstd, ZSTD_c_compressionLevel, 1);
+  std::vector<uint8_t> out(ZSTD_CStreamOutSize());
+  auto write = [&](const void* data, size_t size, ZSTD_EndDirective end) {
+    ZSTD_inBuffer in{data, size, 0};
+    size_t left;
+    do {
+      ZSTD_outBuffer o{out.data(), out.size(), 0};
+      left = ZSTD_compressStream2(zstd, &o, &in, end);
+      std::fwrite(out.data(), 1, o.pos, file);
+    } while (!ZSTD_isError(left) && (in.pos < in.size || (end == ZSTD_e_end && left)));
+  };
+  char line[512];
+  while (maps && file && std::fgets(line, sizeof(line), maps)) {
+    unsigned long a = 0, b = 0;
+    char perms[8] = {};
+    if (std::sscanf(line, "%lx-%lx %7s", &a, &b, perms) != 3 || perms[0] != 'r') {
+      continue;
+    }
+    uintptr_t start = std::max<uintptr_t>(a, low), end = std::min<uintptr_t>(b, high);
+    for (uintptr_t at = start; at < end; at += 0x1000000) {
+      uint32_t header[2] = {uint32_t(at - low), uint32_t(std::min<uintptr_t>(end - at, 0x1000000))};
+      write(header, sizeof(header), ZSTD_e_continue);
+      write(reinterpret_cast<const void*>(at), header[1], ZSTD_e_continue);
+    }
+  }
+  if (file) {
+    write(nullptr, 0, ZSTD_e_end);
+    std::fclose(file);
+  }
+  if (maps) {
+    std::fclose(maps);
+  }
+  ZSTD_freeCCtx(zstd);
+}
+
+// The trace's start, end and pictures, at each present.
+void TraceFrame(HostTexture* frontBuffer) {
+  if (g_tracePicture.pending) {
+    WaitForGPU();
+    WriteTracePicture();
+  }
+  bool opened = false;
+  if (g_traceRequest.exchange(false) && !g_traceFile) {
+    opened = true;
+    const char* home = std::getenv("HOME");
+    for (int n = 1; n < 1000 && !g_traceFile; n++) {
+      g_traceDir = fmt::format("{}/ng2-trace-{}", home ? home : ".", n);
+      std::error_code error;
+      if (std::filesystem::create_directory(g_traceDir, error)) {
+        g_traceFile = std::fopen((g_traceDir + "/draws.txt").c_str(), "w");
+      }
+    }
+    const char* frames = std::getenv("NG2_TRACE_FRAMES");
+    g_traceLeft = frames ? std::max(std::atoi(frames), 1) : 60;
+    g_traceFrames = 0;
+    REXLOG_INFO("video: tracing {} frames to {}", g_traceLeft, g_traceDir);
+    if (g_traceFile && !std::getenv("NG2_TRACE_NOMEMORY")) {
+      WriteTraceMemory(fmt::format("{}/memory-{}.zst", g_traceDir, g_frameCount));
+      g_traceConstants = std::fopen(fmt::format("{}/vs-constants-{}.bin", g_traceDir, g_frameCount).c_str(), "wb");
+    }
+  } else if (g_traceConstants) {
+    std::fclose(g_traceConstants);  // the first frame's only
+    g_traceConstants = nullptr;
+  }
+  if (!g_traceFile) {
+    return;
+  }
+  TraceLog("present frame {}", g_frameCount);
+  std::fflush(g_traceFile);  // quitting doesn't flush stdio
+  if (g_traceFrames++ % 10 == 0 && frontBuffer && frontBuffer->samples == RenderSampleCount::COUNT_1 &&
+      (frontBuffer->format == RenderFormat::R8G8B8A8_UNORM ||
+       frontBuffer->format == RenderFormat::R16G16B16A16_UNORM)) {
+    TracePicture& picture = g_tracePicture;
+    uint32_t texel = frontBuffer->format == RenderFormat::R16G16B16A16_UNORM ? 8 : 4;
+    uint32_t rowWidth = (frontBuffer->width + 63) & ~63u;
+    uint64_t size = uint64_t(rowWidth) * frontBuffer->height * texel;
+    if (!picture.buffer || picture.size < size) {
+      picture.buffer = g_device->createBuffer(RenderBufferDesc::ReadbackBuffer(size));
+      picture.size = size;
+    }
+    picture.path = fmt::format("{}/frame-{}.ppm", g_traceDir, g_frameCount);
+    picture.width = frontBuffer->width, picture.height = frontBuffer->height;
+    picture.rowWidth = rowWidth, picture.format = frontBuffer->format;
+    Transition(*frontBuffer, RenderTextureLayout::COPY_SOURCE);
+    CommandList()->copyTextureRegion(
+        RenderTextureCopyLocation::PlacedFootprint(picture.buffer.get(), frontBuffer->format,
+                                                   frontBuffer->width, frontBuffer->height, 1,
+                                                   rowWidth),
+        RenderTextureCopyLocation::Subresource(frontBuffer->texture.get()));
+    picture.pending = true;
+  }
+  // The frame starting now is traced: the count drops at the presents that end traced frames.
+  if (!opened && --g_traceLeft <= 0) {
+    std::fclose(g_traceFile);
+    g_traceFile = nullptr;
+    REXLOG_INFO("video: trace done: {}", g_traceDir);
+  }
+}
+
 void Present(HostTexture* frontBuffer) {
   StageTimer timer(Stage::kPresent);
   auto* commandList = CommandList();
   FinishGuestMemory();
-  if (Tracing()) {
-    REXLOG_INFO("present frame {}", g_frameCount);
+  // NG2_TRACE_FILE=<file>: as F7 when the file appears (for test runs).
+  static const char* traceFile = std::getenv("NG2_TRACE_FILE");
+  if (traceFile && g_frameCount % 30 == 0 && !g_traceFile) {
+    std::error_code error;
+    if (std::filesystem::remove(traceFile, error)) {
+      g_traceRequest = true;
+    }
+  }
+  if (g_traceFile || g_traceRequest || g_tracePicture.pending) {
+    TraceFrame(frontBuffer);
+  } else if (Tracing()) {
+    TraceLog("present frame {}", g_frameCount);
   }
 
   // Takes effect through a resize. vsync = false from older settings means
@@ -3071,6 +3365,9 @@ bool CreateHostDevice() {
   }
 
   g_swapChain = g_queue->createSwapChain(renderWindow, 3, BACKBUFFER_FORMAT, 1);
+  SDL_AddEventWatch(WatchTraceKey, nullptr);
+  REXLOG_INFO("video: vertex shaders round toward zero: {}",
+              g_device->getCapabilities().roundingModeRTZ ? "yes" : "no (the GPU can't)");
   // plume always returns an object; one that failed (no surface, no present
   // support, format not offered) has no images.
   if (!g_swapChain || g_swapChain->getTextureCount() == 0) {
@@ -3175,6 +3472,11 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
   bool clearColor = (flags & 0x1) && target;
   bool clearDepth = (flags & 0x10) && depth;
   bool clearStencil = (flags & 0x20) && depth;
+  if (Tracing()) {
+    TraceLog("clear flags {:#x} rects {} target {:x} {}x{} depth {:x} {}x{} z {} stencil {}", flags, rectCount,
+             reinterpret_cast<uintptr_t>(target), target ? target->width : 0, target ? target->height : 0,
+             reinterpret_cast<uintptr_t>(depth), depth ? depth->width : 0, depth ? depth->height : 0, z, stencil);
+  }
   if (!clearColor && !(flags & 0xE) && !clearDepth && !clearStencil) {
     return;
   }
@@ -3190,19 +3492,35 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
   int32_t limitX = int32_t(target ? target->width : depth->width);
   int32_t limitY = int32_t(target ? target->height : depth->height);
   int32_t scale = int32_t(target ? target->scale : depth->scale);  // guest to host pixels
+  // As D3D's Clear, within the scissor while the game has it on (a whole
+  // target clear then clears the scissor's rect).
+  int32_t guestX = limitX / scale, guestY = limitY / scale;
+  int32_t clip[4] = {0, 0, guestX, guestY};
+  bool scissor = guest::Load32(device + kScissorEnable) != 0;
+  if (scissor) {
+    for (uint32_t k = 0; k < 4; k++) {
+      int32_t edge = int32_t(guest::Load32(device + kScissorRect + 4 * k));
+      clip[k] = k < 2 ? std::max(clip[k], edge) : std::min(clip[k], edge);
+    }
+  }
+  const int32_t (*sources)[4] = rects;
+  uint32_t sourceCount = rectCount;
+  const int32_t whole[1][4] = {{0, 0, guestX, guestY}};
+  if (!rectCount && scissor) {
+    sources = whole, sourceCount = 1;
+  }
   std::vector<RenderRect> clearRects;
-  for (uint32_t i = 0; i < rectCount; i++) {
+  for (uint32_t i = 0; i < sourceCount; i++) {
     // Clamped in guest pixels first: huge rects would overflow when scaled.
-    int32_t guestX = limitX / scale, guestY = limitY / scale;
-    RenderRect rect(std::clamp(rects[i][0], 0, guestX) * scale,
-                    std::clamp(rects[i][1], 0, guestY) * scale,
-                    std::clamp(rects[i][2], 0, guestX) * scale,
-                    std::clamp(rects[i][3], 0, guestY) * scale);
+    RenderRect rect(std::clamp(sources[i][0], clip[0], std::max(clip[0], clip[2])) * scale,
+                    std::clamp(sources[i][1], clip[1], std::max(clip[1], clip[3])) * scale,
+                    std::clamp(sources[i][2], clip[0], std::max(clip[0], clip[2])) * scale,
+                    std::clamp(sources[i][3], clip[1], std::max(clip[1], clip[3])) * scale);
     if (rect.right > rect.left && rect.bottom > rect.top) {
       clearRects.push_back(rect);
     }
   }
-  if (rectCount && clearRects.empty()) {
+  if (sourceCount && clearRects.empty()) {
     return;
   }
   const RenderRect* rectData = clearRects.empty() ? nullptr : clearRects.data();
@@ -3248,7 +3566,7 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
                            : guest::Load32(device + guest::device::kRenderTargets + source * 4);
   HostTexture* target = GetSurface(surface, depth);
   if (Tracing()) {
-    REXLOG_INFO("resolve flags {:#x} from {} to {:#x}", flags,
+    TraceLog("resolve flags {:#x} from {} to {:#x}", flags,
                 target ? fmt::format("{}x{} fmt {}", target->width, target->height,
                                      uint32_t(target->format))
                        : std::string("none"),

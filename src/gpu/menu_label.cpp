@@ -210,8 +210,15 @@ constexpr uint32_t kHeaderTop = 14, kHeaderMargin = 12;
 constexpr int kGlowRadius = 4;
 constexpr float kGlowLevel = 70.0f;
 
+// The in-game list's header ("IN-GAME MANUAL AND OPTIONS", 521x58), in the
+// same lettering at the same size and place: ours goes in as it is, the rest
+// left clear.
+constexpr uint64_t kInGameHeaderHash = 0xc16cba91cd852335;
+constexpr uint32_t kInGameHeaderWidth = 521;
+
 // Set by the menu, read where textures are made.
 std::atomic<bool> g_headerWanted = false;
+std::atomic<bool> g_inGameHeaderWanted = false;
 std::atomic<uint32_t> g_headerGeneration = 0;
 
 // A box blur, each way.
@@ -334,15 +341,44 @@ void SetRecompHeader(bool on) {
   }
 }
 
+void SetInGameRecompHeader(bool on) {
+  if (on != g_inGameHeaderWanted) {
+    g_inGameHeaderWanted = on;
+    g_headerGeneration++;
+  }
+}
+
 uint32_t MenuHeaderGeneration() {
   return g_headerGeneration;
 }
 
 bool ReplaceMenuHeader(uint32_t width, uint32_t height, const uint8_t* pixels,
-                       std::vector<uint8_t>& out, uint32_t& outWidth, bool& isHeader) {
-  isHeader = width == kHeaderWidth && height == kHeaderHeight &&
-             XXH3_64bits(pixels, size_t(width) * height) == kHeaderHash;
-  return isHeader && g_headerWanted && !g_atlas.empty() && MakeHeader(out, outWidth);
+                       std::vector<uint8_t>& out, uint32_t& outWidth, MenuHeaderKind& kind) {
+  kind = MenuHeaderKind::kNone;
+  if (height != kHeaderHeight || (width != kHeaderWidth && width != kInGameHeaderWidth)) {
+    return false;
+  }
+  uint64_t hash = XXH3_64bits(pixels, size_t(width) * height);
+  if (hash == kHeaderHash) {
+    kind = MenuHeaderKind::kOptions;
+    return g_headerWanted && !g_atlas.empty() && MakeHeader(out, outWidth);
+  }
+  if (hash != kInGameHeaderHash) {
+    return false;
+  }
+  kind = MenuHeaderKind::kInGame;
+  std::vector<uint8_t> header;
+  uint32_t headerWidth = 0;
+  if ( !g_inGameHeaderWanted || g_atlas.empty() || !MakeHeader(header, headerWidth) ||
+      headerWidth > width) {
+    return false;
+  }
+  out.assign(size_t(width) * height, 0);
+  for (uint32_t y = 0; y < height; y++) {
+    std::memcpy(&out[size_t(y) * width], &header[size_t(y) * headerWidth], headerWidth);
+  }
+  outWidth = width;
+  return true;
 }
 
 

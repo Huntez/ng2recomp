@@ -88,3 +88,26 @@ are addressed by guest physical address, so vertex buffers live in one GPU
 buffer laid out like guest physical memory (`g_GuestMemoryBase`), filled from
 CPU writes on unlock, written by skinning shaders, and bound with offsets for
 draws. Shaders need `bufferDeviceAddress` and `vertexPipelineStoresAndAtomics`.
+
+## Multiplying by zero
+
+Xenos multiplies as Shader Model 3: +-0 or a denormal times anything, an
+infinity or NaN too, is 0 (Xenia's ZeroIfAnyOperandIsZero). Ninja Gaiden II
+relies on it: Sonia's skin blends a garbage position stream (NaN) with a
+weight of 0, and plain multiplies turned those vertices into NaN (a hole in
+her shoulder). mul, mad, dp2add/dp3/dp4, dst's y, muls, mulsprev and mulsc go
+through `mulz`/`dotz` in shader_common.h (patch 0009); they are `precise`,
+since DXC doesn't carry `precise` into called functions.
+
+## Rounding
+
+Xenos vertex ALUs round sums and products toward zero and never fuse a
+multiply and an add (Xenia Edge 3390fc219, 043a7cb40): games split vertex and
+bone indices with a multiply then trunc, and round to nearest can push one
+into the next. Vertex shaders therefore ask for SPIR-V's RoundingModeRTZ
+(32-bit) and declare their registers and outputs `precise` (NoContraction).
+DXC only declares the capability for an instruction that asks for it, so each
+vertex shader has one `ps + 0` through such a declared instruction. On a GPU
+without shaderRoundingModeRTZFloat32 the renderer removes the mode, its
+capability and extension from the SPIR-V (video.cpp DropRoundTowardZero); the
+log says which at startup ("vertex shaders round toward zero").

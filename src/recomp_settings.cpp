@@ -136,6 +136,8 @@ constexpr Setting kSettings[] = {
      "windowed_width", Kind::kWindowSize},
     {u"V-Sync", {u"Off", u"FIFO", u"Mailbox", u"Adaptive"}, 4, "present_mode", Kind::kPresent},
     {u"Show FPS", {u"On", u"Off"}, 2, "show_fps", Kind::kOnOff},
+    {u"Infinite Health", {u"On", u"Off"}, 2, "cheat_infinite_health", Kind::kOnOff},
+    {u"Infinite Ninpo", {u"On", u"Off"}, 2, "cheat_infinite_ninpo", Kind::kOnOff},
 };
 // Window Size's choices.
 constexpr std::pair<int32_t, int32_t> kWindowSizes[] = {
@@ -168,6 +170,11 @@ constexpr Page kPages[] = {
        {6, 0x7F0, true, true},
        {7, 0xE00, false, false}}},
      4},
+    // The Camera Settings page: its two four-choice rows.
+    {u"Cheats", 3, 0x13E0, 0x1300,
+     {{{8, 0x1E0, false, false},
+       {9, 0x7F0, false, false}}},
+     2},
 };
 constexpr uint32_t kPageCount = std::size(kPages);
 constexpr std::u16string_view kRestoreText = u"Restore Defaults";
@@ -582,8 +589,10 @@ void SetValue(const Setting& setting, uint32_t value) {
       SetSetting(setting.name, value == 0 ? "true" : "false");
       break;
     case Kind::kPresent:
-      // The older vsync setting would keep it off otherwise.
-      SetSetting("vsync", value == 0 ? "false" : "true");
+      // The older vsync setting would keep it off otherwise. It is also the
+      // SDK's guest vblank switch (off: 1000 Hz, which the game would run
+      // at), so it stays on.
+      SetSetting("vsync", "true");
       SetSetting(setting.name, std::to_string(value));
       break;
     case Kind::kWindowMode:
@@ -1076,6 +1085,10 @@ REX_EXTERN(__imp__sub_836AD330);
 REX_HOOK_RAW(sub_836AD330) {
   Build(ctx, base, __imp__sub_836AD330, 2);  // Controller Settings
 }
+REX_EXTERN(__imp__sub_836ADE10);
+REX_HOOK_RAW(sub_836ADE10) {
+  Build(ctx, base, __imp__sub_836ADE10, 3);  // Camera Settings
+}
 
 // A choice or a row from a builder whose rows are left out.
 REX_HOOK_RAW(sub_836AA270) {
@@ -1106,6 +1119,14 @@ REX_HOOK_RAW(sub_823E6AD8) {
     __imp__sub_823E6AD8(ctx, base);
   }
 }
+REX_EXTERN(__imp__sub_823E7040);
+REX_HOOK_RAW(sub_823E7040) {
+  if (g_open) {
+    RunPage(ctx, base, kPages[2]);
+  } else {
+    __imp__sub_823E7040(ctx, base);
+  }
+}
 
 // The Game Settings page's play time, formatted each frame into a shared
 // string: blank on ours.
@@ -1118,6 +1139,18 @@ REX_HOOK_RAW(sub_836AC0C8) {
 }
 
 void ng2::recomp_settings::ApplyWindowAtStart() {
+  // vsync = false from older builds' V-Sync Off: it is also the SDK's guest
+  // vblank switch (off: 1000 Hz), so it becomes present_mode 0 and vsync on.
+  if (GetSetting("vsync") == "false") {
+    if (rex::cvar::GetFlagSource("present_mode") == rex::cvar::Source::kDefault) {
+      SetSetting("present_mode", "0");
+    }
+    SetSetting("vsync", "true");
+    if (!g_configPath.empty()) {
+      SaveSettings();
+    }
+    g_written.clear();
+  }
   // The runtime opens the window fullscreen as a borderless window, or at its
   // default size: the exclusive mode or our windowed size is set over it.
   bool fullscreen = rex::cvar::Query<bool>("fullscreen");
@@ -1129,10 +1162,13 @@ void ng2::recomp_settings::ApplyWindowAtStart() {
 
 // RECOMP SETTINGS in gameplay: the Back button's "IN-GAME MANUAL AND OPTIONS"
 // list (docs/menus.md) gets a RECOMP SETTINGS row after its twelve. Choosing
-// it puts our settings in the list's twelve rows (eight choice rows of the
-// game's own class, Back, and three empty rows of no height) until Back.
-// The list's own methods walk its twelve rows, so the extra row is added to
-// them by the hooks below.
+// it lays the list out as the title's RECOMP SETTINGS screen until Back: the
+// categories on the left, the chosen one's settings on the right ("< value >"
+// in the game's font where the title has arrow lists), Restore Defaults, and
+// the header redrawn as RECOMP SETTINGS. The list's twelve rows then hold the
+// categories, the chosen one's settings, Restore Defaults and empty rows of
+// no height. The list's own methods walk its twelve rows, so the extra row is
+// added to them by the hooks below.
 namespace {
 
 constexpr uint32_t kInGameState = 0x83CEB3B4;    // 0: the list
@@ -1165,14 +1201,35 @@ constexpr uint32_t kGuestAlloc = 0xB2800000;
 constexpr uint32_t kChoicesShown = 4;             // a choice row's room
 
 constexpr std::u16string_view kEntryText = u"Recomp Settings";
-constexpr std::u16string_view kBackText = u"Back";
+// Our layout in the list's rows: the categories, then a page's settings and
+// Restore Defaults, drawn to the right of the categories (where the title
+// screen has its pages), then empty rows.
+constexpr uint32_t kFirstPageRow = kPageCount;
+constexpr uint32_t kEmptyRows = kGameRows - kFirstPageRow - 1;  // for the shortest page
+constexpr float kPageColumn = 344.0f;  // the title's pages are this far right of its categories
+constexpr uint32_t kCursorMark = 0x4ED0, kCursorMarkSlot = 0x4EC0;  // in the list
+constexpr uint32_t kMarkX = 0x30, kMarkY = 0x34;  // the mark's place, from the list's
+constexpr uint32_t kMarkOrigin = 0x82284800;     // the float the list places it from
+constexpr uint32_t kValueRoom = 24;
+// A row is drawn where its slot's frame in the list's layout is; each of its
+// sprites (label, choice mark, choices, the strokes between them) is placed
+// from there by +0x30. The label's and the choices' are 0; the strokes' are
+// set by the row's setup, the choice mark's (under the chosen one) by its
+// update when the value changes.
+constexpr uint32_t kSpriteOffset = 0x30;
+constexpr uint32_t kRowSprite = 0x20, kChoiceMark = 0x120;
+constexpr uint32_t kChoiceItems = 0x370, kChoiceItemSize = 0x100;
+constexpr uint32_t kStrokes = 0x1C0, kStrokeSize = 0x90;
+constexpr uint32_t kChoiceCount = 0x770;
 
 uint32_t g_list = 0;            // the list object, once built
 uint32_t g_arena = 0, g_arenaUsed = 0, g_arenaSize = 0;
 uint32_t g_entry = 0;           // our row in the list
 uint32_t g_settingRows[std::size(kSettings)] = {};
 uint32_t g_valueText[std::size(kSettings)] = {};  // rows with too many choices show one
-uint32_t g_backRow = 0, g_emptyRows[3] = {};
+uint32_t g_categoryRows[kPageCount] = {}, g_restoreRow = 0, g_emptyRows[kEmptyRows] = {};
+uint32_t g_category = 0;       // the category shown
+bool g_inPage = false;         // the cursor is in its settings (else on the categories)
 uint32_t g_gameRows[kGameRows] = {};
 bool g_inGameOurs = false;      // our settings are in the list
 uint32_t g_suppress = 0;        // directions (bit per sub_823E3448 direction) and Confirm (bit 4)
@@ -1255,9 +1312,26 @@ std::u16string ValueText(const Setting& setting) {
   return std::u16string(setting.choices[std::min(ValueOf(setting), setting.count - 1)]);
 }
 
+// Shown as "< value >", as the title shows it in an arrow list.
+bool IsListSetting(uint32_t setting) {
+  for (const Page& page : kPages) {
+    for (uint32_t i = 0; i < page.count; i++) {
+      if (page.rows[i].setting == setting) {
+        return page.rows[i].list;
+      }
+    }
+  }
+  return false;
+}
+
+std::u16string ArrowText(const Setting& setting) {
+  return u"\u2039  " + ValueText(setting) + u"  \u203A";
+}
+
 // Our rows and their texts, made once.
 uint32_t g_ids = 0;  // string ids for the choice rows' setup call
-uint32_t g_entryText = 0, g_backText = 0, g_emptyText = 0;
+uint32_t g_entryText = 0, g_restoreText = 0, g_emptyText = 0;
+uint32_t g_categoryText[kPageCount] = {};
 uint32_t g_labelText[std::size(kSettings)] = {};
 uint32_t g_choiceTexts[std::size(kSettings)][kChoicesShown] = {};
 
@@ -1273,7 +1347,10 @@ bool MakeInGameRowsOnce(PPCContext& ctx, uint8_t* base) {
   std::memset(ng2::guest::Virtual(arena), 0, kSize);
   g_arena = arena, g_arenaSize = kSize, g_arenaUsed = 0;
   g_entry = ArenaAlloc(kLabelRowSize);
-  g_backRow = ArenaAlloc(kLabelRowSize);
+  for (uint32_t& row : g_categoryRows) {
+    row = ArenaAlloc(kLabelRowSize);
+  }
+  g_restoreRow = ArenaAlloc(kLabelRowSize);
   for (uint32_t& row : g_emptyRows) {
     row = ArenaAlloc(kLabelRowSize);
   }
@@ -1282,13 +1359,16 @@ bool MakeInGameRowsOnce(PPCContext& ctx, uint8_t* base) {
   }
   g_ids = ArenaAlloc(4 * kChoicesShown);
   g_entryText = GuestText(kEntryText);
-  g_backText = GuestText(kBackText);
+  g_restoreText = GuestText(kRestoreText);
   g_emptyText = GuestText(u"");
+  for (uint32_t i = 0; i < kPageCount; i++) {
+    g_categoryText[i] = GuestText(kPages[i].name);
+  }
   for (uint32_t i = 0; i < std::size(kSettings); i++) {
     const Setting& setting = kSettings[i];
     g_labelText[i] = GuestText(setting.label);
-    if (setting.count > kChoicesShown) {
-      g_valueText[i] = GuestText(u"", 12);  // the value alone, cycled
+    if (IsListSetting(i)) {
+      g_valueText[i] = GuestText(u"", kValueRoom);  // "< value >"
     } else {
       for (uint32_t k = 0; k < setting.count; k++) {
         g_choiceTexts[i][k] = GuestText(setting.choices[k]);
@@ -1302,13 +1382,36 @@ bool MakeInGameRowsOnce(PPCContext& ctx, uint8_t* base) {
   for (uint32_t k = 0; k < kChoicesShown; k++) {
     Store32(g_ids + 4 * k, kAnyText);
   }
-  for (uint32_t row : {g_entry, g_backRow, g_emptyRows[0], g_emptyRows[1], g_emptyRows[2]}) {
+  MakeLabelRow(ctx, base, g_entry);
+  MakeLabelRow(ctx, base, g_restoreRow);
+  for (uint32_t row : g_categoryRows) {
+    MakeLabelRow(ctx, base, row);
+  }
+  for (uint32_t row : g_emptyRows) {
     MakeLabelRow(ctx, base, row);
   }
   for (uint32_t row : g_settingRows) {
     CallGuest(ctx, base, __imp__sub_8366E078, {row});
   }
   return true;
+}
+
+// A setting's row set up in a row slot of ours.
+void SetUpSettingRow(PPCContext& ctx, uint8_t* base, uint32_t setting, uint32_t slot) {
+  const Setting& that = kSettings[setting];
+  uint32_t row = g_settingRows[setting];
+  InitRow(ctx, base, row, slot);
+  bool one = g_valueText[setting] != 0;
+  CallGuest(ctx, base, __imp__sub_8366FCA0, {row, kAnyText, g_ids, one ? 1u : that.count, 0});
+  Store32(row + kRowLabel, g_labelText[setting]);
+  if (one) {
+    SetGuestText(g_valueText[setting], ArrowText(that));
+    Store32(row + kChoiceText, g_valueText[setting]);
+  } else {
+    for (uint32_t k = 0; k < that.count; k++) {
+      Store32(row + kChoiceText + 0x100 * k, g_choiceTexts[setting][k]);
+    }
+  }
 }
 
 // Our rows set up again, as the game's builder does its own each time.
@@ -1318,30 +1421,21 @@ bool SetUpInGameRows(PPCContext& ctx, uint8_t* base) {
   }
   InitRow(ctx, base, g_entry, kEntryIndex);
   Store32(g_entry + kRowLabel, g_entryText);
-  InitRow(ctx, base, g_backRow, uint32_t(std::size(kSettings)));
-  Store32(g_backRow + kRowLabel, g_backText);
-  for (uint32_t i = 0; i < std::size(g_emptyRows); i++) {
-    InitRow(ctx, base, g_emptyRows[i], uint32_t(std::size(kSettings)) + 1 + i, true);
-    Store32(g_emptyRows[i] + kRowLabel, g_emptyText);
-  }
-  for (uint32_t i = 0; i < std::size(kSettings); i++) {
-    const Setting& setting = kSettings[i];
-    uint32_t row = g_settingRows[i];
-    InitRow(ctx, base, row, i);
-    bool one = g_valueText[i] != 0;
-    CallGuest(ctx, base, __imp__sub_8366FCA0,
-              {row, kAnyText, g_ids, one ? 1u : setting.count, 0});
-    Store32(row + kRowLabel, g_labelText[i]);
-    if (one) {
-      SetGuestText(g_valueText[i], ValueText(setting));
-      Store32(row + kChoiceText, g_valueText[i]);
-    } else {
-      for (uint32_t k = 0; k < setting.count; k++) {
-        Store32(row + kChoiceText + 0x100 * k, g_choiceTexts[i][k]);
-      }
-    }
+  for (uint32_t i = 0; i < kPageCount; i++) {
+    InitRow(ctx, base, g_categoryRows[i], i);
+    Store32(g_categoryRows[i] + kRowLabel, g_categoryText[i]);
   }
   return true;
+}
+
+// Restore Defaults after a page's rows, and the empty rows after it.
+void SetUpPageEnd(PPCContext& ctx, uint8_t* base, uint32_t restoreSlot) {
+  InitRow(ctx, base, g_restoreRow, restoreSlot);
+  Store32(g_restoreRow + kRowLabel, g_restoreText);
+  for (uint32_t i = 0; i < std::size(g_emptyRows); i++) {
+    InitRow(ctx, base, g_emptyRows[i], restoreSlot + 1 + i, true);
+    Store32(g_emptyRows[i] + kRowLabel, g_emptyText);
+  }
 }
 
 bool g_inGameShownOrder = false;  // the game's rows placed with ours among them
@@ -1363,12 +1457,16 @@ void NotifyCursor(PPCContext& ctx, uint8_t* base, uint32_t cursor) {
   }
 }
 
+// The shown page's values into its rows (by their slots).
 void PushValues(PPCContext& ctx, uint8_t* base) {
-  for (uint32_t i = 0; i < std::size(kSettings); i++) {
+  const Page& page = kPages[g_category];
+  for (uint32_t j = 0; j < page.count; j++) {
+    uint32_t i = page.rows[j].setting;
     if (g_valueText[i]) {
-      SetGuestText(g_valueText[i], ValueText(kSettings[i]));
+      SetGuestText(g_valueText[i], ArrowText(kSettings[i]));
     }
-    CallGuest(ctx, base, __imp__sub_8366E238, {i, g_valueText[i] ? 0 : ValueOf(kSettings[i])});
+    CallGuest(ctx, base, __imp__sub_8366E238,
+              {kFirstPageRow + j, g_valueText[i] ? 0 : ValueOf(kSettings[i])});
   }
 }
 
@@ -1414,28 +1512,77 @@ REX_EXTERN(__imp__sub_83672AF8);  // the list's event 1, to all its rows: (list,
 
 namespace {
 
-void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours) {
-  if (ours) {
-    uint32_t rows[kGameRows];
-    for (uint32_t i = 0; i < std::size(kSettings); i++) {
-      rows[i] = g_settingRows[i];
+// A page row (in slot kFirstPageRow + line) moved to the right column, at
+// that line from the top.
+float PageRowShiftY() {
+  return -float(kFirstPageRow) * LoadFloat(kLineHeight);
+}
+
+void ShiftSprite(uint32_t sprite, bool fromZero) {
+  float x = fromZero ? 0.0f : LoadFloat(sprite + kSpriteOffset);
+  float y = fromZero ? 0.0f : LoadFloat(sprite + kSpriteOffset + 4);
+  StoreFloat(sprite + kSpriteOffset, x + kPageColumn);
+  StoreFloat(sprite + kSpriteOffset + 4, y + PageRowShiftY());
+}
+
+// Right after the row's setup (for a choice row).
+void PlacePageRow(uint32_t row, bool choices) {
+  ShiftSprite(row + kRowSprite, true);
+  if (choices) {
+    uint32_t count = std::min<uint32_t>(ng2::guest::Load32(row + kChoiceCount), kChoicesShown);
+    for (uint32_t k = 0; k < count; k++) {
+      ShiftSprite(row + kChoiceItems + kChoiceItemSize * k, true);
+      if (k + 1 < count) {
+        ShiftSprite(row + kStrokes + kStrokeSize * k, false);
+      }
     }
-    rows[std::size(kSettings)] = g_backRow;
-    for (uint32_t i = 0; i < std::size(g_emptyRows); i++) {
-      rows[std::size(kSettings) + 1 + i] = g_emptyRows[i];
-    }
-    SetListRows(rows);
-    // The 13th stays: the move off our row still names index 12.
-    g_inGameOurs = true;
-    // Event 1 (as the list's rows get when it opens), to ours only: the
-    // list's own sends it to its view too, which closes the menu.
-    for (uint32_t i = 0; i < kGameRows; i++) {
-      CallGuest(ctx, base, __imp__sub_8366F158, {rows[i], 1, kInGameModel});
-    }
-  } else {
+  }
+}
+
+// Our layout in the list, with a category's page (its rows set up again
+// for the slots they're shown in); or the game's rows back. Moving between
+// categories leaves the category rows as they are, as the title's list.
+void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours, uint32_t category = 0,
+                    bool categoriesShown = false) {
+  if (!ours) {
     ArrangeGameRows();
     g_inGameOurs = false;
+    ng2::video::SetInGameRecompHeader(false);
+    return;
   }
+  g_category = category;
+  const Page& page = kPages[category];
+  uint32_t rows[kGameRows];
+  for (uint32_t i = 0; i < kPageCount; i++) {
+    rows[i] = g_categoryRows[i];
+  }
+  for (uint32_t j = 0; j < page.count; j++) {
+    SetUpSettingRow(ctx, base, page.rows[j].setting, kFirstPageRow + j);
+    rows[kFirstPageRow + j] = g_settingRows[page.rows[j].setting];
+    PlacePageRow(rows[kFirstPageRow + j], true);
+  }
+  uint32_t restoreSlot = kFirstPageRow + page.count;
+  SetUpPageEnd(ctx, base, restoreSlot);
+  rows[restoreSlot] = g_restoreRow;
+  PlacePageRow(g_restoreRow, false);
+  for (uint32_t i = restoreSlot + 1; i < kGameRows; i++) {
+    rows[i] = g_emptyRows[i - restoreSlot - 1];
+  }
+  SetListRows(rows);
+  // The 13th stays: the move off our row still names index 12.
+  g_inGameOurs = true;
+  ng2::video::SetInGameRecompHeader(true);
+  // Event 1 (as the list's rows get when it opens), to ours only: the
+  // list's own sends it to its view too, which closes the menu.
+  for (uint32_t i = categoriesShown ? kFirstPageRow : 0; i < kGameRows; i++) {
+    CallGuest(ctx, base, __imp__sub_8366F158, {rows[i], 1, kInGameModel});
+  }
+  // A row shows a value once it changes: the slots may hold another
+  // page's, so each is changed twice.
+  for (uint32_t j = 0; j < page.count; j++) {
+    CallGuest(ctx, base, __imp__sub_8366E238, {kFirstPageRow + j, 0xFF});
+  }
+  PushValues(ctx, base);
 }
 
 void LeaveInGameRows(PPCContext& ctx, uint8_t* base) {
@@ -1463,6 +1610,7 @@ REX_HOOK_RAW(sub_836722A8) {
     g_written.clear();
   }
   g_inGameOurs = false;
+  ng2::video::SetInGameRecompHeader(false);
   g_inGameShownOrder = false;
   if (SetUpInGameRows(ctx, base)) {
     g_list = list;
@@ -1472,6 +1620,28 @@ REX_HOOK_RAW(sub_836722A8) {
     ArrangeGameRows();
     PlaceGameRows(ctx, base);
     g_inGameShownOrder = true;
+  }
+}
+
+// A choice row's update: the choice mark of ours, placed again whenever the
+// game places it, goes with the row; "< value >" rows have none, as the
+// title's arrow lists.
+REX_EXTERN(__imp__sub_8366F5A8);
+REX_HOOK_RAW(sub_8366F5A8) {
+  uint32_t row = ctx.r3.u32;
+  uint32_t state = ng2::guest::Load32(row + 4);
+  __imp__sub_8366F5A8(ctx, base);
+  if (!g_inGameOurs || (state != 1 && state != 3)) {
+    return;
+  }
+  for (uint32_t i = 0; i < std::size(kSettings); i++) {
+    if (g_settingRows[i] == row) {
+      if (g_valueText[i]) {
+        StoreFloat(row + kChoiceMark + kSpriteOffset + 4, -10000.0f);
+      } else {
+        ShiftSprite(row + kChoiceMark, false);
+      }
+    }
   }
 }
 
@@ -1489,10 +1659,20 @@ REX_EXTERN(__imp__sub_83672960);
 REX_HOOK_RAW(sub_83672960) {  // update
   uint32_t list = ctx.r3.u32;
   __imp__sub_83672960(ctx, base);
-  if (list == g_list && !g_inGameOurs) {
+  if (list != g_list) {
+    return;
+  }
+  if (!g_inGameOurs) {
     uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
     CallAt(ctx, base, Method(row, 2), {row});
+    return;
   }
+  // The cursor mark at our row: a category, or a page row in the right
+  // column (the list placed it by the heights of the rows above its slot).
+  float origin = LoadFloat(kMarkOrigin), height = LoadFloat(kLineHeight);
+  uint32_t line = g_inPage ? ng2::guest::Load32(kInGameCursors) - kFirstPageRow : g_category;
+  StoreFloat(list + kCursorMark + kMarkX, origin + (g_inPage ? kPageColumn : 0.0f));
+  StoreFloat(list + kCursorMark + kMarkY, std::floor(origin + float(line) * height));
 }
 REX_HOOK_RAW(sub_83672AF8) {  // event 1 to every row
   uint32_t list = ctx.r3.u32, model = ctx.r4.u32;
@@ -1557,47 +1737,79 @@ REX_HOOK_RAW(sub_823E84F8) {
   double sound = LoadFloat(kCursorSound);
 
   if (g_inGameOurs) {
-    constexpr uint32_t kRows = uint32_t(std::size(kSettings)) + 1;  // and Back
-    cursor = std::min(cursor, kRows - 1);
-    if (CallGuest(ctx, base, __imp__sub_823E3ED0, {kPadState, cursor, 0xFF, 0})) {
-      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
-      LeaveInGameRows(ctx, base);
-      return;
-    }
-    uint32_t moved = cursor;
-    if (pressed(0)) {
-      moved = (moved + kRows - 1) % kRows;
-    }
-    if (pressed(1)) {
-      moved = (moved + 1) % kRows;
-    }
-    if (moved != cursor) {
-      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
-      cursor = moved;
-      Store32(cursorAddress, cursor);
-    }
-    if (cursor == kRows - 1) {
-      if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
+    bool back = CallGuest(ctx, base, __imp__sub_823E3ED0, {kPadState, cursor, 0xFF, 0}) != 0;
+    if (!g_inPage) {
+      // The categories: up and down show one's page, Confirm or right go
+      // into it, Back leaves.
+      if (back) {
         CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
         LeaveInGameRows(ctx, base);
         return;
       }
+      uint32_t category = g_category;
+      if (pressed(0)) {
+        category = (category + kPageCount - 1) % kPageCount;
+      }
+      if (pressed(1)) {
+        category = (category + 1) % kPageCount;
+      }
+      if (category != g_category) {
+        CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+        ShowInGameRows(ctx, base, true, category, true);
+      }
+      cursor = g_category;
+      if (pressed(2) || CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
+        CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+        g_inPage = true;
+        cursor = kFirstPageRow;
+      }
+    } else if (back) {
+      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+      g_inPage = false;
+      cursor = g_category;
     } else {
-      const Setting& setting = kSettings[cursor];
-      uint32_t value = ValueOf(setting), changed = value;
-      if (pressed(3)) {
-        changed = (changed + setting.count - 1) % setting.count;
+      // A page: up and down pick a row, left and right change it, Y sets its
+      // default, Confirm on Restore Defaults sets the page's.
+      const Page& page = kPages[g_category];
+      uint32_t rowCount = page.count + 1;
+      uint32_t row = std::min(cursor - std::min(cursor, kFirstPageRow), rowCount - 1);
+      uint32_t moved = row;
+      if (pressed(0)) {
+        moved = (moved + rowCount - 1) % rowCount;
       }
-      if (pressed(2)) {
-        changed = (changed + 1) % setting.count;
+      if (pressed(1)) {
+        moved = (moved + 1) % rowCount;
       }
-      if (changed != value) {
-        CallGuest(ctx, base, __imp__sub_82429DA8, {3}, sound);
-        SetValue(setting, changed);
-      } else if (CallGuest(ctx, base, __imp__sub_823E3FD0, {kPadState})) {
-        RestoreDefault(setting);
+      if (moved != row) {
+        CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+        row = moved;
+      }
+      cursor = kFirstPageRow + row;
+      if (row == page.count) {
+        if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
+          CallGuest(ctx, base, __imp__sub_82429DA8, {3}, sound);
+          for (uint32_t i = 0; i < page.count; i++) {
+            RestoreDefault(kSettings[page.rows[i].setting]);
+          }
+        }
+      } else {
+        const Setting& setting = kSettings[page.rows[row].setting];
+        uint32_t value = ValueOf(setting), changed = value;
+        if (pressed(3)) {
+          changed = (changed + setting.count - 1) % setting.count;
+        }
+        if (pressed(2)) {
+          changed = (changed + 1) % setting.count;
+        }
+        if (changed != value) {
+          CallGuest(ctx, base, __imp__sub_82429DA8, {3}, sound);
+          SetValue(setting, changed);
+        } else if (CallGuest(ctx, base, __imp__sub_823E3FD0, {kPadState})) {
+          RestoreDefault(setting);
+        }
       }
     }
+    Store32(cursorAddress, cursor);
     if (g_windowChanged) {
       ScheduleWindow();
     }
@@ -1627,15 +1839,10 @@ REX_HOOK_RAW(sub_823E84F8) {
     g_suppress |= 0xC;  // no left and right either
     if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
       CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
-      ShowInGameRows(ctx, base, true);
+      g_inPage = false;
+      ShowInGameRows(ctx, base, true, 0);
       Store32(cursorAddress, 0);
       NotifyCursor(ctx, base, 0);
-      // A row shows a value once it changes: the game's rows' values are
-      // still in the model, so each is changed twice.
-      for (uint32_t i = 0; i < std::size(kSettings); i++) {
-        CallGuest(ctx, base, __imp__sub_8366E238, {i, 0xFF});
-      }
-      PushValues(ctx, base);
       g_suppress = 0;
       return;
     }
@@ -1669,6 +1876,6 @@ REX_HOOK_RAW(sub_83672BE8) {
   CallGuest(ctx, base, __imp__sub_8366F158, {Load32(list + kRowsAt + 4 * cursor), 2, model});
   Store32(model, cursor);
   Store32(model + 4, last);
-  Store32(list + 0x4EC0, ToShown(cursor));
+  Store32(list + kCursorMarkSlot, ToShown(cursor));
   ctx.r3.u64 = 1;
 }
