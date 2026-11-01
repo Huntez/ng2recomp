@@ -10,6 +10,8 @@
 #   NG2_TEST_WAYLAND=1  run on gamescope's nested Wayland socket instead of X11
 #   NG2_TEST_AUDIO=disk  real audio output, written to <out_dir>/audio.raw
 #     (SDL's disk driver) instead of the null audio device
+#   NG2_TEST_AUDIO=pipewire NG2_PW_RUNTIME=<dir>  audio in real time through
+#     a private PipeWire at that runtime dir (one null sink, no sound cards)
 set -euo pipefail
 
 secs=${1:?seconds}
@@ -19,6 +21,9 @@ shift 2
 root=$(cd "$(dirname "$0")/.." && pwd)
 bin=${NG2_BIN:-$root/out/build/linux-amd64-release/ng2}
 mkdir -p "$out/xdg/data" "$out/xdg/config" "$out/xdg/cache" "$out/user" "$out/home"
+# NG2_SAVE_FROM=<user_data_root>: start from a copy of those saves (the
+# originals are never opened).
+if [[ -n ${NG2_SAVE_FROM:-} ]]; then cp -a "$NG2_SAVE_FROM/." "$out/user/"; fi
 
 # Settings from the user's shell (REX_* cvar variables) must not leak in.
 unset $(compgen -e | grep '^REX') 2>/dev/null || true
@@ -51,6 +56,11 @@ fi
 audio=(NG2_AUDIO=0 SDL_AUDIODRIVER=dummy SDL_AUDIO_DRIVER=dummy)
 if [ "${NG2_TEST_AUDIO:-}" = disk ]; then
   audio=(NG2_AUDIO=1 SDL_AUDIO_DRIVER=disk SDL_AUDIO_DISK_OUTPUT_FILE="$out/audio.raw")
+elif [ "${NG2_TEST_AUDIO:-}" = pipewire ]; then
+  # A real-time audio device on a private PipeWire (NG2_PW_RUNTIME: its
+  # runtime dir, one null sink, no sound cards), never the user's.
+  audio=(NG2_AUDIO=1 SDL_AUDIO_DRIVER=pipewire PIPEWIRE_RUNTIME_DIR="${NG2_PW_RUNTIME:?NG2_PW_RUNTIME}"
+         PULSE_SERVER=disabled)
 fi
 
 exec env -u WAYLAND_DISPLAY -u DISPLAY HOME="$out/home" NG2_CONFIG="$out/ng2.toml" \

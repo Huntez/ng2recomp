@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <thread>
@@ -201,6 +202,27 @@ REX_HOOK_RAW(sub_83737AE0) {
   }
 }
 
+// A wait at the barrier over 2 ms, logged when it happens (at most one line a
+// second; the ones in between are counted into the next line): a thread kept
+// waiting that long is a pass the sound can't afford (one is ~5 ms of audio).
+static void NoteBarrierWait(std::chrono::steady_clock::duration waited) {
+  using namespace std::chrono;
+  static std::atomic<uint32_t> skipped{0};
+  static std::atomic<int64_t> last_report_ns{0};
+  const double ms = duration<double, std::milli>(waited).count();
+  if (ms < 2.0) {
+    return;
+  }
+  const int64_t now = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+  int64_t last = last_report_ns.load();
+  if (now - last >= 1'000'000'000 && last_report_ns.compare_exchange_strong(last, now)) {
+    REXLOG_WARN("audio barrier: waited {:.1f} ms ({} more over 2 ms since the last line)", ms,
+                skipped.exchange(0));
+  } else {
+    skipped++;
+  }
+}
+
 // The audio engine's barrier (XAudio2's voice processing, sub_8374F078): each
 // thread taking part sets its processor's byte in an 8-byte mask and waits
 // until the mask holds all of them; the first to see that cleared it, and a
@@ -215,6 +237,15 @@ REX_HOOK_RAW(sub_83737AE0) {
 // 8-byte lock across a cache line would be a split lock.
 REX_EXTERN(__imp__sub_8374F078);
 REX_HOOK_RAW(sub_8374F078) {
+  // NG2_GAME_AUDIO_BARRIER=1: the game's own barrier (for comparisons).
+  static const bool original = [] {
+    const char* v = std::getenv("NG2_GAME_AUDIO_BARRIER");
+    return v && v[0] == '1';
+  }();
+  if (original) {
+    __imp__sub_8374F078(ctx, base);
+    return;
+  }
   uint32_t engine = ctx.r3.u32;
   if (ng2::guest::Load32(engine + 0x130) == 0) {
     return;
@@ -237,8 +268,14 @@ REX_HOOK_RAW(sub_8374F078) {
     }
   }
   store(cpu, 1);
+  // Timed from the first yield on (a few hundred microseconds in): a normal
+  // pass never gets there.
+  std::chrono::steady_clock::time_point slow_since{};
   for (uint32_t spins = 0;; spins++) {
     if (load(cpu) == 0) {
+      if (spins > 4096) {
+        NoteBarrierWait(std::chrono::steady_clock::now() - slow_since);
+      }
       return;  // completed
     }
     if (int(cpu) == clearer) {
@@ -253,8 +290,14 @@ REX_HOOK_RAW(sub_8374F078) {
           }
         }
         store(cpu, 0);
+        if (spins > 4096) {
+          NoteBarrierWait(std::chrono::steady_clock::now() - slow_since);
+        }
         return;
       }
+    }
+    if (spins == 4096) {
+      slow_since = std::chrono::steady_clock::now();
     }
     if (spins >= 4096) {
       std::this_thread::yield();
