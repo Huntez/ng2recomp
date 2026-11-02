@@ -39,6 +39,33 @@ if [ -z "$game" ] || [ ! -f "$game/default.xex" ]; then
   printf '%s\n' "$game" > "$config_dir/game_dir"
 fi
 
+tu2_sha1=22d3be744cc43316e6f93d3d17834a814dd28062
+# Title Update 2 (default.xexp next to default.xex): ask for the update
+# package (or an extracted default.xexp) once and put it in the game folder.
+if [ ! -f "$game/default.xexp" ]; then
+  command -v kdialog >/dev/null ||
+    error "Title Update 2 is missing: put default.xexp in $game (kdialog is needed to ask)."
+  kdialog --title "Ninja Gaiden II: Title Update 2" --msgbox \
+    "This port runs the game with Title Update 2. Choose the update: its package (TU_1A461UL_000000G000000.00000000000G4) or an extracted default.xexp." || exit 0
+  update=$(kdialog --title "Ninja Gaiden II: Title Update 2" \
+    --getopenfilename "$HOME" "TU_* default.xexp|Title update or default.xexp") || exit 0
+  [ -w "$game" ] || error "Can't write to $game: copy default.xexp there yourself."
+  case "$(basename "$update")" in
+    *.xexp|*.XEXP) cp "$update" "$game/default.xexp.part" || error "Can't copy to $game." ;;
+    *) python3 -I "$here/usr/bin/stfs_extract.py" "$update" default.xexp "$game/default.xexp.part" ||
+         error "That file isn't the title update." ;;
+  esac
+  # Title Update 2's default.xexp, nothing else (another update or game's
+  # wouldn't fit this build).
+  if [ "$(sha1sum "$game/default.xexp.part" | cut -d' ' -f1)" != "$tu2_sha1" ]; then
+    rm -f "$game/default.xexp.part"
+    error "That isn't Title Update 2 for this game."
+  fi
+  mv "$game/default.xexp.part" "$game/default.xexp"
+fi
+[ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu2_sha1" ] ||
+  error "$game/default.xexp isn't Title Update 2 for this game. Remove it to choose the update again."
+
 export NG2_RENDERER=${NG2_RENDERER:-native}
 export NG2_CONFIG=${NG2_CONFIG:-$config_dir/ng2.toml}
 exec "$here/usr/bin/ng2" --game_data_root="$game" --user_data_root="$data_dir/user" \

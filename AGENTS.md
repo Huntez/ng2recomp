@@ -22,6 +22,8 @@ the rules that keep a test run from disturbing the machine it runs on.
 - `packaging/`: the AppImage (`appimage/build.sh`) and the Windows icon and resources.
 - `docs/`: `renderer-plan.md` (the renderer, with what was measured), `menus.md` (the game's menus,
   reverse-engineered), `shaders.md`, the D3D function maps (`d3d-map-*.md`), `xenia-notes.md`.
+  The game is Title Update 2 since 2026-11-02; notes from before then use 1.0 addresses, which
+  `title-update.md` maps (`tools/map_addresses.py` made the map).
 
 ## Building
 

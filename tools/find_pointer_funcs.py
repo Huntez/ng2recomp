@@ -17,7 +17,7 @@ import sys
 
 IMAGE_BASE = 0x82000000
 CODE_BASE = 0x822F0000
-CODE_END = CODE_BASE + 0x1771D30
+CODE_END = CODE_BASE + 0x1797D30  # Title Update 2 (1.0: 0x1771D30)
 
 BLR, BCTR = 0x4E800020, 0x4E800420
 # mr r8,r8: the compiler brackets __try regions with these. SEH scope tables

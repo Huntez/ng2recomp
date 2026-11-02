@@ -1,10 +1,10 @@
 // ng2 - Ninja Gaiden II static recompilation
 //
 // NG2_DEBUG_WAITS=1: a debugging aid for stalls. Reports guest waits
-// (WaitForSingleObjectEx wrapper 83818F90) still blocked after 5 s or that
+// (WaitForSingleObjectEx wrapper 8383E678) still blocked after 5 s or that
 // took over 2 s, with the handle's last SetEvent caller, failed semaphore
 // releases, and the state of the game's job system (control block
-// 83BF1C70: submit 822F2688, worker run 822F2870), which is how the
+// 83C07CF0: submit 822F2688, worker run 822F2870), which is how the
 // opening's stall (a lost semaphore wake-up in ReXGlue) was found.
 
 #include <chrono>
@@ -65,9 +65,9 @@ void Watchdog() {
                   wait.handle, wait.caller, set.caller, set.count);
       std::string jobs;
       for (uint32_t i = 0; i < 12; i++) {
-        jobs += fmt::format(" {:08x}", ng2::guest::Load32(0x83BF1C70 + i * 4));
+        jobs += fmt::format(" {:08x}", ng2::guest::Load32(0x83C07CF0 + i * 4));
       }
-      REXLOG_WARN("wait: job control 83BF1C70:{}", jobs);
+      REXLOG_WARN("wait: job control 83C07CF0:{}", jobs);
       auto ms = [&](std::chrono::steady_clock::time_point t) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(now - t).count();
       };
@@ -83,8 +83,8 @@ void Watchdog() {
 }  // namespace
 
 // SetEvent(handle)
-REX_EXTERN(__imp__sub_8380DC78);
-REX_HOOK_RAW(sub_8380DC78) {
+REX_EXTERN(__imp__sub_83833360);
+REX_HOOK_RAW(sub_83833360) {
   if (Enabled()) {
     std::lock_guard lock(g_mutex);
     auto& set = g_sets[ctx.r3.u32];
@@ -92,14 +92,14 @@ REX_HOOK_RAW(sub_8380DC78) {
     set.count++;
     set.when = std::chrono::steady_clock::now();
   }
-  __imp__sub_8380DC78(ctx, base);
+  __imp__sub_83833360(ctx, base);
 }
 
 // WaitForSingleObjectEx(handle, timeout, alertable)
-REX_EXTERN(__imp__sub_83818F90);
-REX_HOOK_RAW(sub_83818F90) {
+REX_EXTERN(__imp__sub_8383E678);
+REX_HOOK_RAW(sub_8383E678) {
   if (!Enabled()) {
-    __imp__sub_83818F90(ctx, base);
+    __imp__sub_8383E678(ctx, base);
     return;
   }
   uint32_t handle = ctx.r3.u32, timeout = ctx.r4.u32, caller = uint32_t(ctx.lr);
@@ -112,7 +112,7 @@ REX_HOOK_RAW(sub_83818F90) {
     id = g_nextWait++;
     g_waiting[id] = {handle, caller, start};
   }
-  __imp__sub_83818F90(ctx, base);
+  __imp__sub_8383E678(ctx, base);
   {
     std::lock_guard lock(g_mutex);
     g_waiting.erase(id);
@@ -133,10 +133,10 @@ REX_HOOK_RAW(sub_83818F90) {
 }
 
 // ReleaseSemaphore(handle, count, &previous): log failures.
-REX_EXTERN(__imp__sub_8380DFF0);
-REX_HOOK_RAW(sub_8380DFF0) {
+REX_EXTERN(__imp__sub_83833928);
+REX_HOOK_RAW(sub_83833928) {
   uint32_t handle = ctx.r3.u32, count = ctx.r4.u32, lr = uint32_t(ctx.lr);
-  __imp__sub_8380DFF0(ctx, base);
+  __imp__sub_83833928(ctx, base);
   if (Enabled() && ctx.r3.u32 == 0) {
     static int reports = 0;
     if (reports++ < 10) {
@@ -163,8 +163,8 @@ REX_HOOK_RAW(sub_822F2870) {
     return;
   }
   uint32_t worker = ctx.r3.u32;
-  uint32_t before[6] = {Load32(worker), Load32(worker + 4), Load32(0x83BF1C70 + 8),
-                        Load32(0x83BF1C70 + 12), Load32(0x83BF1C70 + 36), Load32(0x83BF1C70 + 24)};
+  uint32_t before[6] = {Load32(worker), Load32(worker + 4), Load32(0x83C07CF0 + 8),
+                        Load32(0x83C07CF0 + 12), Load32(0x83C07CF0 + 36), Load32(0x83C07CF0 + 24)};
   {
     std::lock_guard lock(g_mutex);
     g_runs++;
@@ -177,6 +177,6 @@ REX_HOOK_RAW(sub_822F2870) {
     g_runLog[g_runLogNext++ % 8] = fmt::format(
         "worker {:#x} id {} slot {} pop {} count {} mask {:#x} done {} -> pop {} done {}", worker,
         before[0], before[1], before[2], before[3], before[4], before[5],
-        Load32(0x83BF1C70 + 8), Load32(0x83BF1C70 + 24));
+        Load32(0x83C07CF0 + 8), Load32(0x83C07CF0 + 24));
   }
 }

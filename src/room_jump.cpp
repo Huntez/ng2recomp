@@ -3,14 +3,14 @@
 // NG2_ROOM_JUMP=<from>:<to>: a test aid to reach a cutscene without playing
 // up to it. The story scripts load "rooms" (a stage, plus the cutscene stages
 // that come with it) and play their cutscenes with commands run by
-// sub_82440ED8: a command is a u16 opcode (bit 14 picks one of two handler
-// tables; the story's are in the other, at 0x83AC5938), a u16 argument count,
+// sub_824427D0: a command is a u16 opcode (bit 14 picks one of two handler
+// tables; the story's are in the other, at 0x83AE8A70), a u16 argument count,
 // then u32 arguments. B18 loads a room, B166 waits for it, B20 plays its
 // cutscene, B19 unloads it. Rewriting all four from one room to another keeps
 // the script consistent: the loader and the cutscene ask for the same room.
 //
-// Rooms (lookup sub_83633008, extra stages sub_83632DC8) with their cutscene
-// stages (the stage table at 0x83AF3338: 174 RTM01_10, 175 RTM01_30, ...):
+// Rooms (lookup sub_836559F0, extra stages sub_836557B0) with their cutscene
+// stages (the stage table at 0x83B08F98: 174 RTM01_10, 175 RTM01_30, ...):
 // 3 = the opening (RTM01_10), 5 = the end of Chapter 1 (RTM01_30), 11 has
 // RTM03_10 (177), 22 RTM05_10 (180), 28 RTM06_10 (182), 30 RTM05_15 (181),
 // 37 RTM07_50 (185). So NG2_ROOM_JUMP=3:5 and New Game play the cutscene
@@ -37,8 +37,8 @@ bool ParseJump(uint32_t& from, uint32_t& to) {
 
 }  // namespace
 
-REX_EXTERN(__imp__sub_82440ED8);
-REX_HOOK_RAW(sub_82440ED8) {
+REX_EXTERN(__imp__sub_824427D0);
+REX_HOOK_RAW(sub_824427D0) {
   uint32_t from = 0, to = 0;
   if (ParseJump(from, to)) {
     uint32_t command = ctx.r4.u32;
@@ -54,5 +54,5 @@ REX_HOOK_RAW(sub_82440ED8) {
       REXLOG_INFO("room jump: story command B{} for room {} now room {}", index, from, to);
     }
   }
-  __imp__sub_82440ED8(ctx, base);
+  __imp__sub_824427D0(ctx, base);
 }

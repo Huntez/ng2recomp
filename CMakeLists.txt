@@ -23,6 +23,9 @@ set(NG2_SOURCES
     src/debug_waits.cpp
     src/room_jump.cpp
     src/cheats.cpp
+    src/dlc.cpp
+    src/gameplay.cpp
+    src/aspect.cpp
 )
 
 if(WIN32)
@@ -84,6 +87,7 @@ add_custom_command(
         "${NG2_SHADER_DIR}/input" "${NG2_SHADER_CACHE}"
         "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
     DEPENDS ng2_dump_image xenos_recomp "${NG2_GAME_DIR}/default.xex"
+        "${NG2_GAME_DIR}/default.xexp"
         "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
         "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
     COMMENT "Translating NG2 shaders with XenosRecomp"

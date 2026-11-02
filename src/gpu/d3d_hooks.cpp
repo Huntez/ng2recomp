@@ -53,34 +53,34 @@ void ReportStats() {
 }  // namespace
 
 // DrawVertices(dev, prim type, start vertex, vertex count)
-REX_EXTERN(__imp__sub_8373C720);
-REX_HOOK_RAW(sub_8373C720) {
+REX_EXTERN(__imp__sub_83761E58);
+REX_HOOK_RAW(sub_83761E58) {
   g_counters.draws++;
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, start = ctx.r5.u32, count = ctx.r6.u32;
-  __imp__sub_8373C720(ctx, base);
+  __imp__sub_83761E58(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
     ng2::video::OnDraw(device, primitive, start, count, false, 0);
   }
 }
 
 // DrawIndexedVertices(dev, prim type, base vertex, start index, index count)
-REX_EXTERN(__imp__sub_8373CB08);
-REX_HOOK_RAW(sub_8373CB08) {
+REX_EXTERN(__imp__sub_83762240);
+REX_HOOK_RAW(sub_83762240) {
   g_counters.draws++;
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, baseVertex = ctx.r5.u32;
   uint32_t startIndex = ctx.r6.u32, count = ctx.r7.u32;
-  __imp__sub_8373CB08(ctx, base);
+  __imp__sub_83762240(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
     ng2::video::OnDraw(device, primitive, baseVertex, count, true, startIndex);
   }
 }
 
 // BeginVertices(dev, prim type, vertex count, stride) -> vertex data
-REX_EXTERN(__imp__sub_8373BD50);
-REX_HOOK_RAW(sub_8373BD50) {
+REX_EXTERN(__imp__sub_83761488);
+REX_HOOK_RAW(sub_83761488) {
   g_counters.draws++;
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
-  __imp__sub_8373BD50(ctx, base);
+  __imp__sub_83761488(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
     ng2::video::OnBeginVertices(device, primitive, count, stride, ctx.r3.u32);
   }
@@ -88,14 +88,14 @@ REX_HOOK_RAW(sub_8373BD50) {
 
 // BeginIndexedVertices(dev, prim type, base vertex, vertex count, index
 // count, index format, stride, &indices, [stack] &vertices)
-REX_EXTERN(__imp__sub_8373C1F0);
-REX_HOOK_RAW(sub_8373C1F0) {
+REX_EXTERN(__imp__sub_83761928);
+REX_HOOK_RAW(sub_83761928) {
   g_counters.draws++;
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, baseVertex = ctx.r5.u32;
   uint32_t vertexCount = ctx.r6.u32, indexCount = ctx.r7.u32, indexFormat = ctx.r8.u32;
   uint32_t stride = ctx.r9.u32, indexDataOut = ctx.r10.u32;
   uint32_t vertexDataOut = ng2::guest::Load32(ctx.r1.u32 + 84);  // 9th argument
-  __imp__sub_8373C1F0(ctx, base);
+  __imp__sub_83761928(ctx, base);
   if (ng2::video::IsNativeRenderer() && ctx.r3.s32 >= 0 && indexDataOut && vertexDataOut) {
     ng2::video::OnBeginIndexedVertices(device, primitive, baseVertex, vertexCount, indexCount,
                                        (indexFormat & 4) != 0, stride,
@@ -105,28 +105,28 @@ REX_HOOK_RAW(sub_8373C1F0) {
 }
 
 // CreateVertexShader(const DWORD* function) -> D3DVertexShader*
-REX_EXTERN(__imp__sub_8373B790);
-REX_HOOK_RAW(sub_8373B790) {
+REX_EXTERN(__imp__sub_83760EC8);
+REX_HOOK_RAW(sub_83760EC8) {
   uint32_t container = ctx.r3.u32;
-  __imp__sub_8373B790(ctx, base);
+  __imp__sub_83760EC8(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
     ng2::video::OnCreateShader(ctx.r3.u32, container, false);
   }
 }
 
 // CreatePixelShader(const DWORD* function) -> D3DPixelShader*
-REX_EXTERN(__imp__sub_8373B3C8);
-REX_HOOK_RAW(sub_8373B3C8) {
+REX_EXTERN(__imp__sub_83760B00);
+REX_HOOK_RAW(sub_83760B00) {
   uint32_t container = ctx.r3.u32;
-  __imp__sub_8373B3C8(ctx, base);
+  __imp__sub_83760B00(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
     ng2::video::OnCreateShader(ctx.r3.u32, container, true);
   }
 }
 
 // Clear(dev, count, rects, flags, color, f1 z, stencil)
-REX_EXTERN(__imp__sub_837390C8);
-REX_HOOK_RAW(sub_837390C8) {
+REX_EXTERN(__imp__sub_8375E290);
+REX_HOOK_RAW(sub_8375E290) {
   g_counters.clears++;
   // The float takes r8's slot, so stencil comes in r9.
   uint32_t device = ctx.r3.u32, count = ctx.r4.u32, rects = ctx.r5.u32, flags = ctx.r6.u32;
@@ -141,7 +141,7 @@ REX_HOOK_RAW(sub_837390C8) {
       rectData[i][j] = ng2::guest::LoadS32(rects + i * 16 + j * 4);
     }
   }
-  __imp__sub_837390C8(ctx, base);
+  __imp__sub_8375E290(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
     ng2::video::OnClear(device, count, rectData, flags, color, z, stencil);
   }
@@ -149,26 +149,26 @@ REX_HOOK_RAW(sub_837390C8) {
 
 // Resolve(dev, flags, src rect, dest texture, dest point, level, slice,
 // clear color, f1 clear z, [stack] stencil, params)
-REX_EXTERN(__imp__sub_8373D570);
-REX_HOOK_RAW(sub_8373D570) {
+REX_EXTERN(__imp__sub_83762CA8);
+REX_HOOK_RAW(sub_83762CA8) {
   g_counters.resolves++;
   uint32_t device = ctx.r3.u32, flags = ctx.r4.u32, rect = ctx.r5.u32, texture = ctx.r6.u32;
   uint32_t point = ctx.r7.u32, clearColor = ctx.r10.u32;
   float clearZ = float(ctx.f1.f64);
   // 10th argument on the caller's stack (the float takes the 9th slot).
   uint32_t clearStencil = ng2::guest::Load32(ctx.r1.u32 + 92);
-  __imp__sub_8373D570(ctx, base);
+  __imp__sub_83762CA8(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
     ng2::video::OnResolve(device, flags, rect, texture, point, clearColor, clearZ, clearStencil);
   }
 }
 
 // Swap: the frame is done.
-REX_EXTERN(__imp__sub_837452C0);
-REX_HOOK_RAW(sub_837452C0) {
+REX_EXTERN(__imp__sub_8376A9F8);
+REX_HOOK_RAW(sub_8376A9F8) {
   g_counters.swaps++;
   uint32_t device = ctx.r3.u32, frontBuffer = ctx.r4.u32;
-  __imp__sub_837452C0(ctx, base);
+  __imp__sub_8376A9F8(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
     ng2::video::OnSwap(device, frontBuffer);
   }
@@ -178,21 +178,21 @@ REX_HOOK_RAW(sub_837452C0) {
 }
 
 // The D3D library's waits for the GPU: each fills a wait block (with the
-// time base at +20 when it starts) and calls sub_83737AE0 until the GPU's
+// time base at +20 when it starts) and calls sub_8375E538 until the GPU's
 // read pointer passes a fence (1: still waiting). The console spins here; on
 // a PC that's a whole core busy until the next vblank, so once a wait has
 // spun a while each step sleeps a little. The count starts again with each
 // wait, told apart by that time stamp (they end on the read pointer, not on
 // a step's 0).
-REX_EXTERN(__imp__sub_83737AE0);
-REX_HOOK_RAW(sub_83737AE0) {
+REX_EXTERN(__imp__sub_8375E538);
+REX_HOOK_RAW(sub_8375E538) {
   thread_local uint32_t spins = 0, lastStamp = 0;
   uint32_t stamp = ng2::guest::Load32(ctx.r3.u32 + 20);
   if (stamp != lastStamp) {
     lastStamp = stamp;
     spins = 0;
   }
-  __imp__sub_83737AE0(ctx, base);
+  __imp__sub_8375E538(ctx, base);
   if (ctx.r3.u32 != 0 && ++spins > 64) {
 #if defined(_WIN32)
     std::this_thread::yield();  // a sleep there is a millisecond or more
@@ -223,7 +223,7 @@ static void NoteBarrierWait(std::chrono::steady_clock::duration waited) {
   }
 }
 
-// The audio engine's barrier (XAudio2's voice processing, sub_8374F078): each
+// The audio engine's barrier (XAudio2's voice processing, sub_83774818): each
 // thread taking part sets its processor's byte in an 8-byte mask and waits
 // until the mask holds all of them; the first to see that cleared it, and a
 // waiting thread only left on seeing the mask whole or cleared. If the OS
@@ -235,15 +235,15 @@ static void NoteBarrierWait(std::chrono::steady_clock::duration waited) {
 // only cleared by a completed barrier and only set again by its own thread
 // after that. Byte accesses only: the mask needn't be 8-byte aligned, and an
 // 8-byte lock across a cache line would be a split lock.
-REX_EXTERN(__imp__sub_8374F078);
-REX_HOOK_RAW(sub_8374F078) {
+REX_EXTERN(__imp__sub_83774818);
+REX_HOOK_RAW(sub_83774818) {
   // NG2_GAME_AUDIO_BARRIER=1: the game's own barrier (for comparisons).
   static const bool original = [] {
     const char* v = std::getenv("NG2_GAME_AUDIO_BARRIER");
     return v && v[0] == '1';
   }();
   if (original) {
-    __imp__sub_8374F078(ctx, base);
+    __imp__sub_83774818(ctx, base);
     return;
   }
   uint32_t engine = ctx.r3.u32;
@@ -252,7 +252,7 @@ REX_HOOK_RAW(sub_8374F078) {
   }
   uint8_t cpu = *ng2::guest::Virtual(ctx.r13.u32 + 0x10C);
   if (cpu >= 6) {
-    __imp__sub_8374F078(ctx, base);  // not a processor that takes part
+    __imp__sub_83774818(ctx, base);  // not a processor that takes part
     return;
   }
   uint8_t* mask = ng2::guest::Virtual(ctx.r4.u32);

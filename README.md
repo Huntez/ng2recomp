@@ -50,6 +50,11 @@ limit; that headroom is what allows 4x-8x and MSAA on top.
    Properties → Allow executing).
 2. Run it. On the first start a window asks for your copy of the game: a disc image (`.iso`) or the
    `default.xex` of an extracted copy. A disc image is extracted once into the data folder.
+3. It then asks for Title Update 2 (`TU_1A461UL_000000G000000.00000000000G4`, or its
+   `default.xexp`), which the port is built for, and puts it in the game folder.
+4. Downloadable content (Mission Mode, the costume packs): put the packages in a `dlc` folder in
+   the game folder (the console's `544307D5/00000002` folder can go in as it is). They are installed
+   on the next start.
 
 Needs a 64-bit Linux, a GPU with Vulkan 1.3 drivers, FFmpeg's libraries (libavformat, libavcodec,
 libswresample, libswscale) and `kdialog` for the first-start window. The test AppImages use the
@@ -122,9 +127,11 @@ libswresample, libswscale).
        cd thirdparty/plume && git checkout 1192686 && git submodule update --init contrib/volk contrib/VulkanMemoryAllocator contrib/Vulkan-Headers
        git am ../../patches/plume/*.patch
 
-3. Extract the disc into `game_files/`:
+3. Extract the disc into `game_files/` and put Title Update 2's `default.xexp` next to
+   `default.xex` (see [docs/title-update.md](docs/title-update.md)):
 
        python3 tools/xdvdfs_extract.py "Ninja Gaiden II (World).iso" game_files
+       python3 tools/stfs_extract.py TU_1A461UL_000000G000000.00000000000G4 default.xexp game_files/default.xexp
 
 4. Build. This generates about 560 MB of C++ from the game's code and translates its shaders
    (see [docs/shaders.md](docs/shaders.md)):

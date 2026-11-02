@@ -42,6 +42,8 @@
 #include "gpu/menu_label.h"
 #include "recomp_settings.h"
 
+#include "aspect.h"
+
 REXCVAR_DEFINE_INT32(windowed_width, 0, "UI/Window",
                      "The window's width when not fullscreen (0: the default size)");
 REXCVAR_DEFINE_INT32(windowed_height, 0, "UI/Window",
@@ -53,26 +55,26 @@ REXCVAR_DEFINE_BOOL(exclusive_fullscreen, false, "UI/Window",
 namespace ng2::recomp_settings {
 namespace {
 
-// The title menu opens screens with sub_8364CFC8(manager, id): 13 is the
+// The title menu opens screens with sub_8366FAC8(manager, id): 13 is the
 // "sign in to see the Marketplace" message, 9 the Options screen.
 constexpr uint32_t kMarketplaceMessage = 13;
 constexpr uint32_t kOptionsScreen = 9;
 
-// Options state (sub_823E5778): the page (0 the category list, 1 Game
+// Options state (sub_823E5968): the page (0 the category list, 1 Game
 // Settings, past 11 closes Options), the page before this frame's, the
 // depth, and a cursor per page.
-constexpr uint32_t kPage = 0x83CEB3F8;
-constexpr uint32_t kLastPage = 0x83CEB3FC;
-constexpr uint32_t kDepth = 0x83CEB400;
-constexpr uint32_t kCursors = 0x83CEB414;
+constexpr uint32_t kPage = 0x83D017B0;
+constexpr uint32_t kLastPage = 0x83D017B4;
+constexpr uint32_t kDepth = 0x83D017B8;
+constexpr uint32_t kCursors = 0x83D017CC;
 constexpr uint32_t kCategoryPage = 0;
 constexpr uint32_t kClosed = 0xFF;  // what the category list's Back sets
 // The pad state, the player's pad, and the menu model.
-constexpr uint32_t kPadState = 0x84F41264;
-constexpr uint32_t kPlayerPad = 0x84B5030A;
-constexpr uint32_t kMenuModel = 0x85313E30;
-constexpr uint32_t kCursorSound = 0x8206EE58;  // the float the sounds take
-// sub_83682750(n): the menu's transitions.
+constexpr uint32_t kPadState = 0x84F5BBD8;
+constexpr uint32_t kPlayerPad = 0x84C3DA3E;
+constexpr uint32_t kMenuModel = 0x8532EDB0;
+constexpr uint32_t kCursorSound = 0x8206EF3C;  // the float the sounds take
+// sub_836A50D0(n): the menu's transitions.
 constexpr uint32_t kChoiceChanged = 5;
 constexpr uint32_t kEnter = 6;
 constexpr uint32_t kLeave = 7;
@@ -83,7 +85,7 @@ constexpr uint32_t kLeave = 7;
 // uses. Display is the Controller Settings page. Each row's widget is reset,
 // placed and appended by us after the game's builder has run with its own
 // rows left out.
-constexpr uint32_t kListVtable = 0x82281010;  // an arrow list ("<- value ->")
+constexpr uint32_t kListVtable = 0x822869A0;  // an arrow list ("<- value ->")
 constexpr uint32_t kListSize = 0x270;
 constexpr uint32_t kListTexts = 0x20;        // up to 10 value texts
 constexpr uint32_t kListShown = 0x234;       // the value text shown
@@ -94,10 +96,10 @@ constexpr float kArrowSpread = 32.0f;
 constexpr uint32_t kWidgetValue = 0x14;
 constexpr uint32_t kWidgetX = 0x18, kWidgetY = 0x1C;
 constexpr uint32_t kOnOffRow = 0x600;  // a choice row's flag: 1 shows its first choice
-constexpr uint32_t kPlayTimeText = 0x859D8DC4;  // UTF-16, from sub_836AC0C8
+constexpr uint32_t kPlayTimeText = 0x859F5574;  // UTF-16, from sub_836D1780
 constexpr uint32_t kPageRows = 0x10;           // a page object's row count
-constexpr uint32_t kModelValues = 0x85313EB0;  // + 0x40 * page + 8 * row
-constexpr uint32_t kStringTable = 0x83BBC138;  // for sub_823E0E60(table, language, id)
+constexpr uint32_t kModelValues = 0x8532EE30;  // + 0x40 * page + 8 * row
+constexpr uint32_t kStringTable = 0x83BD1DC0;  // for sub_823E1200(table, language, id)
 
 // Options strings: table 2 (id 0x20000 + index), strings back to back in
 // 16-byte slots.
@@ -110,7 +112,7 @@ constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97;
 constexpr uint32_t kSlotCount = 0x98;  // past the last index used
 
 enum class Kind {
-  kScale, kFiltering, kLevel, kOnOff, kPresent, kWindowMode, kWindowSize, kSamples
+  kScale, kFiltering, kLevel, kOnOff, kPresent, kWindowMode, kWindowSize, kSamples, kAspect
 };
 struct Setting {
   std::u16string_view label;
@@ -119,6 +121,23 @@ struct Setting {
   const char* name;
   Kind kind;
 };
+// Window Size's choices, for each aspect ratio (Aspect Ratio's order).
+struct WindowSize {
+  int32_t width, height;
+  std::u16string_view text;
+};
+constexpr uint32_t kWindowSizeCount = 5;
+constexpr WindowSize kWindowSizes[][kWindowSizeCount] = {
+    {{1280, 720, u"1280x720"}, {1600, 900, u"1600x900"}, {1920, 1080, u"1920x1080"},
+     {2560, 1440, u"2560x1440"}, {3840, 2160, u"3840x2160"}},
+    {{1280, 800, u"1280x800"}, {1440, 900, u"1440x900"}, {1680, 1050, u"1680x1050"},
+     {1920, 1200, u"1920x1200"}, {2560, 1600, u"2560x1600"}},
+    {{1720, 720, u"1720x720"}, {2560, 1080, u"2560x1080"}, {3440, 1440, u"3440x1440"},
+     {3840, 1600, u"3840x1600"}, {5120, 2160, u"5120x2160"}},
+    {{2560, 720, u"2560x720"}, {3840, 1080, u"3840x1080"}, {5120, 1440, u"5120x1440"},
+     {6880, 1440, u"6880x1440"}, {7680, 2160, u"7680x2160"}},
+};
+
 constexpr Setting kSettings[] = {
     // With what the game's 3D (1120x584) is drawn at, as the NGB recomp's.
     {u"Render Scale",
@@ -132,16 +151,31 @@ constexpr Setting kSettings[] = {
      Kind::kSamples},
     {u"Window Mode", {u"Windowed", u"Borderless", u"Fullscreen"}, 3, "fullscreen",
      Kind::kWindowMode},
-    {u"Window Size", {u"1280x720", u"1600x900", u"1920x1080", u"2560x1440", u"3840x2160"}, 5,
-     "windowed_width", Kind::kWindowSize},
+    // Its choices follow the aspect ratio (kWindowSizes).
+    {u"Window Size", {}, kWindowSizeCount, "windowed_width", Kind::kWindowSize},
     {u"V-Sync", {u"Off", u"FIFO", u"Mailbox", u"Adaptive"}, 4, "present_mode", Kind::kPresent},
     {u"Show FPS", {u"On", u"Off"}, 2, "show_fps", Kind::kOnOff},
     {u"Infinite Health", {u"On", u"Off"}, 2, "cheat_infinite_health", Kind::kOnOff},
     {u"Infinite Ninpo", {u"On", u"Off"}, 2, "cheat_infinite_ninpo", Kind::kOnOff},
+    {u"Unlock Difficulties", {u"On", u"Off"}, 2, "cheat_unlock_difficulties", Kind::kOnOff},
+    {u"Unlock Costumes", {u"On", u"Off"}, 2, "cheat_unlock_costumes", Kind::kOnOff},
+    {u"Skip Intro", {u"On", u"Off"}, 2, "skip_intro", Kind::kOnOff},
+    {u"Skip Cutscenes", {u"On", u"Off"}, 2, "skip_cutscenes", Kind::kOnOff},
+    {u"Pause in Background", {u"On", u"Off"}, 2, "pause_in_background", Kind::kOnOff},
+    {u"Aspect Ratio", {u"16:9", u"16:10", u"21:9", u"32:9"}, 4, "aspect_ratio", Kind::kAspect},
 };
-// Window Size's choices.
-constexpr std::pair<int32_t, int32_t> kWindowSizes[] = {
-    {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
+// The window sizes for the chosen aspect ratio.
+const WindowSize* WindowSizes() {
+  return kWindowSizes[ng2::aspect::AspectIndex()];
+}
+
+// A setting's k-th choice as shown.
+std::u16string_view Choice(const Setting& setting, uint32_t k) {
+  if (setting.kind == Kind::kWindowSize) {
+    return WindowSizes()[std::min(k, kWindowSizeCount - 1)].text;
+  }
+  return setting.choices[std::min(k, setting.count - 1)];
+}
 
 struct PageRow {
   uint32_t setting;
@@ -154,7 +188,7 @@ struct Page {
   uint32_t page;   // its Options page (category + 1)
   uint32_t size;   // its page object's
   uint32_t restore;  // the Restore Defaults row's widget
-  std::array<PageRow, 4> rows;
+  std::array<PageRow, 6> rows;
   uint32_t count;
 };
 constexpr Page kPages[] = {
@@ -167,14 +201,25 @@ constexpr Page kPages[] = {
     {u"Display", 2, 0x1CC0, 0x1A20,
      {{{4, 0x1E0, true, true},
        {5, 0x1E0 + kListSize, true, true},
+       {15, 0xA60, true, true},
        {6, 0x7F0, true, true},
        {7, 0xE00, false, false}}},
-     4},
-    // The Camera Settings page: its two four-choice rows.
+     5},
+    // The Camera Settings page: its two four-choice rows, and lists over its
+    // two sliders.
     {u"Cheats", 3, 0x13E0, 0x1300,
      {{{8, 0x1E0, false, false},
-       {9, 0x7F0, false, false}}},
-     2},
+       {9, 0x7F0, false, false},
+       {10, 0xE00, true, true},
+       {11, 0x1080, true, true}}},
+     4},
+    // The Audio Settings page: lists over its sliders and its Speaker
+    // Output row (all before its Restore Defaults).
+    {u"Gameplay", 4, 0x26A0, 0xAA0,
+     {{{12, 0x1E0, true, true},
+       {13, 0x1E0 + kListSize, true, true},
+       {14, 0x1E0 + 2 * kListSize, true, true}}},
+     3},
 };
 constexpr uint32_t kPageCount = std::size(kPages);
 constexpr std::u16string_view kRestoreText = u"Restore Defaults";
@@ -198,6 +243,8 @@ std::map<std::string, std::string, std::less<>> g_written;
 // draws them).
 std::vector<std::pair<uint32_t, std::vector<uint8_t>>> g_savedGuest;
 std::vector<std::pair<uint32_t, std::vector<uint8_t>>> g_savedWidgets;
+// Our list widgets on the title's pages, by setting (0: none).
+uint32_t g_listWidgets[std::size(kSettings)] = {};
 
 void PutBack(std::vector<std::pair<uint32_t, std::vector<uint8_t>>>& saved) {
   for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
@@ -319,7 +366,17 @@ void PlaceTexts(const std::vector<std::pair<uint32_t, uint32_t>>& slots) {
   std::vector<std::u16string_view> texts{kRestoreText};
   for (const Setting& setting : kSettings) {
     texts.push_back(setting.label);
-    texts.insert(texts.end(), setting.choices.begin(), setting.choices.begin() + setting.count);
+    // List values are strings of ours (ListString); only choice rows'
+    // choices are the table's.
+    bool list = false;
+    for (const Page& page : kPages) {
+      for (uint32_t i = 0; i < page.count; i++) {
+        list |= &kSettings[page.rows[i].setting] == &setting && page.rows[i].list;
+      }
+    }
+    if (!list) {
+      texts.insert(texts.end(), setting.choices.begin(), setting.choices.begin() + setting.count);
+    }
   }
   std::sort(texts.begin(), texts.end(),
             [](auto a, auto b) { return a.size() > b.size() || (a.size() == b.size() && a < b); });
@@ -439,6 +496,7 @@ void PutBackGame() {
 }
 
 void Close() {
+  std::fill(std::begin(g_listWidgets), std::end(g_listWidgets), 0u);
   if (!g_open) {
     return;
   }
@@ -477,6 +535,8 @@ uint32_t ValueOf(const Setting& setting) {
     }
     case Kind::kLevel:
       return uint32_t(std::clamp(GetInt(setting.name), 0, int32_t(setting.count) - 1));
+    case Kind::kAspect:
+      return ng2::aspect::AspectIndex();
     case Kind::kOnOff:
       return GetSetting(setting.name) == "true" ? 0 : 1;
     case Kind::kPresent:
@@ -494,9 +554,9 @@ uint32_t ValueOf(const Setting& setting) {
       return samples >= 8 ? 3 : samples >= 4 ? 2 : samples >= 2 ? 1 : 0;
     }
     case Kind::kWindowSize:
-      for (uint32_t i = 0; i < std::size(kWindowSizes); i++) {
-        if (GetInt("windowed_width") == kWindowSizes[i].first &&
-            GetInt("windowed_height") == kWindowSizes[i].second) {
+      for (uint32_t i = 0; i < kWindowSizeCount; i++) {
+        if (GetInt("windowed_width") == WindowSizes()[i].width &&
+            GetInt("windowed_height") == WindowSizes()[i].height) {
           return i;
         }
       }
@@ -534,7 +594,7 @@ void ApplyWindow(bool fullscreen) {
     int32_t width = rex::cvar::Query<int32_t>("windowed_width");
     int32_t height = rex::cvar::Query<int32_t>("windowed_height");
     if (width <= 0 || height <= 0) {
-      width = kWindowSizes[0].first, height = kWindowSizes[0].second;
+      width = WindowSizes()[0].width, height = WindowSizes()[0].height;
     }
     SDL_SetWindowSize(window, width, height);
   }
@@ -585,6 +645,21 @@ void SetValue(const Setting& setting, uint32_t value) {
     case Kind::kLevel:
       SetSetting(setting.name, std::to_string(value));
       break;
+    case Kind::kAspect: {
+      // The window keeps its place in Window Size's list, at the new shape.
+      const Setting* sizes = nullptr;
+      for (const Setting& other : kSettings) {
+        if (other.kind == Kind::kWindowSize) {
+          sizes = &other;
+        }
+      }
+      uint32_t size = sizes ? ValueOf(*sizes) : 0;
+      SetSetting(setting.name, std::to_string(value));
+      if (sizes) {
+        SetValue(*sizes, size);
+      }
+      break;
+    }
     case Kind::kOnOff:
       SetSetting(setting.name, value == 0 ? "true" : "false");
       break;
@@ -603,13 +678,21 @@ void SetValue(const Setting& setting, uint32_t value) {
       SetSetting(setting.name, std::to_string(value == 0 ? 0 : 1 << value));
       break;
     case Kind::kWindowSize:
-      SetSetting("windowed_width", std::to_string(kWindowSizes[value].first));
-      SetSetting("windowed_height", std::to_string(kWindowSizes[value].second));
+      SetSetting("windowed_width", std::to_string(WindowSizes()[value].width));
+      SetSetting("windowed_height", std::to_string(WindowSizes()[value].height));
       break;
   }
 }
 
 void RestoreDefault(const Setting& setting) {
+  // The aspect through its own setter: the window keeps its place in Window
+  // Size's list.
+  if (setting.kind == Kind::kAspect) {
+    if (const auto* info = rex::cvar::GetFlagInfo(setting.name)) {
+      SetValue(setting, uint32_t(std::atoi(info->default_value.c_str())));
+    }
+    return;
+  }
   auto reset = [](const char* name) {
     if (const auto* info = rex::cvar::GetFlagInfo(name)) {
       SetSetting(name, info->default_value);
@@ -679,46 +762,46 @@ double CallGuestFloat(PPCContext& ctx, uint8_t* base, void (*function)(PPCContex
 
 }  // namespace
 
-REX_EXTERN(__imp__sub_823E3448);  // a pad direction: (pad state, pad, 1, 0, 0 up 1 down 2 right 3 left)
-REX_EXTERN(__imp__sub_823E3D78);  // Confirm: (&pad state, cursor, enabled[], 0)
-REX_EXTERN(__imp__sub_823E3ED0);  // Back: (&pad state, cursor, 0xFF, 0)
-REX_EXTERN(__imp__sub_823E3FD0);  // Y, a row's default: (&pad state)
-REX_EXTERN(__imp__sub_82429DA8);  // a menu sound: (id), f1
-REX_EXTERN(__imp__sub_83682750);  // a menu transition: (n, flag)
-REX_EXTERN(__imp__sub_83681830);  // the page's state into the menu model
-REX_EXTERN(__imp__sub_836AA198);  // a widget's reset: (widget, model)
-REX_EXTERN(__imp__sub_836AA260);  // a list's or label's height: (widget) -> f1
-REX_EXTERN(__imp__sub_836AA488);  // a choice row's height: (widget) -> f1
-REX_EXTERN(__imp__sub_836DFDE0);  // a text sprite's constructor: (sprite)
-REX_EXTERN(__imp__sub_823E41F0);  // a widget part's constructor: (part)
-REX_EXTERN(__imp__sub_823E0E60);  // a string: (table, language, id) -> pointer
-REX_EXTERN(__imp__sub_8365CDF0);  // the text language
-REX_EXTERN(__imp__sub_836AA270);  // a choice onto a choice row: (widget, string id)
-REX_EXTERN(__imp__sub_836AB540);  // a row onto a page: (page, label id, widget)
+REX_EXTERN(__imp__sub_823E37F0);  // a pad direction: (pad state, pad, 1, 0, 0 up 1 down 2 right 3 left)
+REX_EXTERN(__imp__sub_823E4120);  // Confirm: (&pad state, cursor, enabled[], 0)
+REX_EXTERN(__imp__sub_823E4278);  // Back: (&pad state, cursor, 0xFF, 0)
+REX_EXTERN(__imp__sub_823E4378);  // Y, a row's default: (&pad state)
+REX_EXTERN(__imp__sub_8242AF00);  // a menu sound: (id), f1
+REX_EXTERN(__imp__sub_836A50D0);  // a menu transition: (n, flag)
+REX_EXTERN(__imp__sub_836A4210);  // the page's state into the menu model
+REX_EXTERN(__imp__sub_836CF9C0);  // a widget's reset: (widget, model)
+REX_EXTERN(__imp__sub_836CFA88);  // a list's or label's height: (widget) -> f1
+REX_EXTERN(__imp__sub_836CFCA0);  // a choice row's height: (widget) -> f1
+REX_EXTERN(__imp__sub_837045E0);  // a text sprite's constructor: (sprite)
+REX_EXTERN(__imp__sub_8242BF80);  // a widget part's constructor: (part)
+REX_EXTERN(__imp__sub_823E1200);  // a string: (table, language, id) -> pointer
+REX_EXTERN(__imp__sub_8367F948);  // the text language
+REX_EXTERN(__imp__sub_836CFA98);  // a choice onto a choice row: (widget, string id)
+REX_EXTERN(__imp__sub_836D0CD8);  // a row onto a page: (page, label id, widget)
 
-// The title menu's entries (sub_8364CBE8): 0x140 bytes each, from
-// 0x85387600; at +0x124 the action, +0x128 the row's place, +0x130 "needs
+// The title menu's entries (sub_8366F4D0): 0x140 bytes each, from
+// 0x853A3B60; at +0x124 the action, +0x128 the row's place, +0x130 "needs
 // Xbox LIVE" (shown greyed while signed out). LEADERBOARDS (action 3) goes,
 // the entries below move up into the rows above, and ours isn't greyed.
-constexpr uint32_t kTitleEntries = 0x85387600;
+constexpr uint32_t kTitleEntries = 0x853A3B60;
 constexpr uint32_t kTitleEntrySize = 0x140;
-constexpr uint32_t kTitleEntryCount = 0x85388500;
+constexpr uint32_t kTitleEntryCount = 0x853A4A60;
 constexpr uint32_t kEntryAction = 0x124, kEntryPlace = 0x128, kEntryOnline = 0x130;
 constexpr uint32_t kLeaderboards = 3, kMarketplace = 6;
 // A new last entry quits the game: action 7, which the title menu doesn't
-// handle; its picture (table 0x83A93700, by language and action) is the
+// handle; its picture (table 0x83AB3870, by language and action) is the
 // atlas's EXIT DEMO band, redrawn as EXIT GAME (src/gpu/menu_label.cpp).
 constexpr uint32_t kExitAction = 7;
 constexpr uint32_t kEntryStoragePrompt = 0x12C;
 constexpr uint32_t kTitleEntryCapacity = 12;
-constexpr uint32_t kTitleCursor = 0x85388504;
-constexpr uint32_t kPadPressed = 0x83BF1F78;  // + pad * 0x44: newly pressed buttons
+constexpr uint32_t kTitleCursor = 0x853A4A64;
+constexpr uint32_t kPadPressed = 0x83C07FF8;  // + pad * 0x44: newly pressed buttons
 constexpr uint32_t kConfirmButtons = 0x150;
 
-REX_EXTERN(__imp__sub_8364CBE8);
-REX_HOOK_RAW(sub_8364CBE8) {
+REX_EXTERN(__imp__sub_8366F4D0);
+REX_HOOK_RAW(sub_8366F4D0) {
   PutBackGame();
-  __imp__sub_8364CBE8(ctx, base);
+  __imp__sub_8366F4D0(ctx, base);
   using ng2::guest::Load32;
   uint32_t count = Load32(kTitleEntryCount);
   if (count > 8) {
@@ -759,22 +842,22 @@ REX_HOOK_RAW(sub_8364CBE8) {
 }
 
 // The title menu's "signed in" check: ours always takes the signed-out path,
-// whose message sub_8364CFC8 turns into our screen.
-REX_EXTERN(__imp__sub_8364CA08);
-REX_HOOK_RAW(sub_8364CA08) {
+// whose message sub_8366FAC8 turns into our screen.
+REX_EXTERN(__imp__sub_8366F2E8);
+REX_HOOK_RAW(sub_8366F2E8) {
   uint32_t index = ctx.r3.u32;
   if (index < ng2::guest::Load32(kTitleEntryCount) &&
       ng2::guest::Load32(kTitleEntries + index * kTitleEntrySize + kEntryAction) == kMarketplace) {
     ctx.r3.u64 = 0;
     return;
   }
-  __imp__sub_8364CA08(ctx, base);
+  __imp__sub_8366F2E8(ctx, base);
 }
 
 // The title menu's input: Confirm on the exit entry quits.
-REX_EXTERN(__imp__sub_8364D0C0);
-REX_HOOK_RAW(sub_8364D0C0) {
-  __imp__sub_8364D0C0(ctx, base);
+REX_EXTERN(__imp__sub_8366FBC0);
+REX_HOOK_RAW(sub_8366FBC0) {
+  __imp__sub_8366FBC0(ctx, base);
   using ng2::guest::Load32;
   uint32_t player = *ng2::guest::Virtual(kPlayerPad);
   uint32_t cursor = Load32(kTitleCursor);
@@ -801,20 +884,20 @@ REX_HOOK_RAW(sub_8364D0C0) {
 
 // Opening a screen: the Marketplace message becomes the Options screen with
 // our settings in it.
-REX_EXTERN(__imp__sub_8364CFC8);
-REX_HOOK_RAW(sub_8364CFC8) {
+REX_EXTERN(__imp__sub_8366FAC8);
+REX_HOOK_RAW(sub_8366FAC8) {
   if (ctx.r4.u32 == kMarketplaceMessage) {
     ctx.r4.u64 = kOptionsScreen;
     Open();
   }
-  __imp__sub_8364CFC8(ctx, base);
+  __imp__sub_8366FAC8(ctx, base);
 }
 
-// The Options screen's run: its loop (sub_823E5778) returns when Options
+// The Options screen's run: its loop (sub_823E5968) returns when Options
 // closes.
-REX_EXTERN(__imp__sub_823E55B0);
-REX_HOOK_RAW(sub_823E55B0) {
-  __imp__sub_823E55B0(ctx, base);
+REX_EXTERN(__imp__sub_823E57A0);
+REX_HOOK_RAW(sub_823E57A0) {
+  __imp__sub_823E57A0(ctx, base);
   Close();
 }
 
@@ -831,8 +914,44 @@ uint32_t StoreValues(PPCContext& ctx, const Page* page) {
   return values;
 }
 
+REX_EXTERN(__imp__sub_83835940);  // XMemAlloc(size, attributes)
+
+// List values' strings (UTF-16BE, in guest memory of ours): a list shows
+// a string pointer per value, so they need no slot in the game's string
+// table (Window Size alone has 20). Made once, kept.
+std::vector<std::pair<std::u16string, uint32_t>> g_listStrings;
+uint32_t g_listArena = 0, g_listArenaUsed = 0;
+constexpr uint32_t kListArenaSize = 0x2000;
+constexpr uint32_t kListArenaAttributes = 0xB2800000;
+
+uint32_t ListString(PPCContext& ctx, uint8_t* base, std::u16string_view text) {
+  for (const auto& [placed, address] : g_listStrings) {
+    if (placed == text) {
+      return address;
+    }
+  }
+  if (!g_listArena) {
+    g_listArena = CallGuest(ctx, base, __imp__sub_83835940, {kListArenaSize, kListArenaAttributes});
+    if (!g_listArena) {
+      return 0;
+    }
+  }
+  uint32_t size = uint32_t(text.size() + 1) * 2;
+  if (g_listArenaUsed + size > kListArenaSize) {
+    REXLOG_WARN("recomp settings: no room for a list value");
+    return 0;
+  }
+  uint32_t address = g_listArena + g_listArenaUsed;
+  g_listArenaUsed += (size + 3) & ~3u;
+  std::vector<uint8_t> bytes = Utf16BE(text);
+  bytes.push_back(0), bytes.push_back(0);
+  std::memcpy(ng2::guest::Virtual(address), bytes.data(), bytes.size());
+  g_listStrings.emplace_back(text, address);
+  return address;
+}
+
 // A list widget made in place, as the Game Settings page's constructor
-// (sub_83681EB0) makes its language list.
+// (sub_836A4830) makes its language list.
 void MakeList(PPCContext& ctx, uint8_t* base, uint32_t widget) {
   uint8_t* bytes = ng2::guest::Virtual(widget);
   g_savedWidgets.emplace_back(widget, std::vector<uint8_t>(bytes, bytes + kListSize));
@@ -840,9 +959,9 @@ void MakeList(PPCContext& ctx, uint8_t* base, uint32_t widget) {
   Store32(widget, kListVtable);
   for (uint32_t sprite : {0x50u, 0xE0u, 0x170u}) {
     Store32(widget + sprite + 0x74, 0);
-    CallGuest(ctx, base, __imp__sub_836DFDE0, {widget + sprite});
+    CallGuest(ctx, base, __imp__sub_837045E0, {widget + sprite});
   }
-  CallGuest(ctx, base, __imp__sub_823E41F0, {widget + 0x200});
+  CallGuest(ctx, base, __imp__sub_8242BF80, {widget + 0x200});
   Store32(widget + 0x260, 1);
 }
 
@@ -851,14 +970,14 @@ void MakeList(PPCContext& ctx, uint8_t* base, uint32_t widget) {
 void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object, uint32_t model) {
   using ng2::guest::Load32;
   Store32(object + kPageRows, 0);
-  uint32_t language = CallGuest(ctx, base, __imp__sub_8365CDF0, {}) & 0xFF;
+  uint32_t language = CallGuest(ctx, base, __imp__sub_8367F948, {}) & 0xFF;
   uint32_t table = Load32(kStringTable);
   auto text = [&](std::u16string_view s) {
-    return CallGuest(ctx, base, __imp__sub_823E0E60, {table, language, TextId(s)});
+    return CallGuest(ctx, base, __imp__sub_823E1200, {table, language, TextId(s)});
   };
   float y = 0.0f;
   auto place = [&](uint32_t widget) {
-    CallGuest(ctx, base, __imp__sub_836AA198, {widget, model});
+    CallGuest(ctx, base, __imp__sub_836CF9C0, {widget, model});
     StoreFloat(widget + kWidgetX, 0.0f);
     StoreFloat(widget + kWidgetY, y);
   };
@@ -873,8 +992,9 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
     place(widget);
     if (row.list) {
       for (uint32_t k = 0; k < 10; k++) {
-        Store32(widget + kListTexts + 4 * k, text(setting.choices[std::min(k, setting.count - 1)]));
+        Store32(widget + kListTexts + 4 * k, ListString(ctx, base, Choice(setting, k)));
       }
+      g_listWidgets[row.setting] = widget;
       Store32(widget + kListShown, Load32(widget + kListTexts + 4 * value));
       // The arrows further apart than the game's, for the longer values
       // (Render Scale's resolutions).
@@ -887,17 +1007,17 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
     } else {
       Store32(widget + kOnOffRow, 0);
       for (uint32_t k = 0; k < setting.count; k++) {
-        CallGuest(ctx, base, __imp__sub_836AA270, {widget, TextId(setting.choices[k])});
+        CallGuest(ctx, base, __imp__sub_836CFA98, {widget, TextId(setting.choices[k])});
       }
     }
     Store32(widget + kWidgetValue, value);
-    CallGuest(ctx, base, __imp__sub_836AB540, {object, TextId(setting.label), widget});
-    y += float(CallGuestFloat(ctx, base, row.list ? __imp__sub_836AA260 : __imp__sub_836AA488,
+    CallGuest(ctx, base, __imp__sub_836D0CD8, {object, TextId(setting.label), widget});
+    y += float(CallGuestFloat(ctx, base, row.list ? __imp__sub_836CFA88 : __imp__sub_836CFCA0,
                               {widget}));
   }
   uint32_t restore = object + page.restore;
   place(restore);
-  CallGuest(ctx, base, __imp__sub_836AB540, {object, TextId(kRestoreText), restore});
+  CallGuest(ctx, base, __imp__sub_836D0CD8, {object, TextId(kRestoreText), restore});
   // The rows' values in the model, as the handler will keep them; the
   // game's are put back on closing.
   uint32_t slots = kModelValues + 0x40 * page.page;
@@ -940,6 +1060,21 @@ bool InBuild(uint32_t address) {
   return g_building && address - g_building < g_buildingSize;
 }
 
+// Window Size's list after the aspect ratio changed: the new sizes.
+void RefreshWindowSizes(PPCContext& ctx, uint8_t* base) {
+  using ng2::guest::Load32;
+  for (uint32_t i = 0; i < std::size(kSettings); i++) {
+    uint32_t widget = g_listWidgets[i];
+    if (kSettings[i].kind != Kind::kWindowSize || !widget) {
+      continue;
+    }
+    for (uint32_t k = 0; k < 10; k++) {
+      Store32(widget + kListTexts + 4 * k, ListString(ctx, base, Choice(kSettings[i], k)));
+    }
+    Store32(widget + kListShown, Load32(widget + kListTexts + 4 * ValueOf(kSettings[i])));
+  }
+}
+
 // A page's input, while ours is open: up and down pick a row, left and right
 // change it, Y sets its default, Confirm on Restore Defaults sets them all,
 // Back returns to the category list.
@@ -950,15 +1085,15 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
   uint32_t cursorAddress = kCursors + 4 * number;
   uint32_t cursor = std::min(Load32(cursorAddress), rowCount - 1);
   double sound = LoadFloat(kCursorSound);
-  if (CallGuest(ctx, base, __imp__sub_823E3ED0, {kPadState, cursor, 0xFF, 0})) {
+  if (CallGuest(ctx, base, __imp__sub_823E4278, {kPadState, cursor, 0xFF, 0})) {
     Store32(kPage, kCategoryPage);
     Store32(kDepth, Load32(kDepth) - 1);
-    CallGuest(ctx, base, __imp__sub_83682750, {kLeave, 0});
+    CallGuest(ctx, base, __imp__sub_836A50D0, {kLeave, 0});
   } else {
     uint32_t pad = Load32(kPadState);
     uint32_t player = *ng2::guest::Virtual(kPlayerPad);
     auto pressed = [&](uint32_t direction) {
-      return CallGuest(ctx, base, __imp__sub_823E3448, {pad, player, 1, 0, direction}) != 0;
+      return CallGuest(ctx, base, __imp__sub_823E37F0, {pad, player, 1, 0, direction}) != 0;
     };
     uint32_t moved = cursor;
     if (pressed(0)) {
@@ -968,17 +1103,18 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
       moved = (moved + 1) % rowCount;
     }
     if (moved != cursor) {
-      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+      CallGuest(ctx, base, __imp__sub_8242AF00, {2}, sound);
       cursor = moved;
       Store32(cursorAddress, cursor);
     }
     if (cursor == page.count) {
       // Restore Defaults; the enabled[] list is only read for the list page.
-      if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
+      if (CallGuest(ctx, base, __imp__sub_823E4120, {kPadState, cursor, 0, 0})) {
         for (uint32_t i = 0; i < page.count; i++) {
           RestoreDefault(kSettings[page.rows[i].setting]);
         }
-        CallGuest(ctx, base, __imp__sub_83682750, {kEnter, 0});
+        RefreshWindowSizes(ctx, base);
+        CallGuest(ctx, base, __imp__sub_836A50D0, {kEnter, 0});
       }
     } else {
       const Setting& setting = kSettings[page.rows[cursor].setting];
@@ -992,18 +1128,22 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
         changed = (changed + 1) % setting.count;
       }
       if (changed != value) {
-        CallGuest(ctx, base, __imp__sub_82429DA8, {3}, sound);
+        CallGuest(ctx, base, __imp__sub_8242AF00, {3}, sound);
         SetValue(setting, changed);
-      } else if (CallGuest(ctx, base, __imp__sub_823E3FD0, {kPadState})) {
+        if (setting.kind == Kind::kAspect) {
+          RefreshWindowSizes(ctx, base);
+        }
+      } else if (CallGuest(ctx, base, __imp__sub_823E4378, {kPadState})) {
         RestoreDefault(setting);
+        RefreshWindowSizes(ctx, base);
       }
-      CallGuest(ctx, base, __imp__sub_83682750, {kChoiceChanged, left ? 0u : 1u});
+      CallGuest(ctx, base, __imp__sub_836A50D0, {kChoiceChanged, left ? 0u : 1u});
     }
   }
   if (g_windowChanged) {
     ScheduleWindow();
   }
-  CallGuest(ctx, base, __imp__sub_83681830,
+  CallGuest(ctx, base, __imp__sub_836A4210,
             {kMenuModel, Load32(kLastPage), number, kCursors, StoreValues(ctx, &page), 8});
 }
 
@@ -1011,8 +1151,8 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
 
 // The loop starts with the first category and rows picked, and leaves the
 // game's as they were.
-REX_EXTERN(__imp__sub_823E5778);
-REX_HOOK_RAW(sub_823E5778) {
+REX_EXTERN(__imp__sub_823E5968);
+REX_HOOK_RAW(sub_823E5968) {
   constexpr uint32_t kSaved = kPageCount + 1;
   uint32_t saved[kSaved];
   for (uint32_t i = 0; i < kSaved; i++) {
@@ -1024,7 +1164,7 @@ REX_HOOK_RAW(sub_823E5778) {
       Store32(kCursors + 4 * i, 0);
     }
   }
-  __imp__sub_823E5778(ctx, base);
+  __imp__sub_823E5968(ctx, base);
   if (ours) {
     for (uint32_t i = 0; i < kSaved; i++) {
       Store32(kCursors + 4 * i, saved[i]);
@@ -1034,10 +1174,10 @@ REX_HOOK_RAW(sub_823E5778) {
 
 // The category list, replaced while ours is open: our categories only;
 // Confirm opens one's page, Back leaves Options.
-REX_EXTERN(__imp__sub_823E5B60);
-REX_HOOK_RAW(sub_823E5B60) {
+REX_EXTERN(__imp__sub_823E5D50);
+REX_HOOK_RAW(sub_823E5D50) {
   if (!g_open) {
-    __imp__sub_823E5B60(ctx, base);
+    __imp__sub_823E5D50(ctx, base);
     return;
   }
   using ng2::guest::Load32;
@@ -1047,18 +1187,18 @@ REX_HOOK_RAW(sub_823E5B60) {
   for (uint32_t i = 0; i < 8; i++) {
     Store32(enabled + 4 * i, i < kPageCount);
   }
-  if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, enabled, 0})) {
+  if (CallGuest(ctx, base, __imp__sub_823E4120, {kPadState, cursor, enabled, 0})) {
     Store32(kPage, kPages[cursor].page);
     Store32(kDepth, Load32(kDepth) + 1);
-    CallGuest(ctx, base, __imp__sub_83682750, {kEnter, 0});
-  } else if (CallGuest(ctx, base, __imp__sub_823E3ED0, {kPadState, cursor, 7, 0})) {
+    CallGuest(ctx, base, __imp__sub_836A50D0, {kEnter, 0});
+  } else if (CallGuest(ctx, base, __imp__sub_823E4278, {kPadState, cursor, 7, 0})) {
     Store32(kPage, kClosed);
-    CallGuest(ctx, base, __imp__sub_83682750, {kLeave, 0});
+    CallGuest(ctx, base, __imp__sub_836A50D0, {kLeave, 0});
   } else {
     uint32_t pad = Load32(kPadState);
     uint32_t player = *ng2::guest::Virtual(kPlayerPad);
     auto pressed = [&](uint32_t direction) {
-      return CallGuest(ctx, base, __imp__sub_823E3448, {pad, player, 1, 0, direction}) != 0;
+      return CallGuest(ctx, base, __imp__sub_823E37F0, {pad, player, 1, 0, direction}) != 0;
     };
     uint32_t moved = cursor;
     if (pressed(0)) {
@@ -1068,71 +1208,79 @@ REX_HOOK_RAW(sub_823E5B60) {
       moved = (moved + 1) % kPageCount;
     }
     if (moved != cursor) {
-      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, LoadFloat(kCursorSound));
+      CallGuest(ctx, base, __imp__sub_8242AF00, {2}, LoadFloat(kCursorSound));
     }
     Store32(kCursors, moved);
   }
-  CallGuest(ctx, base, __imp__sub_83681830,
+  CallGuest(ctx, base, __imp__sub_836A4210,
             {kMenuModel, Load32(kLastPage), page, kCursors, StoreValues(ctx, nullptr), 8});
 }
 
 // The pages' builders.
-REX_EXTERN(__imp__sub_836AC710);
-REX_HOOK_RAW(sub_836AC710) {
-  Build(ctx, base, __imp__sub_836AC710, 1);  // Game Settings
+REX_EXTERN(__imp__sub_836D1DB0);
+REX_HOOK_RAW(sub_836D1DB0) {
+  Build(ctx, base, __imp__sub_836D1DB0, 1);  // Game Settings
 }
-REX_EXTERN(__imp__sub_836AD330);
-REX_HOOK_RAW(sub_836AD330) {
-  Build(ctx, base, __imp__sub_836AD330, 2);  // Controller Settings
+REX_EXTERN(__imp__sub_836D2968);
+REX_HOOK_RAW(sub_836D2968) {
+  Build(ctx, base, __imp__sub_836D2968, 2);  // Controller Settings
 }
-REX_EXTERN(__imp__sub_836ADE10);
-REX_HOOK_RAW(sub_836ADE10) {
-  Build(ctx, base, __imp__sub_836ADE10, 3);  // Camera Settings
+REX_EXTERN(__imp__sub_836D3400);
+REX_HOOK_RAW(sub_836D3400) {
+  Build(ctx, base, __imp__sub_836D3400, 3);  // Camera Settings
+}
+REX_EXTERN(__imp__sub_836D4C78);
+REX_HOOK_RAW(sub_836D4C78) {
+  Build(ctx, base, __imp__sub_836D4C78, 4);  // Audio Settings
 }
 
 // A choice or a row from a builder whose rows are left out.
-REX_HOOK_RAW(sub_836AA270) {
+REX_HOOK_RAW(sub_836CFA98) {
   if (!InBuild(ctx.r3.u32)) {
-    __imp__sub_836AA270(ctx, base);
+    __imp__sub_836CFA98(ctx, base);
   }
 }
-REX_HOOK_RAW(sub_836AB540) {
+REX_HOOK_RAW(sub_836D0CD8) {
   if (!InBuild(ctx.r3.u32)) {
-    __imp__sub_836AB540(ctx, base);
+    __imp__sub_836D0CD8(ctx, base);
   }
 }
 
 // The pages' handlers, replaced while ours is open.
-REX_EXTERN(__imp__sub_823E6490);
-REX_HOOK_RAW(sub_823E6490) {
-  if (g_open) {
-    RunPage(ctx, base, kPages[0]);
+void Handle(PPCContext& ctx, uint8_t* base, void (*handler)(PPCContext&, uint8_t*)) {
+  const Page* page = PageOf(ng2::guest::Load32(kPage));
+  if (g_open && page) {
+    RunPage(ctx, base, *page);
   } else {
-    __imp__sub_823E6490(ctx, base);
+    handler(ctx, base);
   }
 }
-REX_EXTERN(__imp__sub_823E6AD8);
-REX_HOOK_RAW(sub_823E6AD8) {
-  if (g_open) {
-    RunPage(ctx, base, kPages[1]);
-  } else {
-    __imp__sub_823E6AD8(ctx, base);
-  }
+REX_EXTERN(__imp__sub_823E6680);
+REX_HOOK_RAW(sub_823E6680) {
+  Handle(ctx, base, __imp__sub_823E6680);
 }
-REX_EXTERN(__imp__sub_823E7040);
-REX_HOOK_RAW(sub_823E7040) {
-  if (g_open) {
-    RunPage(ctx, base, kPages[2]);
-  } else {
-    __imp__sub_823E7040(ctx, base);
-  }
+REX_EXTERN(__imp__sub_823E6CC8);
+REX_HOOK_RAW(sub_823E6CC8) {
+  Handle(ctx, base, __imp__sub_823E6CC8);
+}
+REX_EXTERN(__imp__sub_823E7230);
+REX_HOOK_RAW(sub_823E7230) {
+  Handle(ctx, base, __imp__sub_823E7230);
+}
+REX_EXTERN(__imp__sub_823E5FA8);
+REX_HOOK_RAW(sub_823E5FA8) {
+  Handle(ctx, base, __imp__sub_823E5FA8);
+}
+REX_EXTERN(__imp__sub_823E76D8);
+REX_HOOK_RAW(sub_823E76D8) {
+  Handle(ctx, base, __imp__sub_823E76D8);
 }
 
 // The Game Settings page's play time, formatted each frame into a shared
 // string: blank on ours.
-REX_EXTERN(__imp__sub_836AC0C8);
-REX_HOOK_RAW(sub_836AC0C8) {
-  __imp__sub_836AC0C8(ctx, base);
+REX_EXTERN(__imp__sub_836D1780);
+REX_HOOK_RAW(sub_836D1780) {
+  __imp__sub_836D1780(ctx, base);
   if (g_open) {
     Store32(kPlayTimeText, 0);
   }
@@ -1171,10 +1319,10 @@ void ng2::recomp_settings::ApplyWindowAtStart() {
 // added to them by the hooks below.
 namespace {
 
-constexpr uint32_t kInGameState = 0x83CEB3B4;    // 0: the list
-constexpr uint32_t kInGameCursors = 0x83CEB3C4;  // + 4 * state
-constexpr uint32_t kInGameModel = 0x8530B8C0;    // cursor, last cursor
-constexpr uint32_t kInGameViews[] = {0x8530B930, 0x8530BB80, 0x85310AE0};  // told of moves
+constexpr uint32_t kInGameState = 0x83D0176C;    // 0: the list
+constexpr uint32_t kInGameCursors = 0x83D0177C;  // + 4 * state
+constexpr uint32_t kInGameModel = 0x853265E0;    // cursor, last cursor
+constexpr uint32_t kInGameViews[] = {0x85326650, 0x853268A0, 0x8532B800};  // told of moves
 constexpr uint32_t kGameRows = 12;
 constexpr uint32_t kEntryIndex = 12;   // our row's index, as the game's handler sees it
 constexpr uint32_t kEntryShownAt = 10;   // where it's shown: after Save Method
@@ -1190,12 +1338,12 @@ uint32_t ToGameIndex(uint32_t shown) {
 }
 constexpr uint32_t kRowsAt = 8;                 // the list's row pointers
 constexpr uint32_t kChoiceRowSize = 0x780, kLabelRowSize = 0x130;
-constexpr uint32_t kLabelRowVtable = 0x82280C80;  // Return to Game's class
-constexpr uint32_t kQuitRowVtable = 0x82280CC8;   // Quit Game's
+constexpr uint32_t kLabelRowVtable = 0x82286610;  // Return to Game's class
+constexpr uint32_t kQuitRowVtable = 0x82286658;   // Quit Game's
 constexpr uint32_t kRowLabel = 0xE4;              // a row's text
 constexpr uint32_t kChoiceText = 0x434;           // + 0x100 per choice
 constexpr uint32_t kRowHeight = 0x18;
-constexpr uint32_t kLineHeight = 0x821821B4;      // the float the builder gives rows
+constexpr uint32_t kLineHeight = 0x8218243C;      // the float the builder gives rows
 constexpr uint32_t kAnyText = 0x40018;            // a string id, for the setup call
 constexpr uint32_t kGuestAlloc = 0xB2800000;
 constexpr uint32_t kChoicesShown = 4;             // a choice row's room
@@ -1209,7 +1357,7 @@ constexpr uint32_t kEmptyRows = kGameRows - kFirstPageRow - 1;  // for the short
 constexpr float kPageColumn = 344.0f;  // the title's pages are this far right of its categories
 constexpr uint32_t kCursorMark = 0x4ED0, kCursorMarkSlot = 0x4EC0;  // in the list
 constexpr uint32_t kMarkX = 0x30, kMarkY = 0x34;  // the mark's place, from the list's
-constexpr uint32_t kMarkOrigin = 0x82284800;     // the float the list places it from
+constexpr uint32_t kMarkOrigin = 0x8228A1B8;     // the float the list places it from
 constexpr uint32_t kValueRoom = 24;
 // A row is drawn where its slot's frame in the list's layout is; each of its
 // sprites (label, choice mark, choices, the strokes between them) is placed
@@ -1232,7 +1380,7 @@ uint32_t g_category = 0;       // the category shown
 bool g_inPage = false;         // the cursor is in its settings (else on the categories)
 uint32_t g_gameRows[kGameRows] = {};
 bool g_inGameOurs = false;      // our settings are in the list
-uint32_t g_suppress = 0;        // directions (bit per sub_823E3448 direction) and Confirm (bit 4)
+uint32_t g_suppress = 0;        // directions (bit per sub_823E37F0 direction) and Confirm (bit 4)
 
 uint32_t ArenaAlloc(uint32_t size) {
   size = (size + 15) & ~15u;
@@ -1264,11 +1412,11 @@ void SetGuestText(uint32_t at, std::u16string_view text) {
 
 }  // namespace
 
-REX_EXTERN(__imp__sub_83810258);  // XMemAlloc(size, attributes)
-REX_EXTERN(__imp__sub_8366E078);  // a choice row's constructor
-REX_EXTERN(__imp__sub_8366FCA0);  // a choice row's setup: (row, label id, ids, count, reversed)
-REX_EXTERN(__imp__sub_8366E238);  // a row's value: (row, value)
-REX_EXTERN(__imp__sub_8366F158);  // an event to a view: (view, event, model)
+REX_EXTERN(__imp__sub_83835940);  // XMemAlloc(size, attributes)
+REX_EXTERN(__imp__sub_836912D8);  // a choice row's constructor
+REX_EXTERN(__imp__sub_83693080);  // a choice row's setup: (row, label id, ids, count, reversed)
+REX_EXTERN(__imp__sub_83691498);  // a row's value: (row, value)
+REX_EXTERN(__imp__sub_83692538);  // an event to a view: (view, event, model)
 
 namespace {
 
@@ -1303,13 +1451,13 @@ void InitRow(PPCContext& ctx, uint8_t* base, uint32_t row, uint32_t index, bool 
 void MakeLabelRow(PPCContext& ctx, uint8_t* base, uint32_t row) {
   std::memset(ng2::guest::Virtual(row), 0, kLabelRowSize);
   Store32(row, kLabelRowVtable);
-  CallGuest(ctx, base, __imp__sub_836DFDE0, {row + 0x20});
-  CallGuest(ctx, base, __imp__sub_823E41F0, {row + 0xB0});
+  CallGuest(ctx, base, __imp__sub_837045E0, {row + 0x20});
+  CallGuest(ctx, base, __imp__sub_8242BF80, {row + 0xB0});
   Store32(row + 0x110, 1);
 }
 
 std::u16string ValueText(const Setting& setting) {
-  return std::u16string(setting.choices[std::min(ValueOf(setting), setting.count - 1)]);
+  return std::u16string(Choice(setting, ValueOf(setting)));
 }
 
 // Shown as "< value >", as the title shows it in an arrow list.
@@ -1339,8 +1487,11 @@ bool MakeInGameRowsOnce(PPCContext& ctx, uint8_t* base) {
   if (g_arena) {
     return true;
   }
-  constexpr uint32_t kSize = 0x8000;
-  uint32_t arena = CallGuest(ctx, base, __imp__sub_83810258, {kSize, kGuestAlloc});
+  // The rows, then their texts (0x2000 is plenty for the labels and values).
+  constexpr uint32_t kRowsSize = (2 + kPageCount + kEmptyRows) * kLabelRowSize +
+                                 uint32_t(std::size(kSettings)) * kChoiceRowSize;
+  constexpr uint32_t kSize = (kRowsSize + 0x2000 + 0xFFF) & ~0xFFFu;
+  uint32_t arena = CallGuest(ctx, base, __imp__sub_83835940, {kSize, kGuestAlloc});
   if (!arena) {
     return false;
   }
@@ -1375,7 +1526,8 @@ bool MakeInGameRowsOnce(PPCContext& ctx, uint8_t* base) {
       }
     }
   }
-  if (!g_valueText[5] || !g_labelText[std::size(kSettings) - 1]) {
+  if (!g_valueText[5] || !g_labelText[std::size(kSettings) - 1] ||
+      (IsListSetting(std::size(kSettings) - 1) && !g_valueText[std::size(kSettings) - 1])) {
     REXLOG_WARN("recomp settings: no room for the in-game rows");
     return false;
   }
@@ -1391,7 +1543,7 @@ bool MakeInGameRowsOnce(PPCContext& ctx, uint8_t* base) {
     MakeLabelRow(ctx, base, row);
   }
   for (uint32_t row : g_settingRows) {
-    CallGuest(ctx, base, __imp__sub_8366E078, {row});
+    CallGuest(ctx, base, __imp__sub_836912D8, {row});
   }
   return true;
 }
@@ -1402,7 +1554,7 @@ void SetUpSettingRow(PPCContext& ctx, uint8_t* base, uint32_t setting, uint32_t 
   uint32_t row = g_settingRows[setting];
   InitRow(ctx, base, row, slot);
   bool one = g_valueText[setting] != 0;
-  CallGuest(ctx, base, __imp__sub_8366FCA0, {row, kAnyText, g_ids, one ? 1u : that.count, 0});
+  CallGuest(ctx, base, __imp__sub_83693080, {row, kAnyText, g_ids, one ? 1u : that.count, 0});
   Store32(row + kRowLabel, g_labelText[setting]);
   if (one) {
     SetGuestText(g_valueText[setting], ArrowText(that));
@@ -1441,7 +1593,7 @@ void SetUpPageEnd(PPCContext& ctx, uint8_t* base, uint32_t restoreSlot) {
 bool g_inGameShownOrder = false;  // the game's rows placed with ours among them
 
 void SendCursorEvent(PPCContext& ctx, uint8_t* base, uint32_t view) {
-  CallGuest(ctx, base, __imp__sub_8366F158, {view, 2, kInGameModel});
+  CallGuest(ctx, base, __imp__sub_83692538, {view, 2, kInGameModel});
 }
 
 // Tells the list's views the cursor moved (as the game's handler does).
@@ -1465,7 +1617,7 @@ void PushValues(PPCContext& ctx, uint8_t* base) {
     if (g_valueText[i]) {
       SetGuestText(g_valueText[i], ArrowText(kSettings[i]));
     }
-    CallGuest(ctx, base, __imp__sub_8366E238,
+    CallGuest(ctx, base, __imp__sub_83691498,
               {kFirstPageRow + j, g_valueText[i] ? 0 : ValueOf(kSettings[i])});
   }
 }
@@ -1508,7 +1660,7 @@ void PlaceGameRows(PPCContext& ctx, uint8_t* base) {
 
 }  // namespace
 
-REX_EXTERN(__imp__sub_83672AF8);  // the list's event 1, to all its rows: (list, model)
+REX_EXTERN(__imp__sub_836959C0);  // the list's event 1, to all its rows: (list, model)
 
 namespace {
 
@@ -1575,12 +1727,12 @@ void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours, uint32_t category
   // Event 1 (as the list's rows get when it opens), to ours only: the
   // list's own sends it to its view too, which closes the menu.
   for (uint32_t i = categoriesShown ? kFirstPageRow : 0; i < kGameRows; i++) {
-    CallGuest(ctx, base, __imp__sub_8366F158, {rows[i], 1, kInGameModel});
+    CallGuest(ctx, base, __imp__sub_83692538, {rows[i], 1, kInGameModel});
   }
   // A row shows a value once it changes: the slots may hold another
   // page's, so each is changed twice.
   for (uint32_t j = 0; j < page.count; j++) {
-    CallGuest(ctx, base, __imp__sub_8366E238, {kFirstPageRow + j, 0xFF});
+    CallGuest(ctx, base, __imp__sub_83691498, {kFirstPageRow + j, 0xFF});
   }
   PushValues(ctx, base);
 }
@@ -1601,10 +1753,10 @@ void LeaveInGameRows(PPCContext& ctx, uint8_t* base) {
 }  // namespace
 
 // The list's builder, run as it first opens: our row after its twelve.
-REX_EXTERN(__imp__sub_836722A8);
-REX_HOOK_RAW(sub_836722A8) {
+REX_EXTERN(__imp__sub_83695478);
+REX_HOOK_RAW(sub_83695478) {
   uint32_t list = ctx.r3.u32;
-  __imp__sub_836722A8(ctx, base);
+  __imp__sub_83695478(ctx, base);
   if (g_inGameOurs && !g_written.empty() && !g_configPath.empty()) {
     SaveSettings();  // the list was made again while ours was shown
     g_written.clear();
@@ -1626,11 +1778,11 @@ REX_HOOK_RAW(sub_836722A8) {
 // A choice row's update: the choice mark of ours, placed again whenever the
 // game places it, goes with the row; "< value >" rows have none, as the
 // title's arrow lists.
-REX_EXTERN(__imp__sub_8366F5A8);
-REX_HOOK_RAW(sub_8366F5A8) {
+REX_EXTERN(__imp__sub_83692988);
+REX_HOOK_RAW(sub_83692988) {
   uint32_t row = ctx.r3.u32;
   uint32_t state = ng2::guest::Load32(row + 4);
-  __imp__sub_8366F5A8(ctx, base);
+  __imp__sub_83692988(ctx, base);
   if (!g_inGameOurs || (state != 1 && state != 3)) {
     return;
   }
@@ -1646,19 +1798,19 @@ REX_HOOK_RAW(sub_8366F5A8) {
 }
 
 // The list's methods over its rows: ours too.
-REX_EXTERN(__imp__sub_83672908);
-REX_HOOK_RAW(sub_83672908) {  // reset
+REX_EXTERN(__imp__sub_836957D0);
+REX_HOOK_RAW(sub_836957D0) {  // reset
   uint32_t list = ctx.r3.u32;
-  __imp__sub_83672908(ctx, base);
+  __imp__sub_836957D0(ctx, base);
   if (list == g_list && !g_inGameOurs) {
     uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
     CallAt(ctx, base, Method(row, 1), {row});
   }
 }
-REX_EXTERN(__imp__sub_83672960);
-REX_HOOK_RAW(sub_83672960) {  // update
+REX_EXTERN(__imp__sub_83695828);
+REX_HOOK_RAW(sub_83695828) {  // update
   uint32_t list = ctx.r3.u32;
-  __imp__sub_83672960(ctx, base);
+  __imp__sub_83695828(ctx, base);
   if (list != g_list) {
     return;
   }
@@ -1674,19 +1826,19 @@ REX_HOOK_RAW(sub_83672960) {  // update
   StoreFloat(list + kCursorMark + kMarkX, origin + (g_inPage ? kPageColumn : 0.0f));
   StoreFloat(list + kCursorMark + kMarkY, std::floor(origin + float(line) * height));
 }
-REX_HOOK_RAW(sub_83672AF8) {  // event 1 to every row
+REX_HOOK_RAW(sub_836959C0) {  // event 1 to every row
   uint32_t list = ctx.r3.u32, model = ctx.r4.u32;
-  __imp__sub_83672AF8(ctx, base);
+  __imp__sub_836959C0(ctx, base);
   if (list == g_list && !g_inGameOurs) {
     uint32_t row = ng2::guest::Load32(g_list + kRowsAt + 4 * kGameRows);
-    CallGuest(ctx, base, __imp__sub_8366F158, {row, 1, model});
+    CallGuest(ctx, base, __imp__sub_83692538, {row, 1, model});
   }
 }
-REX_EXTERN(__imp__sub_83672A40);
-REX_HOOK_RAW(sub_83672A40) {  // draw: the rows one under another
+REX_EXTERN(__imp__sub_83695908);
+REX_HOOK_RAW(sub_83695908) {  // draw: the rows one under another
   uint32_t list = ctx.r3.u32;
   uint64_t layer = ctx.r4.u64, position = ctx.r5.u64;
-  __imp__sub_83672A40(ctx, base);
+  __imp__sub_83695908(ctx, base);
   if (list == g_list && !g_inGameOurs) {
     uint32_t bits = uint32_t(position);
     float y;
@@ -1702,29 +1854,29 @@ REX_HOOK_RAW(sub_83672A40) {  // draw: the rows one under another
 }
 
 // Pad queries held back from the game's handler while ours acts.
-REX_HOOK_RAW(sub_823E3448) {
+REX_HOOK_RAW(sub_823E37F0) {
   if (g_suppress & (1u << ctx.r7.u32)) {
     ctx.r3.u64 = 0;
     return;
   }
-  __imp__sub_823E3448(ctx, base);
+  __imp__sub_823E37F0(ctx, base);
 }
-REX_HOOK_RAW(sub_823E3D78) {
+REX_HOOK_RAW(sub_823E4120) {
   if (g_suppress & 0x10) {
     ctx.r3.u64 = 0;
     return;
   }
-  __imp__sub_823E3D78(ctx, base);
+  __imp__sub_823E4120(ctx, base);
 }
 
 // The list's handler: moves onto and off our row, and our settings while
 // they're shown.
-REX_EXTERN(__imp__sub_823E84F8);
-REX_HOOK_RAW(sub_823E84F8) {
+REX_EXTERN(__imp__sub_823E86E8);
+REX_HOOK_RAW(sub_823E86E8) {
   using ng2::guest::Load32;
   uint32_t state = Load32(kInGameState);
   if (!g_list || state != 0) {
-    __imp__sub_823E84F8(ctx, base);
+    __imp__sub_823E86E8(ctx, base);
     return;
   }
   uint32_t cursorAddress = kInGameCursors;
@@ -1732,17 +1884,17 @@ REX_HOOK_RAW(sub_823E84F8) {
   uint32_t pad = Load32(kPadState);
   uint32_t player = *ng2::guest::Virtual(kPlayerPad);
   auto pressed = [&](uint32_t direction) {
-    return CallGuest(ctx, base, __imp__sub_823E3448, {pad, player, 1, 0, direction}) != 0;
+    return CallGuest(ctx, base, __imp__sub_823E37F0, {pad, player, 1, 0, direction}) != 0;
   };
   double sound = LoadFloat(kCursorSound);
 
   if (g_inGameOurs) {
-    bool back = CallGuest(ctx, base, __imp__sub_823E3ED0, {kPadState, cursor, 0xFF, 0}) != 0;
+    bool back = CallGuest(ctx, base, __imp__sub_823E4278, {kPadState, cursor, 0xFF, 0}) != 0;
     if (!g_inPage) {
       // The categories: up and down show one's page, Confirm or right go
       // into it, Back leaves.
       if (back) {
-        CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+        CallGuest(ctx, base, __imp__sub_8242AF00, {2}, sound);
         LeaveInGameRows(ctx, base);
         return;
       }
@@ -1754,17 +1906,17 @@ REX_HOOK_RAW(sub_823E84F8) {
         category = (category + 1) % kPageCount;
       }
       if (category != g_category) {
-        CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+        CallGuest(ctx, base, __imp__sub_8242AF00, {2}, sound);
         ShowInGameRows(ctx, base, true, category, true);
       }
       cursor = g_category;
-      if (pressed(2) || CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
-        CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+      if (pressed(2) || CallGuest(ctx, base, __imp__sub_823E4120, {kPadState, cursor, 0, 0})) {
+        CallGuest(ctx, base, __imp__sub_8242AF00, {2}, sound);
         g_inPage = true;
         cursor = kFirstPageRow;
       }
     } else if (back) {
-      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+      CallGuest(ctx, base, __imp__sub_8242AF00, {2}, sound);
       g_inPage = false;
       cursor = g_category;
     } else {
@@ -1781,13 +1933,13 @@ REX_HOOK_RAW(sub_823E84F8) {
         moved = (moved + 1) % rowCount;
       }
       if (moved != row) {
-        CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+        CallGuest(ctx, base, __imp__sub_8242AF00, {2}, sound);
         row = moved;
       }
       cursor = kFirstPageRow + row;
       if (row == page.count) {
-        if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
-          CallGuest(ctx, base, __imp__sub_82429DA8, {3}, sound);
+        if (CallGuest(ctx, base, __imp__sub_823E4120, {kPadState, cursor, 0, 0})) {
+          CallGuest(ctx, base, __imp__sub_8242AF00, {3}, sound);
           for (uint32_t i = 0; i < page.count; i++) {
             RestoreDefault(kSettings[page.rows[i].setting]);
           }
@@ -1802,9 +1954,9 @@ REX_HOOK_RAW(sub_823E84F8) {
           changed = (changed + 1) % setting.count;
         }
         if (changed != value) {
-          CallGuest(ctx, base, __imp__sub_82429DA8, {3}, sound);
+          CallGuest(ctx, base, __imp__sub_8242AF00, {3}, sound);
           SetValue(setting, changed);
-        } else if (CallGuest(ctx, base, __imp__sub_823E3FD0, {kPadState})) {
+        } else if (CallGuest(ctx, base, __imp__sub_823E4378, {kPadState})) {
           RestoreDefault(setting);
         }
       }
@@ -1830,15 +1982,15 @@ REX_HOOK_RAW(sub_823E84F8) {
   }
   uint32_t to = ToGameIndex(toShown);
   if (to != cursor) {
-    CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+    CallGuest(ctx, base, __imp__sub_8242AF00, {2}, sound);
     Store32(cursorAddress, to);
     cursor = to;
     g_suppress |= 0x3;  // the game's handler doesn't move it again
   }
   if (cursor == kEntryIndex) {
     g_suppress |= 0xC;  // no left and right either
-    if (CallGuest(ctx, base, __imp__sub_823E3D78, {kPadState, cursor, 0, 0})) {
-      CallGuest(ctx, base, __imp__sub_82429DA8, {2}, sound);
+    if (CallGuest(ctx, base, __imp__sub_823E4120, {kPadState, cursor, 0, 0})) {
+      CallGuest(ctx, base, __imp__sub_8242AF00, {2}, sound);
       g_inPage = false;
       ShowInGameRows(ctx, base, true, 0);
       Store32(cursorAddress, 0);
@@ -1848,21 +2000,24 @@ REX_HOOK_RAW(sub_823E84F8) {
     }
     g_suppress |= 0x10;  // the game's own Confirm reads past its rows
   }
-  __imp__sub_823E84F8(ctx, base);
+  __imp__sub_823E86E8(ctx, base);
   g_suppress = 0;
 }
 
 
-// The list's cursor event, as the game's (sub_83672BE8) but for rows
+// The list's cursor event, as the game's (sub_83695AB0) but for rows
 // placed in the order shown: the rows to light and unlight are found by
 // the handler's indices, and they compare the cursor with their own index
 // (their place), so they get the cursors in the order shown; the cursor
 // mark's slot (+0x4EC0) is the shown place too.
-REX_EXTERN(__imp__sub_83672BE8);
-REX_HOOK_RAW(sub_83672BE8) {
+REX_EXTERN(__imp__sub_83695AB0);
+REX_HOOK_RAW(sub_83695AB0) {
   uint32_t list = ctx.r3.u32, model = ctx.r4.u32;
-  if (list != g_list || !g_inGameShownOrder || g_inGameOurs) {
-    __imp__sub_83672BE8(ctx, base);
+  // A dialog over the list (Quit Game's Yes / No) moves its own cursor
+  // through the same event: the game's.
+  if (list != g_list || !g_inGameShownOrder || g_inGameOurs ||
+      ng2::guest::Load32(kInGameState) != 0) {
+    __imp__sub_83695AB0(ctx, base);
     return;
   }
   using ng2::guest::Load32;
@@ -1870,12 +2025,31 @@ REX_HOOK_RAW(sub_83672BE8) {
   Store32(model, ToShown(cursor));
   Store32(model + 4, int32_t(last) >= 0 ? ToShown(last) : last);
   if (int32_t(last) >= 0) {
-    CallGuest(ctx, base, __imp__sub_8366F158,
+    CallGuest(ctx, base, __imp__sub_83692538,
               {Load32(list + kRowsAt + 4 * last), 2, model});
   }
-  CallGuest(ctx, base, __imp__sub_8366F158, {Load32(list + kRowsAt + 4 * cursor), 2, model});
+  CallGuest(ctx, base, __imp__sub_83692538, {Load32(list + kRowsAt + 4 * cursor), 2, model});
   Store32(model, cursor);
   Store32(model + 4, last);
   Store32(list + kCursorMarkSlot, ToShown(cursor));
   ctx.r3.u64 = 1;
+}
+
+// Quit Game's value (its Yes / No): the row reads it from the model at
+// 8 * (its index + 1), and its index is its shown place, one past the slot
+// the game writes it to; it's read from the game's slot instead.
+REX_EXTERN(__imp__sub_83694370);
+REX_HOOK_RAW(sub_83694370) {
+  constexpr uint32_t kQuitGameIndex = 10;
+  uint32_t row = ctx.r3.u32, model = ctx.r4.u32;
+  uint32_t index = ng2::guest::Load32(row + 8);
+  bool moved = g_inGameShownOrder && !g_inGameOurs && model == kInGameModel &&
+               index == ToShown(kQuitGameIndex);
+  if (moved) {
+    Store32(row + 8, kQuitGameIndex);
+  }
+  __imp__sub_83694370(ctx, base);
+  if (moved) {
+    Store32(row + 8, index);
+  }
 }

@@ -28,7 +28,7 @@ mkdir -p "$app/usr/bin"
 cp "$build/ng2" "$build/librexruntime.so" "$build/librexgpu-xenos.so" "$app/usr/bin/"
 [ -f "$build/libTracyClient.so" ] && cp "$build/libTracyClient.so" "$app/usr/bin/"
 strip --strip-unneeded "$app/usr/bin/"*
-cp "$repo/tools/xdvdfs_extract.py" "$app/usr/bin/"
+cp "$repo/tools/xdvdfs_extract.py" "$repo/tools/stfs_extract.py" "$app/usr/bin/"
 cp "$here/AppRun" "$app/AppRun"
 chmod +x "$app/AppRun"
 cp "$here/ng2.desktop" "$app/"

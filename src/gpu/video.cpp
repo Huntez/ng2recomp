@@ -11,6 +11,7 @@
 // guest address, which is also how Swap finds the front buffer.
 
 #include "video.h"
+#include "../aspect.h"
 
 #include <atomic>
 #include <bit>
@@ -50,6 +51,7 @@
 #include "guest.h"
 #include "menu_label.h"
 #include "shader_cache.h"
+
 
 extern const uint8_t g_fullscreen_vs[];
 extern const size_t g_fullscreen_vs_size;
@@ -3128,13 +3130,13 @@ void Present(HostTexture* frontBuffer) {
     commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
 
     if (frontBuffer && frontBuffer->descriptor) {
-      // Fit the guest picture into the window, keeping its aspect ratio.
+      // Fit the guest picture into the window at the chosen aspect ratio
+      // (src/aspect.cpp: the game draws for it, into its 16:9 targets).
       float windowWidth = float(g_swapChain->getWidth());
       float windowHeight = float(g_swapChain->getHeight());
-      float scale = std::min(windowWidth / float(frontBuffer->width),
-                             windowHeight / float(frontBuffer->height));
-      float width = std::floor(float(frontBuffer->width) * scale);
-      float height = std::floor(float(frontBuffer->height) * scale);
+      float aspect = ng2::aspect::Aspect();
+      float width = std::floor(std::min(windowWidth, windowHeight * aspect));
+      float height = std::floor(std::min(windowHeight, windowWidth / aspect));
       RenderViewport viewport((windowWidth - width) / 2, (windowHeight - height) / 2, width,
                               height);
       RenderRect scissor(0, 0, int32_t(windowWidth), int32_t(windowHeight));

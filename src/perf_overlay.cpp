@@ -34,18 +34,18 @@ constexpr uint32_t kText = 0xC4;        // the part's UTF-16 string
 constexpr uint32_t kTextScale = 0xC8;   // x, y
 constexpr uint32_t kTextPosition = 0xD0;  // x, y
 constexpr uint32_t kTextChars = 32;
-constexpr uint32_t kMenuFontSize = 0x1C;  // as the Options rows ask sub_836A9EB0
+constexpr uint32_t kMenuFontSize = 0x1C;  // as the Options rows ask sub_83692368
 // From the frame's anchor (about 953, 650 in the 1280x720 UI) to the top
 // left corner (left edge, line center).
 constexpr float kX = 32.0f - 953.0f, kY = 16.0f - 650.0f;
-constexpr uint32_t kLayer = 0x15;
+constexpr uint32_t kLayer = 0x15;  // aspect.cpp keeps this layer's text in the top left corner
 constexpr uint32_t kAllocAttributes = 0xB2800000;
 // A text frame like the one the Options pages' arrow lists show their value
 // in (UI package 0x78's resource 0x2A), from package 0, which is always
 // loaded: resource 0xA.
-constexpr uint32_t kPackages = 0x85309E08;  // 8 bytes per id, +4 the loaded package
+constexpr uint32_t kPackages = 0x85324808;  // 8 bytes per id, +4 the loaded package
 constexpr uint32_t kTextPackage = 0, kTextFrame = 0xA;
-constexpr uint32_t kTextColor = 0x853552C0;  // a focused row's (16 bytes)
+constexpr uint32_t kTextColor = 0x85371760;  // a focused row's (16 bytes)
 
 uint32_t g_item = 0;  // 0 until made
 uint32_t g_resource = 0;  // the item sprite's
@@ -85,25 +85,25 @@ uint32_t CallGuest(PPCContext& ctx, uint8_t* base, void (*function)(PPCContext&,
 
 }  // namespace
 
-REX_EXTERN(__imp__sub_83810258);  // XMemAlloc(size, attributes)
-REX_EXTERN(__imp__sub_836DFDE0);  // a sprite's constructor
-REX_EXTERN(__imp__sub_823E41F0);  // a text part's constructor
-REX_EXTERN(__imp__sub_836A9EB0);  // the menu font's scale for a size -> f1
-REX_EXTERN(__imp__sub_8366E8B8);  // a text item into this frame's 2D lists: (item, layer)
-REX_EXTERN(__imp__sub_836DFF90);  // a sprite's resource: (sprite, resource)
-REX_EXTERN(__imp__sub_836E0128);  // a sprite's update
+REX_EXTERN(__imp__sub_83835940);  // XMemAlloc(size, attributes)
+REX_EXTERN(__imp__sub_837045E0);  // a sprite's constructor
+REX_EXTERN(__imp__sub_8242BF80);  // a text part's constructor
+REX_EXTERN(__imp__sub_83692368);  // the menu font's scale for a size -> f1
+REX_EXTERN(__imp__sub_83691B18);  // a text item into this frame's 2D lists: (item, layer)
+REX_EXTERN(__imp__sub_83704790);  // a sprite's resource: (sprite, resource)
+REX_EXTERN(__imp__sub_83704928);  // a sprite's update
 
 namespace {
 
 bool MakeItem(PPCContext& ctx, uint8_t* base) {
-  uint32_t item = CallGuest(ctx, base, __imp__sub_83810258,
+  uint32_t item = CallGuest(ctx, base, __imp__sub_83835940,
                             {kItemSize + kTextChars * 2, kAllocAttributes});
   if (!item) {
     return false;
   }
   std::memset(ng2::guest::Virtual(item), 0, kItemSize + kTextChars * 2);
-  CallGuest(ctx, base, __imp__sub_836DFDE0, {item});
-  CallGuest(ctx, base, __imp__sub_823E41F0, {item + kTextPart});
+  CallGuest(ctx, base, __imp__sub_837045E0, {item});
+  CallGuest(ctx, base, __imp__sub_8242BF80, {item + kTextPart});
   Store32(item + kText, item + kItemSize);
   // Left aligned and centered on its line; +0xF0: placed by its measured size
   // (as the lists' value text is).
@@ -185,17 +185,17 @@ REX_HOOK_RAW(sub_822F0EF8) {
   }
   if (resource != g_resource) {
     g_resource = resource;
-    CallGuest(ctx, base, __imp__sub_836DFF90, {g_item, resource});
+    CallGuest(ctx, base, __imp__sub_83704790, {g_item, resource});
   }
   // The menu font's scale, once its font is loaded.
   double scale = 0.0;
-  CallGuest(ctx, base, __imp__sub_836A9EB0, {kMenuFontSize}, &scale);
+  CallGuest(ctx, base, __imp__sub_83692368, {kMenuFontSize}, &scale);
   if (!std::isfinite(scale) || scale <= 0.0) {
     return;
   }
   StoreFloat(g_item + kTextScale, float(scale));
   StoreFloat(g_item + kTextScale + 4, float(scale));
   std::memcpy(ng2::guest::Virtual(g_item + 0x40), ng2::guest::Virtual(kTextColor), 16);
-  CallGuest(ctx, base, __imp__sub_836E0128, {g_item});
-  CallGuest(ctx, base, __imp__sub_8366E8B8, {g_item, kLayer});
+  CallGuest(ctx, base, __imp__sub_83704928, {g_item});
+  CallGuest(ctx, base, __imp__sub_83691B18, {g_item, kLayer});
 }

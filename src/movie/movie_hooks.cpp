@@ -18,10 +18,10 @@
 //     S_OK, or 0x16660026 once the movie has ended
 //   +80 render(player, 0, 0): draw the frame to the screen (full-screen
 //     movies)
-//   +112 status via 83862980(player, out): out[0] < 6 playing
+//   +112 status via 83888070(player, out): out[0] < 6 playing
 //   +120 audio(player, &voice): the game sets voice+140 to the volume and
 //     calls voice->vtbl[+92]
-//   +8 release, +96 stop, +92 and 83862888 at the start of full-screen
+//   +8 release, +96 stop, +92 and 83887F88 at the start of full-screen
 //     movies
 //
 // The original player also allocates physical memory for its frames when
@@ -53,9 +53,10 @@
 #include "../gpu/guest.h"
 #include "host_movie.h"
 #include "movie.h"
+#include "../gameplay.h"
 
-REX_EXTERN(__imp__sub_83810258);  // XMemAlloc(size, attributes)
-REX_EXTERN(__imp__sub_838102F0);  // XMemFree(address, attributes)
+REX_EXTERN(__imp__sub_83835940);  // XMemAlloc(size, attributes)
+REX_EXTERN(__imp__sub_838359D8);  // XMemFree(address, attributes)
 
 namespace {
 
@@ -67,7 +68,7 @@ constexpr uint32_t kEndOfMovie = 0x16660026;
 constexpr uint32_t kFail = 0x80004005;  // E_FAIL
 // A guest function that returns 0 (li r3,0; blr): every slot of the
 // stand-in audio voice's vtable.
-constexpr uint32_t kReturnZero = 0x837C1A60;
+constexpr uint32_t kReturnZero = 0x836A3860;
 constexpr uint32_t kVoiceVtableSlots = 64;
 constexpr uint32_t kVoiceSize = 256;
 constexpr uint32_t kObjectSize = 64;
@@ -114,6 +115,7 @@ struct Player {
   uint32_t voice = 0;                             // guest stand-in audio voice
   std::vector<std::pair<uint32_t, uint32_t>> reserved;  // (address, attributes)
   bool reportedEnd = false;
+  bool blanked = false;  // its planes cleared to black
 };
 
 std::mutex g_mutex;
@@ -179,7 +181,7 @@ void ReservePhysical(PPCContext& ctx, uint8_t* base, Player& player, int width, 
     blocks.push_back({chromaSize, 0xBC800000});
   }
   for (auto [size, attributes] : blocks) {
-    uint32_t address = CallGuest(ctx, base, __imp__sub_83810258, size, attributes);
+    uint32_t address = CallGuest(ctx, base, __imp__sub_83835940, size, attributes);
     if (address) {
       player.reserved.push_back({address, attributes});
     }
@@ -188,7 +190,7 @@ void ReservePhysical(PPCContext& ctx, uint8_t* base, Player& player, int width, 
 
 void FreeReserved(PPCContext& ctx, uint8_t* base, Player& player) {
   for (auto it = player.reserved.rbegin(); it != player.reserved.rend(); ++it) {
-    CallGuest(ctx, base, __imp__sub_838102F0, it->first, it->second);
+    CallGuest(ctx, base, __imp__sub_838359D8, it->first, it->second);
   }
   player.reserved.clear();
 }
@@ -234,17 +236,27 @@ void SetGameDataRoot(const std::filesystem::path& root) {
   g_gameDataRoot = root;
 }
 
+bool AnyPlaying() {
+  std::lock_guard lock(g_mutex);
+  for (const auto& [object, player] : g_players) {
+    if (player.movie && !player.reportedEnd) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace ng2::movie
 
 // XMedia2CreateXmvPlayer(device, parameters, &player)
-REX_EXTERN(__imp__sub_83862EB8);
-REX_HOOK_RAW(sub_83862EB8) {
+REX_EXTERN(__imp__sub_838885A8);
+REX_HOOK_RAW(sub_838885A8) {
   uint32_t params = ctx.r4.u32, out = ctx.r5.u32;
   uint32_t pathAddress = Load32(params) == 1 ? Load32(params + 32) : 0;
   const char* path = pathAddress ? reinterpret_cast<const char*>(Virtual(pathAddress)) : "";
   // Only movies from files are replaced.
   if (!HostMovies() || !pathAddress) {
-    __imp__sub_83862EB8(ctx, base);
+    __imp__sub_838885A8(ctx, base);
     if (TraceEnabled()) {
       REXLOG_INFO("movie: create '{}' -> {:#x} player {:#x}", path, ctx.r3.u32, Load32(out));
     }
@@ -258,7 +270,18 @@ REX_HOOK_RAW(sub_83862EB8) {
   std::memset(Virtual(object), 0, kObjectSize);
   Player player;
   std::filesystem::path hostPath = HostPath(path);
-  if (hostPath.empty()) {
+  // Skip Intro: the boot movie's three streams (NinjaVI, _Left, _Right),
+  // the first time each opens, aren't opened: they end at their first frame.
+  static std::vector<std::string> introOpened;
+  std::string name = hostPath.filename().string();
+  bool intro = name.starts_with("NinjaVI") &&
+               std::find(introOpened.begin(), introOpened.end(), name) == introOpened.end();
+  if (intro) {
+    introOpened.push_back(name);
+  }
+  if (intro && ng2::gameplay::SkipIntro()) {
+    REXLOG_INFO("movie: '{}' skipped (Skip Intro)", path);
+  } else if (hostPath.empty()) {
     REXLOG_ERROR("movie: '{}' not found", path);
   } else {
     player.movie = ng2::movie::HostMovie::Open(hostPath, Load32(params + 24) != 0xFFFFFFFF,
@@ -278,13 +301,24 @@ REX_HOOK_RAW(sub_83862EB8) {
 }
 
 // +72: the frame due now into the caller's Y/U/V planes
-REX_EXTERN(__imp__sub_83680E48);
-REX_HOOK_RAW(sub_83680E48) {
+REX_EXTERN(__imp__sub_83887F68);
+REX_HOOK_RAW(sub_83887F68) {
   uint32_t object = ctx.r3.u32, desc = ctx.r4.u32;
   {
     std::lock_guard lock(g_mutex);
     if (Player* player = Find(object)) {
       bool playing = false;
+      // Black until the first frame (the game's textures start zeroed,
+      // which is green in YUV): a movie skipped at once, or not opened.
+      if (!player->blanked) {
+        player->blanked = true;
+        for (int p = 0; p < 3; p++) {
+          uint32_t address = Load32(desc + 12 + p * 4);
+          if (address) {
+            std::memset(Virtual(address), p == 0 ? 16 : 128, Load32(desc + 24 + p * 4));
+          }
+        }
+      }
       if (player->movie) {
         ng2::movie::HostMovie::Planes planes;
         for (int p = 0; p < 3; p++) {
@@ -298,21 +332,23 @@ REX_HOOK_RAW(sub_83680E48) {
           player->movie->SetVolume(LoadFloat(player->voice + 140));
         }
       }
-      if (!playing && TraceEnabled() && !player->reportedEnd) {
+      if (!playing && !player->reportedEnd) {
         player->reportedEnd = true;
-        REXLOG_INFO("movie: {:#x} ended", object);
+        if (TraceEnabled()) {
+          REXLOG_INFO("movie: {:#x} ended", object);
+        }
       }
       ctx.r3.u64 = playing ? 0 : kEndOfMovie;
       return;
     }
   }
-  __imp__sub_83680E48(ctx, base);
+  __imp__sub_83887F68(ctx, base);
 }
 
 // +80: draw the frame to the screen. Not drawn yet, but the movie still
 // runs (time, audio) and ends, which is what ends it for the game.
-REX_EXTERN(__imp__sub_83680E58);
-REX_HOOK_RAW(sub_83680E58) {
+REX_EXTERN(__imp__sub_83887F78);
+REX_HOOK_RAW(sub_83887F78) {
   {
     std::lock_guard lock(g_mutex);
     if (Player* player = Find(ctx.r3.u32)) {
@@ -333,12 +369,12 @@ REX_HOOK_RAW(sub_83680E58) {
       return;
     }
   }
-  __imp__sub_83680E58(ctx, base);
+  __imp__sub_83887F78(ctx, base);
 }
 
 // status(player, out): out[0] = state (6 and up: finished), out[1]
-REX_EXTERN(__imp__sub_83862980);
-REX_HOOK_RAW(sub_83862980) {
+REX_EXTERN(__imp__sub_83888070);
+REX_HOOK_RAW(sub_83888070) {
   uint32_t object = ctx.r3.u32, out = ctx.r4.u32;
   {
     std::lock_guard lock(g_mutex);
@@ -350,12 +386,12 @@ REX_HOOK_RAW(sub_83862980) {
       return;
     }
   }
-  __imp__sub_83862980(ctx, base);
+  __imp__sub_83888070(ctx, base);
 }
 
 // +120: the movie's audio voice
-REX_EXTERN(__imp__sub_83867CB8);
-REX_HOOK_RAW(sub_83867CB8) {
+REX_EXTERN(__imp__sub_8388D3B8);
+REX_HOOK_RAW(sub_8388D3B8) {
   uint32_t object = ctx.r3.u32, out = ctx.r4.u32;
   {
     std::lock_guard lock(g_mutex);
@@ -365,12 +401,12 @@ REX_HOOK_RAW(sub_83867CB8) {
       return;
     }
   }
-  __imp__sub_83867CB8(ctx, base);
+  __imp__sub_8388D3B8(ctx, base);
 }
 
 // +8: release
-REX_EXTERN(__imp__sub_83862878);
-REX_HOOK_RAW(sub_83862878) {
+REX_EXTERN(__imp__sub_83887F58);
+REX_HOOK_RAW(sub_83887F58) {
   uint32_t object = ctx.r3.u32;
   {
     std::optional<Player> player;
@@ -393,10 +429,10 @@ REX_HOOK_RAW(sub_83862878) {
       return;
     }
   }
-  __imp__sub_83862878(ctx, base);
+  __imp__sub_83887F58(ctx, base);
 }
 
-// Methods with nothing to do on the host: +96 stop, +92 and 83862888 (at
+// Methods with nothing to do on the host: +96 stop, +92 and 83887F88 (at
 // the start of full-screen movies).
 #define NG2_PLAYER_NO_OP(addr)                     \
   REX_EXTERN(__imp__sub_##addr);                   \
@@ -411,6 +447,6 @@ REX_HOOK_RAW(sub_83862878) {
     __imp__sub_##addr(ctx, base);                  \
   }
 
-NG2_PLAYER_NO_OP(83862970)
-NG2_PLAYER_NO_OP(83862960)
-NG2_PLAYER_NO_OP(83862888)
+NG2_PLAYER_NO_OP(83888060)
+NG2_PLAYER_NO_OP(83888EE0)
+NG2_PLAYER_NO_OP(83887F88)

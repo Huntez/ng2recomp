@@ -14,6 +14,9 @@
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/xmemory.h>
 
+#include "aspect.h"
+#include "dlc.h"
+#include "gameplay.h"
 #include "gpu/video.h"
 #include "movie/movie.h"
 #include "null_audio.h"
@@ -22,6 +25,11 @@
 
 class Ng2App : public rex::ReXApp {
  public:
+  // Title Update 2's default.xexp (the AppImage also checks its SHA-1).
+  static constexpr uintmax_t kTitleUpdate2Size = 2318336;
+  static constexpr uint32_t kSystemUiNotification = 0x9;  // XN_SYS_UI
+  bool paused_in_background_ = false;
+
   using rex::ReXApp::ReXApp;
 
   static std::unique_ptr<rex::ui::WindowedApp> Create(
@@ -88,6 +96,16 @@ class Ng2App : public rex::ReXApp {
   }
 
   void OnPostSetup() override {
+    // The recompiled code is Title Update 2's. Without the update next to
+    // default.xex the game's data would be 1.0's, which that code misreads.
+    std::error_code ec;
+    if (std::filesystem::file_size(game_data_root() / "default.xexp", ec) != kTitleUpdate2Size) {
+      REXLOG_ERROR("No Title Update 2 default.xexp in {}", game_data_root().string());
+      rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
+                                "Title Update 2 is missing: its default.xexp must be next to "
+                                "default.xex in the game folder.");
+      std::_Exit(1);
+    }
     ng2::movie::SetGameDataRoot(game_data_root());
     if (ng2::video::IsNativeRenderer() && !ng2::video::CreateHostDevice()) {
       REXLOG_ERROR("native renderer: cannot create the Vulkan device");
@@ -101,9 +119,38 @@ class Ng2App : public rex::ReXApp {
     }
   }
 
+  // Pause in Background: the Guide's notification (XN_SYS_UI) pauses the
+  // game while the window isn't focused.
+  void OnWindowFocusChanged(bool focused) override {
+    auto* kernel = runtime() ? runtime()->kernel_state() : nullptr;
+    if (!kernel) {
+      return;
+    }
+    bool pause = !focused && ng2::gameplay::PauseInBackground();
+    if (pause != paused_in_background_) {
+      paused_in_background_ = pause;
+      kernel->BroadcastNotification(kSystemUiNotification, pause ? 1 : 0);
+    }
+  }
+
+  // Downloadable content from the game folder's dlc/ (installed once).
+  void OnPreLaunchModule() override {
+    ng2::dlc::InstallPackages(runtime()->kernel_state(), game_data_root(), user_data_root());
+  }
+
   // NG2_DUMP_IMAGE=<path>: write the loaded (decrypted, decompressed) XEX
   // image for offline analysis, e.g. finding code reached only by pointer.
   void OnPostLoadXexImage() override {
+    // Aspect Ratio (aspect.cpp) writes the game's 16:9 constant, which sits
+    // in read-only image data: its page is made writable.
+    auto* heap = runtime()->memory()->LookupHeap(ng2::aspect::kConstantAddress);
+    if (!heap || !heap->Protect(ng2::aspect::kConstantAddress, 4,
+                                rex::memory::kMemoryProtectRead |
+                                    rex::memory::kMemoryProtectWrite)) {
+      REXLOG_ERROR("aspect ratio: the game's aspect constant can't be made writable");
+    } else {
+      ng2::aspect::SetConstantWritable(true);
+    }
     const char* path = std::getenv("NG2_DUMP_IMAGE");
     if (!path || !*path) {
       return;

@@ -12,4 +12,7 @@ namespace ng2::movie {
 // Where "game:\" movie paths point.
 void SetGameDataRoot(const std::filesystem::path& root);
 
+// A movie is playing on the host player (one that hasn't ended).
+bool AnyPlaying();
+
 }  // namespace ng2::movie
