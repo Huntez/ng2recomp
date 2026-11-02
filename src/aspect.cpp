@@ -111,6 +111,15 @@ struct Box {
   int draws = 0;
 };
 Box g_boxes[kBucketCount];
+// The health bar and ki orbs' extent (buckets 57-61), this frame and last:
+// other HUD pieces drawn within it (the projectile count under the bar)
+// belong to that block.
+float g_leftBlockRight = 0.0f, g_leftBlockBottom = 0.0f;
+float g_lastLeftBlockRight = 0.0f, g_lastLeftBlockBottom = 0.0f;
+// The health bar's bottom: the row under it (ki orbs, the projectile
+// count) is the block's; above, a centred piece stays centred.
+constexpr float kHealthBarBottom = 82.0f;
+
 
 std::chrono::steady_clock::time_point g_boxesLogged;
 bool BucketLog() {
@@ -120,6 +129,10 @@ bool BucketLog() {
 
 void ScanBuckets() {
   g_itemBucket.clear();
+  if (g_leftBlockRight > 0.0f) {  // kept over frames without the HUD
+    g_lastLeftBlockRight = g_leftBlockRight, g_lastLeftBlockBottom = g_leftBlockBottom;
+  }
+  g_leftBlockRight = 0.0f, g_leftBlockBottom = 0.0f;
   uint32_t parity = Load32(kBuckets + 1456) ^ 1;
   uint32_t heads = kBuckets + parity * 728;
   bool hud = false;
@@ -140,9 +153,14 @@ void ScanBuckets() {
 }
 
 
+
 void NotePoint(float x, float y) {
   if (g_drawBucket < 0) {
     return;
+  }
+  if (g_drawBucket >= 57 && g_drawBucket <= 61) {
+    g_leftBlockRight = std::max(g_leftBlockRight, x);
+    g_leftBlockBottom = std::max(g_leftBlockBottom, y);
   }
   if (!BucketLog()) {
     return;
@@ -153,10 +171,12 @@ void NotePoint(float x, float y) {
 }
 
 void NoteQuad(uint32_t vertices, uint32_t stride) {
-  if (g_drawBucket < 0 || !BucketLog()) {
+  if (g_drawBucket < 0) {
     return;
   }
-  g_boxes[g_drawBucket].draws++;
+  if (BucketLog()) {
+    g_boxes[g_drawBucket].draws++;
+  }
   for (uint32_t i = 0; i < 4; i++) {
     NotePoint(LoadFloat(vertices + i * stride), LoadFloat(vertices + i * stride + 4));
   }
@@ -220,7 +240,8 @@ Anchor ItemAnchor(float x, float y) {
     Anchor& a = it->second;
     if (g_drawBucket == kKarmaBucket && y >= 480.0f) {
       a = {0, 1};  // the boss's health bar, drawn with the karma panel: bottom centre
-    } else if (LeftHud(g_drawBucket)) {
+    } else if (LeftHud(g_drawBucket) ||
+               (x <= g_lastLeftBlockRight && y > kHealthBarBottom && y <= g_lastLeftBlockBottom)) {
       a = {-1, -1};
     } else {
       a.x = x < 1280.0f / 3.0f ? -1 : x > 2560.0f / 3.0f ? 1 : 0;
@@ -468,4 +489,52 @@ REX_HOOK_RAW(sub_8368E4F0) {
   SqueezeQuad(vertices, kStride, s);
   __imp__sub_8368E4F0(ctx, base);
   std::memcpy(Virtual(vertices), saved, sizeof(saved));
+}
+
+// A clip item (draw method sub_8369FBA8: it saves the device's scissor and
+// sets one from the item's x, y, width and height at +16..+28; its partner
+// sub_8369FC88 puts the saved one back). The boss's health bar fill is
+// drawn whole and clipped to what is left this way. Its draw is tagged as
+// the others, and the rect it sets (D3D's SetScissorRect(device, RECT*),
+// in the game's 1280x720 pixels) is mapped as the item's pieces are.
+REX_EXTERN(__imp__sub_8369FBA8);
+bool g_inClipItem = false;
+REX_HOOK_RAW(sub_8369FBA8) {
+  g_inClipItem = true;
+  DrawTagged(ctx, base, __imp__sub_8369FBA8);
+  g_inClipItem = false;
+}
+
+REX_EXTERN(__imp__sub_8375C500);
+REX_HOOK_RAW(sub_8375C500) {
+  Squeeze s = CurrentSqueeze();
+  uint32_t rect = ctx.r4.u32;
+  if (!s.active() || !g_inClipItem || !g_drawItem || !rect) {
+    __imp__sub_8375C500(ctx, base);
+    return;
+  }
+  int32_t r[4];
+  for (int i = 0; i < 4; i++) {
+    r[i] = int32_t(Load32(rect + 4 * i));
+  }
+  if (r[0] <= 0 && r[1] <= 0 && r[2] >= 1280 && r[3] >= 720) {
+    __imp__sub_8375C500(ctx, base);  // the whole screen: left as it is
+    return;
+  }
+  Anchor a = ItemAnchor((r[0] + r[2]) * 0.5f, (r[1] + r[3]) * 0.5f);
+  auto at = [](float v) { return std::max(0, int32_t(std::lround(v))); };
+  int32_t mapped[4] = {at(Map(float(r[0]), s.x, a.x, 1280.0f)), at(Map(float(r[1]), s.y, a.y, 720.0f)),
+                       at(Map(float(r[2]), s.x, a.x, 1280.0f)), at(Map(float(r[3]), s.y, a.y, 720.0f))};
+  auto store = [](uint32_t address, int32_t value) {
+    uint8_t* p = Virtual(address);
+    uint32_t v = uint32_t(value);
+    p[0] = uint8_t(v >> 24), p[1] = uint8_t(v >> 16), p[2] = uint8_t(v >> 8), p[3] = uint8_t(v);
+  };
+  for (int i = 0; i < 4; i++) {
+    store(rect + 4 * i, mapped[i]);
+  }
+  __imp__sub_8375C500(ctx, base);
+  for (int i = 0; i < 4; i++) {
+    store(rect + 4 * i, r[i]);
+  }
 }
