@@ -62,16 +62,24 @@ system's libraries, so a recent distribution is safest.
 
 ### Windows
 
-Not yet. The code builds for Windows in principle, but there is no Windows package.
+1. Download `NinjaGaiden2-windows-x64.zip` from a test build and unpack it anywhere.
+2. Run `ng2.exe`. The first time it asks for the folder with your copy of the game (the one with
+   `default.xex`, extracted from your disc) and for Title Update 2 (its package, or its
+   `default.xexp`), which it copies into that folder. DLC goes in a `dlc` folder there, as on Linux.
+
+Needs a GPU with Vulkan 1.3 drivers and the Microsoft Visual C++ 2015-2022 Redistributable (x64,
+[vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe)).
+Disc images aren't read on Windows yet: extract the disc first.
 
 ### Where things are kept
 
-| | Linux |
-|---|---|
-| Extracted game (from a disc image), saves, log (`ng2.log`) | `~/.local/share/ng2-recomp` |
-| Settings (`ng2.toml`), the chosen game folder, the pipeline list (`ng2-pipelines.bin`) | `~/.config/ng2-recomp` |
+| | Linux | Windows |
+|---|---|---|
+| Extracted game (from a disc image), saves, log (`ng2.log`) | `~/.local/share/ng2-recomp` | `%LOCALAPPDATA%\NinjaGaiden2` |
+| Settings (`ng2.toml`), the chosen game folder, the pipeline list (`ng2-pipelines.bin`) | `~/.config/ng2-recomp` | `%LOCALAPPDATA%\NinjaGaiden2` |
 
-`NG2_GAME_DIR=<folder>` starts with that game folder instead of the remembered one.
+`NG2_GAME_DIR=<folder>` starts with that game folder instead of the remembered one (Linux; on
+Windows pass `--game_data_root=<folder>`).
 
 ## Settings
 
@@ -141,7 +149,13 @@ libswresample, libswscale).
 
 5. Run it, or pack an AppImage with `packaging/appimage/build.sh`:
 
-       NG2_RENDERER=native out/build/linux-amd64-release/ng2 --game_data_root=game_files
+       out/build/linux-amd64-release/ng2 --game_data_root=game_files
+
+The Windows build is cross-compiled from Linux after the native one: `packaging/windows/build.sh`
+(clang and lld against Microsoft's C runtime and Windows SDK from
+[xwin](https://github.com/Jake-Shadle/xwin), `xwin --accept-license splat --output ~/.xwin`; plume
+also needs its `contrib/D3D12MemoryAllocator` submodule there). It builds the SDK for Windows, fetches
+FFmpeg's Windows build, and packs `out/windows/NinjaGaiden2-windows-x64.zip`.
 
 How it works: [docs/renderer-plan.md](docs/renderer-plan.md) (the renderer),
 [docs/menus.md](docs/menus.md) (the menus), [docs/shaders.md](docs/shaders.md). How to contribute:

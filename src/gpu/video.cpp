@@ -3278,6 +3278,15 @@ bool GetRenderWindow(RenderWindow& renderWindow) {
   }
   REXLOG_INFO("video: X11 window");
   return true;
+#elif defined(_WIN32)
+  renderWindow = static_cast<HWND>(SDL_GetPointerProperty(
+      SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+  if (!renderWindow) {
+    REXLOG_ERROR("video: the SDL window has no HWND");
+    return false;
+  }
+  REXLOG_INFO("video: Win32 window");
+  return true;
 #else
   REXLOG_ERROR("video: unsupported platform");
   return false;
@@ -3392,9 +3401,11 @@ void CreatePipelines() {
 }  // namespace
 
 bool IsNativeRenderer() {
+  // The native renderer unless NG2_RENDERER=xenos (the SDK's GPU emulation,
+  // to compare with).
   static const bool native = [] {
     const char* renderer = std::getenv("NG2_RENDERER");
-    return renderer && std::strcmp(renderer, "native") == 0;
+    return !renderer || std::strcmp(renderer, "xenos") != 0;
   }();
   return native;
 }

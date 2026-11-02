@@ -1,2 +1,3 @@
-// The executable's icon (Windows builds, CMakeLists.txt).
+// The executable's icon (Windows builds, CMakeLists.txt; ng2.manifest is
+// merged into the linker's manifest).
 1 ICON "ng2.ico"

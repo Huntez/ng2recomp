@@ -22,6 +22,7 @@
 #include "null_audio.h"
 #include "recomp_settings.h"
 #include "script_input.h"
+#include "windows_setup.h"
 
 class Ng2App : public rex::ReXApp {
  public:
@@ -41,6 +42,13 @@ class Ng2App : public rex::ReXApp {
   // NG2_CONFIG=<file>: settings file instead of <exe_dir>/ng2.toml (test
   // runs keep away from the player's settings).
   void OnConfigurePaths(rex::PathConfig& paths) override {
+#ifdef _WIN32
+    // The game folder and Title Update 2 (asked for once), settings and
+    // saves in %LOCALAPPDATA%: what the AppImage's launcher does on Linux.
+    if (!ng2::windows_setup::ConfigurePaths(paths)) {
+      std::_Exit(0);
+    }
+#endif
     const char* config = std::getenv("NG2_CONFIG");
     if (config && *config) {
       paths.config_path = config;
@@ -60,7 +68,7 @@ class Ng2App : public rex::ReXApp {
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
-    // NG2_RENDERER=native: the native renderer draws and presents. The GPU
+    // The native renderer (unless NG2_RENDERER=xenos) draws and presents. The GPU
     // plugin's null backend still runs the game's command stream (fences,
     // interrupts, vblank) so its D3D library works unmodified.
     if (ng2::video::IsNativeRenderer()) {
@@ -68,12 +76,12 @@ class Ng2App : public rex::ReXApp {
       config.graphics = rex::system::LoadGpuPlugin("xenos", "null");
       if (!config.graphics) {
         // Without it the game's D3D waits forever on a ring nobody reads.
-        REXLOG_ERROR("NG2_RENDERER=native needs the xenos GPU plugin's null backend");
+        REXLOG_ERROR("the native renderer needs the xenos GPU plugin's null backend");
         rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
                                   "The GPU plugin (librexgpu-xenos) is missing or too old.");
         std::_Exit(1);
       }
-      REXLOG_INFO("NG2_RENDERER=native: GPU emulation off (null command processor)");
+      REXLOG_INFO("native renderer: GPU emulation off (null command processor)");
     }
 
     // NG2_AUDIO=0: run the audio pipeline without an output device.

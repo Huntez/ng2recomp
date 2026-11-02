@@ -10,6 +10,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(generated/rexglue.cmake)
 
+# Cross-compiled (Windows from Linux): the build-time tools are the host
+# build's (NG2_HOST_BUILD_DIR, built first): the code generator, and the
+# shader cache that build translated (the code and shaders don't depend on
+# the target).
+if(CMAKE_CROSSCOMPILING)
+    set(NG2_HOST_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out/build/linux-amd64-release" CACHE PATH
+        "A native build of this tree, for its build-time tools and shader cache")
+    set(NG2_HOST_REXGLUE "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/rexglue-sdk/out/install/linux-amd64/bin/rexglue"
+        CACHE FILEPATH "The host's ReXGlue code generator")
+    if(NOT EXISTS "${NG2_HOST_REXGLUE}")
+        message(FATAL_ERROR "No ${NG2_HOST_REXGLUE}: build and install the native SDK first")
+    endif()
+    set_target_properties(rex::rexglue PROPERTIES
+        IMPORTED_LOCATION "${NG2_HOST_REXGLUE}" IMPORTED_LOCATION_RELEASE "${NG2_HOST_REXGLUE}")
+endif()
+
 # Sources
 set(NG2_SOURCES
     src/main.cpp
@@ -26,11 +42,12 @@ set(NG2_SOURCES
     src/dlc.cpp
     src/gameplay.cpp
     src/aspect.cpp
+    src/windows_setup.cpp
 )
 
 if(WIN32)
     # The executable's icon.
-    add_executable(ng2 WIN32 ${NG2_SOURCES} packaging/windows/ng2.rc)
+    add_executable(ng2 WIN32 ${NG2_SOURCES} packaging/windows/ng2.rc packaging/windows/ng2.manifest)
 else()
     add_executable(ng2 ${NG2_SOURCES})
 endif()
@@ -60,52 +77,80 @@ set(NG2_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_files" CACHE PATH
     "Extracted game files (default.xex is read at build time for its shaders)")
 set(NG2_XENOS_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/XenosRecomp")
 
-add_executable(ng2_dump_image tools/dump_image/main.cpp)
-target_link_libraries(ng2_dump_image PRIVATE rex::runtime)
+if(CMAKE_CROSSCOMPILING)
+    set(NG2_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+    set(NG2_SHADER_CACHE "${NG2_HOST_BUILD_DIR}/shaders/ng2_shader_cache.cpp")
+    if(NOT EXISTS "${NG2_SHADER_CACHE}")
+        message(FATAL_ERROR "No ${NG2_SHADER_CACHE}: build the native tree (NG2_HOST_BUILD_DIR) first")
+    endif()
+else()
+    add_executable(ng2_dump_image tools/dump_image/main.cpp)
+    target_link_libraries(ng2_dump_image PRIVATE rex::runtime)
 
-include(ExternalProject)
-ExternalProject_Add(xenos_recomp
-    SOURCE_DIR "${NG2_XENOS_RECOMP_DIR}"
-    BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp"
-    CMAKE_ARGS
-        -G Ninja
-        -DCMAKE_BUILD_TYPE=Release
-        -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
-        -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
-        -DXENOS_RECOMP_DXIL=OFF
-    BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
-    INSTALL_COMMAND ""
-    BUILD_ALWAYS ON)
+    include(ExternalProject)
+    ExternalProject_Add(xenos_recomp
+        SOURCE_DIR "${NG2_XENOS_RECOMP_DIR}"
+        BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp"
+        CMAKE_ARGS
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+            -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+            -DXENOS_RECOMP_DXIL=OFF
+        BUILD_BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+        INSTALL_COMMAND ""
+        BUILD_ALWAYS ON)
 
-set(NG2_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
-set(NG2_SHADER_CACHE "${NG2_SHADER_DIR}/ng2_shader_cache.cpp")
-add_custom_command(
-    OUTPUT "${NG2_SHADER_CACHE}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${NG2_SHADER_DIR}/input"
-    COMMAND ng2_dump_image "${NG2_GAME_DIR}" default.xex "${NG2_SHADER_DIR}/input/default.img"
-    COMMAND "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
-        "${NG2_SHADER_DIR}/input" "${NG2_SHADER_CACHE}"
-        "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
-    DEPENDS ng2_dump_image xenos_recomp "${NG2_GAME_DIR}/default.xex"
-        "${NG2_GAME_DIR}/default.xexp"
-        "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
-        "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
-    COMMENT "Translating NG2 shaders with XenosRecomp"
-    VERBATIM)
+    set(NG2_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+    set(NG2_SHADER_CACHE "${NG2_SHADER_DIR}/ng2_shader_cache.cpp")
+    add_custom_command(
+        OUTPUT "${NG2_SHADER_CACHE}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${NG2_SHADER_DIR}/input"
+        COMMAND ng2_dump_image "${NG2_GAME_DIR}" default.xex "${NG2_SHADER_DIR}/input/default.img"
+        COMMAND "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+            "${NG2_SHADER_DIR}/input" "${NG2_SHADER_CACHE}"
+            "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
+        DEPENDS ng2_dump_image xenos_recomp "${NG2_GAME_DIR}/default.xex"
+            "${NG2_GAME_DIR}/default.xexp"
+            "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+            "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
+        COMMENT "Translating NG2 shaders with XenosRecomp"
+        VERBATIM)
+endif()
 
 add_library(ng2_shaders STATIC "${NG2_SHADER_CACHE}"
     "${NG2_XENOS_RECOMP_DIR}/thirdparty/smol-v/source/smolv.cpp")
 target_include_directories(ng2_shaders PUBLIC src/gpu
     "${NG2_XENOS_RECOMP_DIR}/thirdparty/smol-v/source")
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
-target_link_libraries(ng2_shaders PUBLIC PkgConfig::ZSTD)
+if(WIN32)
+    # zstd from XenosRecomp's copy, built in; FFmpeg from a prebuilt shared
+    # build (packaging/windows/build.sh fetches it into NG2_FFMPEG_DIR).
+    set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+    set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    add_subdirectory(thirdparty/XenosRecomp/thirdparty/zstd/build/cmake zstd EXCLUDE_FROM_ALL)
+    target_link_libraries(ng2_shaders PUBLIC libzstd_static)
+    target_include_directories(ng2_shaders PUBLIC thirdparty/XenosRecomp/thirdparty/zstd/lib)
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
+    target_link_libraries(ng2_shaders PUBLIC PkgConfig::ZSTD)
+endif()
 target_link_libraries(ng2 PRIVATE ng2_shaders)
 
 # Movies decoded on the host (src/movie): the game's WMV3/VC-1 and WMA files.
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavformat libavcodec libavutil libswresample libswscale)
-target_link_libraries(ng2 PRIVATE PkgConfig::FFMPEG)
+if(WIN32)
+    set(NG2_FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/out/windows-deps/ffmpeg" CACHE PATH
+        "FFmpeg for Windows: include/, lib/*.lib, bin/*.dll")
+    target_include_directories(ng2 PRIVATE "${NG2_FFMPEG_DIR}/include")
+    foreach(_lib avformat avcodec avutil swresample swscale)
+        target_link_libraries(ng2 PRIVATE "${NG2_FFMPEG_DIR}/lib/${_lib}.lib")
+    endforeach()
+else()
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+        libavformat libavcodec libavutil libswresample libswscale)
+    target_link_libraries(ng2 PRIVATE PkgConfig::FFMPEG)
+endif()
 
 # Native renderer: plume (Unleashed Recompiled's RHI), Vulkan only, with the
 # Wayland surface support from patches/plume.

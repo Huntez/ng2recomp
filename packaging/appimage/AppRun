@@ -66,7 +66,6 @@ fi
 [ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu2_sha1" ] ||
   error "$game/default.xexp isn't Title Update 2 for this game. Remove it to choose the update again."
 
-export NG2_RENDERER=${NG2_RENDERER:-native}
 export NG2_CONFIG=${NG2_CONFIG:-$config_dir/ng2.toml}
 exec "$here/usr/bin/ng2" --game_data_root="$game" --user_data_root="$data_dir/user" \
   --log_file="$data_dir/ng2.log" "$@"

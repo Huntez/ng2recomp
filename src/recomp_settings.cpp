@@ -19,6 +19,7 @@
 // The title menu also loses LEADERBOARDS and gains EXIT GAME here.
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <cstdint>
 #include <cstdlib>
@@ -305,6 +306,9 @@ std::vector<std::pair<uint32_t, uint32_t>> FindTextSlots() {
   first.push_back(0), first.push_back(0);
   std::vector<uint8_t> second = Utf16BE(u"Controller Settings");
   const uint8_t* end = memory + kPhysicalSize;
+  // Boyer-Moore: the memory is mostly zeros, which the pattern ends with
+  // (Horspool would step one byte at a time over them).
+  const std::boyer_moore_searcher searcher(first.begin(), first.end());
   auto isTable = [&](const uint8_t* hit) {
     return uint32_t(hit - memory) % 16 == 0 && hit + 0x20 + second.size() < end &&
            std::memcmp(hit, first.data(), first.size()) == 0 &&
@@ -315,9 +319,8 @@ std::vector<std::pair<uint32_t, uint32_t>> FindTextSlots() {
     table = memory + knownTable;
   }
   for (const uint8_t* at = memory; !table && at < end;) {
-    const uint8_t* hit = static_cast<const uint8_t*>(
-        memmem(at, size_t(end - at), first.data(), first.size()));
-    if (!hit) {
+    const uint8_t* hit = std::search(at, end, searcher);
+    if (hit == end) {
       break;
     }
     if (isTable(hit)) {

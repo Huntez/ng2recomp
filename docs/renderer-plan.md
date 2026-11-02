@@ -2,8 +2,8 @@
 
 Goal: draw NG2 with Vulkan from hooked D3D calls, in the spirit of Unleashed
 Recompiled's `gpu/video.cpp` (plume RHI, Vulkan only), instead of emulating
-the Xenos GPU. `NG2_RENDERER=native` selects it; ReXGlue's xenos plugin
-(`--gpu_plugin=xenos`) stays as the reference picture.
+the Xenos GPU. It draws by default; ReXGlue's xenos plugin (`NG2_RENDERER=xenos
+--gpu_plugin=xenos`) stays as the reference picture.
 
 ## Architecture (as built)
 

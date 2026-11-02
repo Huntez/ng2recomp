@@ -35,6 +35,7 @@ rebuilds the app alone.
 A test run must not disturb the machine it runs on: no window on the desktop, no sound, no input
 devices, and none of the player's settings or saves.
 
+- `tools/run-headless-windows.sh` does the same for the Windows build under Proton (umu-run).
 - `tools/run-headless.sh <seconds> <out dir> [game options]` runs the game in a headless gamescope
   with its own HOME, settings (`<out dir>/ng2.toml`), user data and log (`<out dir>/ng2.log`, which
   rotates at 5 MB: read `ng2.1.log` first). `NG2_SHOTS="30 60"` takes screenshots at those seconds.
@@ -45,13 +46,12 @@ devices, and none of the player's settings or saves.
 - `NG2_ROOM_JUMP=<from>:<to>` swaps a room in the story script (src/room_jump.cpp lists the rooms
   with cutscenes): with the New Game path above, `3:5` plays the cutscene before Chapter 2 at about
   80-110 s.
-- Use the native renderer (`NG2_RENDERER=native`) unless comparing with Xenia's (`unset` it and
-  add `--gpu_plugin=xenos --headless`; Xenia's draws cutscenes black in this build).
+- The native renderer draws by default; to compare with Xenia's set `NG2_RENDERER=xenos` and add
+  `--gpu_plugin=xenos --headless` (Xenia's draws cutscenes black in this build).
 
 ## Environment
 
-- `NG2_RENDERER=native`: the native renderer (the AppImage sets it); without it, the SDK's Xenia
-  GPU emulation draws.
+- `NG2_RENDERER=xenos`: the SDK's Xenia GPU emulation draws instead of the native renderer.
 - `NG2_AUDIO=0`: no audio device; the game's audio still runs.
 - `NG2_CONFIG=<file>`: settings file instead of `<exe dir>/ng2.toml`.
 - `NG2_PROFILE=1`: time per renderer stage, once a second. `NG2_HITCHES=1` (or `log_hitches`): slow
