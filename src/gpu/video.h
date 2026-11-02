@@ -24,6 +24,14 @@ void SetPipelineListPath(const std::filesystem::path& path);
 // The game starting a frame (for NG2_LATENCY_LOG).
 void MarkFrameStart();
 
+// A full-screen movie's frame (Y, U, V planes, 4:2:0), shown instead of the
+// game's picture while frames keep coming.
+void ShowMovieFrame(const uint8_t* const planes[3], const uint32_t pitches[3], uint32_t width,
+                    uint32_t height);
+// The full-screen movie is still playing (no new frame this time): its last
+// frame stays up.
+void KeepMovieShown();
+
 // Called from the D3D hooks on the game's D3D thread, after the original
 // function ran (guest addresses; docs/d3d-map-*.md has the signatures).
 void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uint32_t flags,

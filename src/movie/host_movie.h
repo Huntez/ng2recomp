@@ -32,6 +32,9 @@ class HostMovie {
   bool CopyFrame(const Planes& planes);
 
   bool Finished() const;
+  // The time of the last frame CopyFrame copied (seconds; negative before
+  // the first).
+  double ShownTime() const;
   int Width() const;
   int Height() const;
   void SetVolume(float volume);

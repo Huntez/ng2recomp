@@ -20,6 +20,7 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 
+#include "aspect.h"
 #include "gpu/guest.h"
 #include "gpu/video.h"
 
@@ -159,7 +160,8 @@ REX_HOOK_RAW(sub_822F0EF8) {
     }
   }
   g_last = now;
-  if (!REXCVAR_GET(show_fps) || (!g_item && !MakeItem(ctx, base))) {
+  // In gameplay only (the HUD up), not on loading screens and menus.
+  if (!REXCVAR_GET(show_fps) || !ng2::aspect::HudShown() || (!g_item && !MakeItem(ctx, base))) {
     return;
   }
   // Averaged over half a second, so it can be read.

@@ -51,6 +51,7 @@
 #include <rex/system/xmemory.h>
 
 #include "../gpu/guest.h"
+#include "../gpu/video.h"
 #include "host_movie.h"
 #include "movie.h"
 #include "../gameplay.h"
@@ -116,6 +117,7 @@ struct Player {
   std::vector<std::pair<uint32_t, uint32_t>> reserved;  // (address, attributes)
   bool reportedEnd = false;
   bool blanked = false;  // its planes cleared to black
+  std::vector<uint8_t> fullScreen[3];  // a full-screen movie's Y, U, V
 };
 
 std::mutex g_mutex;
@@ -345,22 +347,35 @@ REX_HOOK_RAW(sub_83887F68) {
   __imp__sub_83887F68(ctx, base);
 }
 
-// +80: draw the frame to the screen. Not drawn yet, but the movie still
-// runs (time, audio) and ends, which is what ends it for the game.
+// +80: draw the frame to the screen (full-screen movies, such as the attract
+// trailer): the renderer shows it instead of the game's picture.
 REX_EXTERN(__imp__sub_83887F78);
 REX_HOOK_RAW(sub_83887F78) {
   {
     std::lock_guard lock(g_mutex);
     if (Player* player = Find(ctx.r3.u32)) {
-      static bool logged = false;
-      if (!logged) {
-        logged = true;
-        REXLOG_WARN("movie: full-screen movies are not drawn yet");
-      }
       bool playing = false;
       if (player->movie) {
-        ng2::movie::HostMovie::Planes none = {};
-        playing = player->movie->CopyFrame(none);
+        // Decoded into host planes of ours, and shown by the renderer in
+        // place of the game's picture.
+        uint32_t width = uint32_t(player->movie->Width()), height = uint32_t(player->movie->Height());
+        uint32_t pitches[3] = {width, (width + 1) / 2, (width + 1) / 2};
+        uint32_t rows[3] = {height, (height + 1) / 2, (height + 1) / 2};
+        ng2::movie::HostMovie::Planes planes;
+        for (int p = 0; p < 3; p++) {
+          player->fullScreen[p].resize(size_t(pitches[p]) * rows[p]);
+          planes.data[p] = player->fullScreen[p].data();
+          planes.pitch[p] = pitches[p];
+          planes.size[p] = uint32_t(player->fullScreen[p].size());
+        }
+        double before = player->movie->ShownTime();
+        playing = player->movie->CopyFrame(planes);
+        if (playing && player->movie->ShownTime() != before) {
+          const uint8_t* data[3] = {planes.data[0], planes.data[1], planes.data[2]};
+          ng2::video::ShowMovieFrame(data, pitches, width, height);
+        } else if (playing && player->movie->ShownTime() >= 0.0) {
+          ng2::video::KeepMovieShown();
+        }
         if (player->voice) {
           player->movie->SetVolume(LoadFloat(player->voice + 140));
         }

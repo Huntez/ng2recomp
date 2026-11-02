@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -102,6 +103,7 @@ struct Anchor {
 };
 std::unordered_map<uint32_t, Anchor> g_itemAnchor;
 bool g_hud = false;  // the gameplay HUD is up this frame (health bar buckets 57-59)
+std::atomic<bool> g_hudShown{false};  // the same, for other threads
 
 // Diagnostic (NG2_BUCKET_LOG=1): each bucket's 2D box, once a second.
 struct Box {
@@ -109,6 +111,7 @@ struct Box {
   int draws = 0;
 };
 Box g_boxes[kBucketCount];
+
 std::chrono::steady_clock::time_point g_boxesLogged;
 bool BucketLog() {
   static const bool on = std::getenv("NG2_BUCKET_LOG") != nullptr;
@@ -130,6 +133,7 @@ void ScanBuckets() {
     }
   }
   g_hud = hud;
+  g_hudShown.store(hud, std::memory_order_relaxed);
   // Anchors are kept while their item is drawn (one sliding across a third
   // doesn't jump), and dropped with it or with the HUD.
   if (!hud) {
@@ -139,16 +143,26 @@ void ScanBuckets() {
   }
 }
 
-void NoteQuad(uint32_t vertices, uint32_t stride) {
-  if (!BucketLog() || g_drawBucket < 0) {
+
+void NotePoint(float x, float y) {
+  if (g_drawBucket < 0) {
+    return;
+  }
+  if (!BucketLog()) {
     return;
   }
   Box& b = g_boxes[g_drawBucket];
-  b.draws++;
+  b.x0 = std::min(b.x0, x), b.x1 = std::max(b.x1, x);
+  b.y0 = std::min(b.y0, y), b.y1 = std::max(b.y1, y);
+}
+
+void NoteQuad(uint32_t vertices, uint32_t stride) {
+  if (g_drawBucket < 0 || !BucketLog()) {
+    return;
+  }
+  g_boxes[g_drawBucket].draws++;
   for (uint32_t i = 0; i < 4; i++) {
-    float x = LoadFloat(vertices + i * stride), y = LoadFloat(vertices + i * stride + 4);
-    b.x0 = std::min(b.x0, x), b.x1 = std::max(b.x1, x);
-    b.y0 = std::min(b.y0, y), b.y1 = std::max(b.y1, y);
+    NotePoint(LoadFloat(vertices + i * stride), LoadFloat(vertices + i * stride + 4));
   }
 }
 
@@ -184,6 +198,7 @@ void DrawTagged(PPCContext& ctx, uint8_t* base, void (*draw)(PPCContext&, uint8_
 // Buckets of the HUD's left column (karma panel 39-41, health bar and ki
 // 57-61), and menus' (never moved: pause and inventory 49-50, in-game
 // options 70-72, loading and title screens 20, 80-86).
+constexpr int kKarmaBucket = 40;
 bool LeftHud(int bucket) {
   return (bucket >= 39 && bucket <= 41) || (bucket >= 57 && bucket <= 61);
 }
@@ -207,7 +222,9 @@ Anchor ItemAnchor(float x, float y) {
   auto [it, added] = g_itemAnchor.try_emplace(g_drawItem);
   if (added) {
     Anchor& a = it->second;
-    if (LeftHud(g_drawBucket)) {
+    if (g_drawBucket == kKarmaBucket && y >= 480.0f) {
+      a = {0, 1};  // the boss's health bar, drawn with the karma panel: bottom centre
+    } else if (LeftHud(g_drawBucket)) {
       a = {-1, -1};
     } else {
       a.x = x < 1280.0f / 3.0f ? -1 : x > 2560.0f / 3.0f ? 1 : 0;
@@ -288,6 +305,10 @@ namespace ng2::aspect {
 namespace {
 bool g_constantWritable = false;
 }  // namespace
+
+bool HudShown() {
+  return g_hudShown.load(std::memory_order_relaxed);
+}
 
 float SqueezeX() {
   return CurrentSqueeze().x;
@@ -371,6 +392,7 @@ REX_HOOK_RAW(sub_8368EFE8) {
 REX_EXTERN(__imp__sub_8370DD20);
 REX_HOOK_RAW(sub_8370DD20) {
   Squeeze s = CurrentSqueeze();
+  NotePoint(High(ctx.r10.u64), Low(ctx.r10.u64));
   if (s.active()) {
     Anchor a = ItemAnchor(High(ctx.r10.u64), Low(ctx.r10.u64));
     for (PPCRegister* row : {&ctx.r4, &ctx.r6, &ctx.r8}) {
@@ -437,11 +459,14 @@ REX_EXTERN(__imp__sub_8368E4F0);
 REX_HOOK_RAW(sub_8368E4F0) {
   Squeeze s = CurrentSqueeze();
   uint32_t vertices = ctx.r4.u32;
+  constexpr uint32_t kStride = 16, kCount = 4;
+  if (vertices) {
+    NoteQuad(vertices, kStride);
+  }
   if (!s.active() || !vertices) {
     __imp__sub_8368E4F0(ctx, base);
     return;
   }
-  constexpr uint32_t kStride = 16, kCount = 4;
   uint8_t saved[kStride * kCount];
   std::memcpy(saved, Virtual(vertices), sizeof(saved));
   SqueezeQuad(vertices, kStride, s);

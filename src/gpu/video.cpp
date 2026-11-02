@@ -3058,6 +3058,63 @@ void TraceFrame(HostTexture* frontBuffer) {
   }
 }
 
+// Full-screen movies (the attract trailer): the movie stand-in
+// (src/movie) decodes them and hands each frame over; the presenter shows
+// the latest while frames keep coming, instead of the game's picture.
+std::mutex g_movieMutex;
+std::vector<uint8_t> g_movieRGBA;  // the latest frame, RGBA8
+uint32_t g_movieWidth = 0, g_movieHeight = 0;
+uint64_t g_movieSerial = 0;
+std::chrono::steady_clock::time_point g_movieTime;
+std::unique_ptr<HostTexture> g_movieTexture;
+uint64_t g_movieUploaded = 0;
+constexpr auto kMovieShown = std::chrono::milliseconds(250);
+
+// The latest movie frame on the GPU, or null when no movie is showing.
+// Before the frame's render pass (it records a copy).
+HostTexture* MovieTexture() {
+  std::lock_guard lock(g_movieMutex);
+  if (!g_movieSerial || std::chrono::steady_clock::now() - g_movieTime > kMovieShown) {
+    return nullptr;
+  }
+  if (!g_movieTexture || g_movieTexture->width != g_movieWidth ||
+      g_movieTexture->height != g_movieHeight) {
+    if (g_movieTexture) {
+      g_garbage[g_frame].push_back(std::move(g_movieTexture));
+    }
+    g_movieTexture = std::make_unique<HostTexture>();
+    g_movieTexture->width = g_movieWidth;
+    g_movieTexture->height = g_movieHeight;
+    g_movieTexture->format = RenderFormat::R8G8B8A8_UNORM;
+    g_movieTexture->texture = g_device->createTexture(
+        RenderTextureDesc::Texture2D(g_movieWidth, g_movieHeight, 1, RenderFormat::R8G8B8A8_UNORM));
+    if (!g_movieTexture->texture) {
+      g_movieTexture.reset();
+      return nullptr;
+    }
+    SetDescriptor(*g_movieTexture);
+    g_movieUploaded = 0;
+  }
+  if (g_movieUploaded != g_movieSerial) {
+    g_movieUploaded = g_movieSerial;
+    uint32_t rowBytes = g_movieWidth * 4;
+    uint32_t pitch = (rowBytes + 255) & ~255u;
+    Upload upload = Allocate(uint64_t(pitch) * g_movieHeight, 512);
+    for (uint32_t y = 0; y < g_movieHeight; y++) {
+      std::memcpy(upload.data + uint64_t(y) * pitch, g_movieRGBA.data() + uint64_t(y) * rowBytes,
+                  rowBytes);
+    }
+    Transition(*g_movieTexture, RenderTextureLayout::COPY_DEST);
+    CommandList()->copyTextureRegion(
+        RenderTextureCopyLocation::Subresource(g_movieTexture->texture.get()),
+        RenderTextureCopyLocation::PlacedFootprint(upload.buffer, RenderFormat::R8G8B8A8_UNORM,
+                                                   g_movieWidth, g_movieHeight, 1, pitch / 4,
+                                                   upload.offset));
+  }
+  Transition(*g_movieTexture, RenderTextureLayout::SHADER_READ);
+  return g_movieTexture.get();
+}
+
 void Present(HostTexture* frontBuffer) {
   StageTimer timer(Stage::kPresent);
   auto* commandList = CommandList();
@@ -3109,6 +3166,7 @@ void Present(HostTexture* frontBuffer) {
     g_renderSemaphores.push_back(g_device->createCommandSemaphore());
   }
 
+  HostTexture* movie = g_swapChainValid ? MovieTexture() : nullptr;
   if (g_swapChainValid) {
     if (frontBuffer) {
       Transition(*frontBuffer, RenderTextureLayout::SHADER_READ);
@@ -3129,18 +3187,21 @@ void Present(HostTexture* frontBuffer) {
     g_boundFramebuffer = framebuffer.get();
     commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
 
-    if (frontBuffer && frontBuffer->descriptor) {
+    HostTexture* source = movie && movie->descriptor ? movie : frontBuffer;
+    if (source && source->descriptor) {
       // Fit the guest picture into the window at the chosen aspect ratio
-      // (src/aspect.cpp: the game draws for it, into its 16:9 targets).
+      // (src/aspect.cpp: the game draws for it, into its 16:9 targets); a
+      // movie at its own.
       float windowWidth = float(g_swapChain->getWidth());
       float windowHeight = float(g_swapChain->getHeight());
-      float aspect = ng2::aspect::Aspect();
+      float aspect = source == movie ? float(movie->width) / float(movie->height)
+                                     : ng2::aspect::Aspect();
       float width = std::floor(std::min(windowWidth, windowHeight * aspect));
       float height = std::floor(std::min(windowHeight, windowWidth / aspect));
       RenderViewport viewport((windowWidth - width) / 2, (windowHeight - height) / 2, width,
                               height);
       RenderRect scissor(0, 0, int32_t(windowWidth), int32_t(windowHeight));
-      uint32_t constants[3] = {frontBuffer->descriptor, SAMPLER_LINEAR_CLAMP,
+      uint32_t constants[3] = {source->descriptor, SAMPLER_LINEAR_CLAMP,
                                g_gammaTable ? g_gammaTable->descriptor : 0u};
       commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
       commandList->setPipeline(g_presentPipeline.get());
@@ -3385,6 +3446,41 @@ bool CreateHostDevice() {
   return true;
 }
 
+void ShowMovieFrame(const uint8_t* const planes[3], const uint32_t pitches[3], uint32_t width,
+                    uint32_t height) {
+  if (!width || !height) {
+    return;
+  }
+  // BT.601, limited range (WMV / VC-1), converted outside the lock.
+  static thread_local std::vector<uint8_t> rgba;
+  rgba.resize(size_t(width) * height * 4);
+  for (uint32_t y = 0; y < height; y++) {
+    const uint8_t* lumaRow = planes[0] + size_t(y) * pitches[0];
+    const uint8_t* uRow = planes[1] + size_t(y / 2) * pitches[1];
+    const uint8_t* vRow = planes[2] + size_t(y / 2) * pitches[2];
+    uint8_t* out = rgba.data() + size_t(y) * width * 4;
+    for (uint32_t x = 0; x < width; x++) {
+      float luma = 1.164f * (float(lumaRow[x]) - 16.0f);
+      float u = float(uRow[x / 2]) - 128.0f, v = float(vRow[x / 2]) - 128.0f;
+      auto clamp8 = [](float f) { return uint8_t(std::clamp(f + 0.5f, 0.0f, 255.0f)); };
+      out[x * 4 + 0] = clamp8(luma + 1.596f * v);
+      out[x * 4 + 1] = clamp8(luma - 0.392f * u - 0.813f * v);
+      out[x * 4 + 2] = clamp8(luma + 2.017f * u);
+      out[x * 4 + 3] = 255;
+    }
+  }
+  std::lock_guard lock(g_movieMutex);
+  g_movieWidth = width, g_movieHeight = height;
+  g_movieRGBA.swap(rgba);
+  g_movieSerial++;
+  g_movieTime = std::chrono::steady_clock::now();
+}
+
+void KeepMovieShown() {
+  std::lock_guard lock(g_movieMutex);
+  g_movieTime = std::chrono::steady_clock::now();
+}
+
 void MarkFrameStart() {
   g_frameStartNs = std::chrono::steady_clock::now().time_since_epoch().count();
 }
@@ -3430,6 +3526,8 @@ void DestroyHostDevice() {
   g_framebuffers.clear();
   g_surfaces.clear();
   g_gammaTable.reset();
+  g_movieTexture.reset();
+  g_movieUploaded = 0;
   g_lastResolve.clear();
   g_resolvedTextures.clear();
   g_resolvedMemory.clear();

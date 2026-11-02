@@ -486,6 +486,11 @@ bool HostMovie::CopyFrame(const Planes& planes) {
   return !s.finished;
 }
 
+double HostMovie::ShownTime() const {
+  std::lock_guard lock(state_->mutex);
+  return state_->lastShown;
+}
+
 bool HostMovie::Finished() const {
   return state_->finished;
 }
