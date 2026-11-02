@@ -34,7 +34,7 @@
 #include "movie/movie.h"
 
 REXCVAR_DEFINE_BOOL(skip_intro, false, "Gameplay", "Skip the opening movie at launch");
-REXCVAR_DEFINE_BOOL(skip_cutscenes, true, "Gameplay",
+REXCVAR_DEFINE_BOOL(skip_cutscenes, false, "Gameplay",
                     "Any cutscene can be skipped, seen or not");
 REXCVAR_DEFINE_BOOL(pause_in_background, false, "Gameplay",
                     "Pause the game while its window isn't focused");

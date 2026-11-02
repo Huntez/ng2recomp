@@ -134,13 +134,9 @@ void ScanBuckets() {
   }
   g_hud = hud;
   g_hudShown.store(hud, std::memory_order_relaxed);
-  // Anchors are kept while their item is drawn (one sliding across a third
-  // doesn't jump), and dropped with it or with the HUD.
-  if (!hud) {
-    g_itemAnchor.clear();
-  } else {
-    std::erase_if(g_itemAnchor, [](const auto& entry) { return !g_itemBucket.contains(entry.first); });
-  }
+  // Decided again each frame: the items are render copies from a pool, so
+  // an address can be another piece the next frame.
+  g_itemAnchor.clear();
 }
 
 
