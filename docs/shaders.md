@@ -111,3 +111,15 @@ vertex shader has one `ps + 0` through such a declared instruction. On a GPU
 without shaderRoundingModeRTZFloat32 the renderer removes the mode, its
 capability and extension from the SPIR-V (video.cpp DropRoundTowardZero); the
 log says which at startup ("vertex shaders round toward zero").
+
+## Predicate counters
+
+Xenos shaders nest conditions with a counter in a register: `setp_*_push`
+starts a level, `setp_pop` ends one, `setp_inv` flips the innermost. The
+translator had `setp_inv` turn a count of 1 into 1 (it must give 0), so the
+instructions after it saw the wrong nesting. NG2's point and spot light code
+(the vertex shader of rigid pieces such as the archers' bows) runs only with
+point lights near, so the bows were lit in bands of colour under the fire
+ninpo. Patch 0010 fixes it, and takes the pushes' test from `.w` and result
+from `.x` of their sources as Xenos does (NG2's shaders replicate one
+component, so their output didn't change).
