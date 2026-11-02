@@ -111,14 +111,6 @@ struct Box {
   int draws = 0;
 };
 Box g_boxes[kBucketCount];
-// The health bar and ki orbs' extent (buckets 57-61), this frame and last:
-// other HUD pieces drawn within it (the projectile count under the bar)
-// belong to that block.
-float g_leftBlockRight = 0.0f, g_leftBlockBottom = 0.0f;
-float g_lastLeftBlockRight = 0.0f, g_lastLeftBlockBottom = 0.0f;
-// The health bar's bottom: the row under it (ki orbs, the projectile
-// count) is the block's; above, a centred piece stays centred.
-constexpr float kHealthBarBottom = 82.0f;
 
 
 std::chrono::steady_clock::time_point g_boxesLogged;
@@ -129,10 +121,6 @@ bool BucketLog() {
 
 void ScanBuckets() {
   g_itemBucket.clear();
-  if (g_leftBlockRight > 0.0f) {  // kept over frames without the HUD
-    g_lastLeftBlockRight = g_leftBlockRight, g_lastLeftBlockBottom = g_leftBlockBottom;
-  }
-  g_leftBlockRight = 0.0f, g_leftBlockBottom = 0.0f;
   uint32_t parity = Load32(kBuckets + 1456) ^ 1;
   uint32_t heads = kBuckets + parity * 728;
   bool hud = false;
@@ -140,6 +128,14 @@ void ScanBuckets() {
     int guard = 0;
     for (uint32_t item = Load32(heads + 4 * i); item && guard < 4096; item = Load32(item + 4), guard++) {
       g_itemBucket[item] = i;
+      if (BucketLog()) {
+        // Each bucket's draw methods, once (what draws a HUD piece).
+        static std::unordered_map<uint64_t, bool> seen;
+        uint32_t method = Load32(Load32(item) + 4);
+        if (seen.try_emplace(uint64_t(i) << 32 | method, true).second) {
+          REXLOG_INFO("2D bucket {} draw method {:08X}", i, method);
+        }
+      }
       if (i >= 57 && i <= 59 && Load32(Load32(item) + 4) != kPlaceholderDraw) {
         hud = true;
       }
@@ -157,10 +153,6 @@ void ScanBuckets() {
 void NotePoint(float x, float y) {
   if (g_drawBucket < 0) {
     return;
-  }
-  if (g_drawBucket >= 57 && g_drawBucket <= 61) {
-    g_leftBlockRight = std::max(g_leftBlockRight, x);
-    g_leftBlockBottom = std::max(g_leftBlockBottom, y);
   }
   if (!BucketLog()) {
     return;
@@ -240,8 +232,9 @@ Anchor ItemAnchor(float x, float y) {
     Anchor& a = it->second;
     if (g_drawBucket == kKarmaBucket && y >= 480.0f) {
       a = {0, 1};  // the boss's health bar, drawn with the karma panel: bottom centre
-    } else if (LeftHud(g_drawBucket) ||
-               (x <= g_lastLeftBlockRight && y > kHealthBarBottom && y <= g_lastLeftBlockBottom)) {
+    } else if (g_drawBucket == kKarmaBucket && x > 2560.0f / 3.0f) {
+      a = {1, -1};  // the projectile count, top right
+    } else if (LeftHud(g_drawBucket)) {
       a = {-1, -1};
     } else {
       a.x = x < 1280.0f / 3.0f ? -1 : x > 2560.0f / 3.0f ? 1 : 0;

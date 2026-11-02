@@ -13,7 +13,12 @@
 #include <chrono>
 #include <thread>
 
+#include <mutex>
+#include <string>
+#include <unordered_set>
 #include <rex/hook.h>
+#include <rex/runtime.h>
+#include <rex/system/xmemory.h>
 #include <rex/logging.h>
 
 #include "guest.h"
@@ -50,12 +55,48 @@ void ReportStats() {
               g_counters.clears.exchange(0), g_counters.resolves.exchange(0));
 }
 
+
+// NG2_DRAW_STACKS=1: each distinct chain of guest callers that leads to a
+// draw, logged once (return addresses: the caller's, then up the stack's
+// back chain, where each function saves its LR 8 bytes below its caller's
+// frame). Finds what draws a picture the 2D pass doesn't.
+void LogDrawStack(PPCContext& ctx, const char* kind) {
+  static const bool on = std::getenv("NG2_DRAW_STACKS") != nullptr;
+  if (!on) {
+    return;
+  }
+  static std::mutex mutex;
+  static std::unordered_set<std::string> seen;
+  std::string key = fmt::format("{:08X}", uint32_t(ctx.lr));
+  auto* memory = rex::Runtime::instance()->memory();
+  auto readable = [&](uint32_t address) {
+    uint32_t protect = 0;
+    auto* heap = memory->LookupHeap(address);
+    return heap && heap->QueryProtect(address, &protect) &&
+           (protect & rex::memory::kMemoryProtectRead);
+  };
+  uint32_t sp = ctx.r1.u32;
+  for (int depth = 0; depth < 10 && sp && readable(sp); depth++) {
+    uint32_t next = ng2::guest::Load32(sp);
+    if (!next || next <= sp || next - sp > 0x100000 || !readable(next - 8)) {
+      break;
+    }
+    key += fmt::format(" {:08X}", ng2::guest::Load32(next - 8));
+    sp = next;
+  }
+  std::lock_guard lock(mutex);
+  if (seen.insert(key).second) {
+    REXLOG_INFO("draw stack {}: {}", kind, key);
+  }
+}
+
 }  // namespace
 
 // DrawVertices(dev, prim type, start vertex, vertex count)
 REX_EXTERN(__imp__sub_83761E58);
 REX_HOOK_RAW(sub_83761E58) {
   g_counters.draws++;
+  LogDrawStack(ctx, "vertices");
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, start = ctx.r5.u32, count = ctx.r6.u32;
   __imp__sub_83761E58(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
@@ -67,6 +108,7 @@ REX_HOOK_RAW(sub_83761E58) {
 REX_EXTERN(__imp__sub_83762240);
 REX_HOOK_RAW(sub_83762240) {
   g_counters.draws++;
+  LogDrawStack(ctx, "indexed");
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, baseVertex = ctx.r5.u32;
   uint32_t startIndex = ctx.r6.u32, count = ctx.r7.u32;
   __imp__sub_83762240(ctx, base);
@@ -79,6 +121,7 @@ REX_HOOK_RAW(sub_83762240) {
 REX_EXTERN(__imp__sub_83761488);
 REX_HOOK_RAW(sub_83761488) {
   g_counters.draws++;
+  LogDrawStack(ctx, "begin");
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
   __imp__sub_83761488(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
@@ -91,6 +134,7 @@ REX_HOOK_RAW(sub_83761488) {
 REX_EXTERN(__imp__sub_83761928);
 REX_HOOK_RAW(sub_83761928) {
   g_counters.draws++;
+  LogDrawStack(ctx, "begin-indexed");
   uint32_t device = ctx.r3.u32, primitive = ctx.r4.u32, baseVertex = ctx.r5.u32;
   uint32_t vertexCount = ctx.r6.u32, indexCount = ctx.r7.u32, indexFormat = ctx.r8.u32;
   uint32_t stride = ctx.r9.u32, indexDataOut = ctx.r10.u32;

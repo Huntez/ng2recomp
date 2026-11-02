@@ -68,6 +68,11 @@ devices, and none of the player's settings or saves.
   buffers (`--dump`) of a Xenia Edge GPU trace, to compare a frame with ours.
 - `NG2_DUMP_IMAGE=<file>`: write the loaded XEX image for analysis.
 - `NG2_D3D_STATS=1`: D3D draw, clear, resolve and swap counts every second.
+- `NG2_DRAW_STACKS=1`: each distinct chain of guest callers behind a draw, logged once (what draws
+  a picture). `NG2_BUCKET_LOG=1`: each 2D render bucket's box per second and its draw methods
+  (src/aspect.cpp).
+- Mission Mode is a quick way to reach bosses headless (Mission 04, Ruler of Lightning). Quick
+  menu: d-pad up, then up, left and A equips the bow.
 - `NG2_MOVIES=xmedia`: the game's own movie player instead of FFmpeg; `NG2_MOVIE_TRACE=1` logs it.
 - `NG2_PAD_LIVE=<file>`: presses each line appended to the file.
 
