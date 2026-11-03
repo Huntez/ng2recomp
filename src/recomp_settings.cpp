@@ -1755,6 +1755,19 @@ void LeaveInGameRows(PPCContext& ctx, uint8_t* base) {
 
 }  // namespace
 
+// Quit Game's question ("If you quit the game...", Yes, No) sits at fixed
+// places (x, y pairs read as it's drawn, sub_83693D68): y 655, the line below
+// the list's last row. Our row moves Return to Game down onto it, so while
+// ours is in the list the question goes 28 lower.
+constexpr uint32_t kQuitQuestionPlaces[] = {0x83BC03CC, 0x83BC03D4, 0x83BC03DC};
+constexpr float kQuitQuestionY = 655.0f, kQuitQuestionLowered = 683.0f;
+
+void PlaceQuitQuestion(bool lowered) {
+  for (uint32_t place : kQuitQuestionPlaces) {
+    StoreFloat(place + 4, lowered ? kQuitQuestionLowered : kQuitQuestionY);
+  }
+}
+
 // The list's builder, run as it first opens: our row after its twelve.
 REX_EXTERN(__imp__sub_836952B8);
 REX_HOOK_RAW(sub_836952B8) {
@@ -1767,6 +1780,7 @@ REX_HOOK_RAW(sub_836952B8) {
   g_inGameOurs = false;
   ng2::video::SetInGameRecompHeader(false);
   g_inGameShownOrder = false;
+  PlaceQuitQuestion(false);
   if (SetUpInGameRows(ctx, base)) {
     g_list = list;
     for (uint32_t i = 0; i < kGameRows; i++) {
@@ -1775,6 +1789,7 @@ REX_HOOK_RAW(sub_836952B8) {
     ArrangeGameRows();
     PlaceGameRows(ctx, base);
     g_inGameShownOrder = true;
+    PlaceQuitQuestion(true);
   }
 }
 
