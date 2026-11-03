@@ -45,10 +45,12 @@ rsync -a --delete --exclude /out --exclude /game_files --exclude /thirdparty/xen
     "$repo/" "$out/src/"
 mkdir -p "$out/src/game_files"  # the game's files are mounted here (the manifest's path)
 
-docker run --rm -m 24g --shm-size=4g -u "$(id -u):$(id -g)" -e HOME=/tmp \
+docker run --rm -m 24g --shm-size=4g -u "$(id -u):$(id -g)" -e HOME=/tmp -e NG2_MARCH="${NG2_MARCH:-x86-64-v2}" \
     -v "$out":/out -v "$game":/out/src/game_files:ro "$image" bash -euc '
 flags="-static-libstdc++ -static-libgcc -fuse-ld=lld"
-arch="-march=x86-64-v2"  # as the Windows build: SSE4.2 and SSSE3, any x86-64 PC since about 2009
+# x86-64-v2 as the Windows build (SSE4.2 and SSSE3, any x86-64 PC since about 2009);
+# NG2_MARCH=x86-64-v3 for AVX2 machines (the Steam Deck, any Ryzen).
+arch="-march=$NG2_MARCH"
 sdk=/out/src/thirdparty/rexglue-sdk
 # A step that fails shows the end of its log.
 step() { log=$1; shift; "$@" >"$log" 2>&1 || { echo "== $log" >&2; tail -20 "$log" >&2; exit 1; }; }

@@ -208,9 +208,10 @@ std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> g_copyPipelines;
 std::unordered_map<const void*, std::unique_ptr<HostTexture>> g_resolveTemps;
 
 // NG2_PROFILE=1: time spent per renderer stage, logged once a second.
-enum class Stage { kDraw, kSync, kTexture, kPipeline, kResolve, kPresent, kCount };
+// wait: for the GPU (a frame's fence, the swapchain image), mostly inside the other stages.
+enum class Stage { kDraw, kSync, kTexture, kPipeline, kResolve, kPresent, kWait, kCount };
 constexpr const char* kStageNames[] = {"draw", "sync", "texture", "pipeline", "resolve",
-                                       "present"};
+                                       "present", "wait"};
 struct Profile {
   bool enabled = [] {
     const char* v = std::getenv("NG2_PROFILE");
@@ -355,8 +356,6 @@ void ReportProfile() {
   for (size_t i = 0; i < size_t(Stage::kCount); i++) {
     line += fmt::format(" {} {:.1f}", kStageNames[i], g_profile.nanoseconds[i] / 1e6);
   }
-  REXLOG_INFO("video: {} frames, ms:{}; compared {:.1f} MB, uploaded {:.1f} MB", g_profile.frames,
-              line, g_profile.comparedBytes / 1048576.0, g_profile.uploadedBytes / 1048576.0);
   REXLOG_INFO("video: {} frames, ms:{}; compared {:.1f} MB, uploaded {:.1f} MB", g_profile.frames,
               line, g_profile.comparedBytes / 1048576.0, g_profile.uploadedBytes / 1048576.0);
   g_profile = Profile{};
@@ -770,6 +769,7 @@ RenderSampleCounts SampleCount(uint32_t msaa) {
 
 void WaitForFrame(uint32_t frame) {
   if (g_commandListPending[frame]) {
+    StageTimer timer(Stage::kWait);
     g_queue->waitForCommandFence(g_commandFences[frame].get());
     g_commandListPending[frame] = false;
   }
@@ -3224,6 +3224,7 @@ void Present(HostTexture* frontBuffer) {
 
   uint32_t index = 0;
   if (g_swapChainValid) {
+    StageTimer timer(Stage::kWait);
     g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[g_frame].get(), &index);
   }
   while (g_renderSemaphores.size() < g_swapChain->getTextureCount()) {
