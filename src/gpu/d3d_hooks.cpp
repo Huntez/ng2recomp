@@ -241,6 +241,23 @@ REX_HOOK_RAW(sub_8376A518) {
   }
 }
 
+// D3D's writers of dirty constants into its command stream (r3 device; the
+// registers by mask from r6): runs of them copied as packets, the stream's
+// write pointer (device +48) moved on. With no GPU emulation nothing reads the
+// stream and the renderer reads the device's own copies: skipped.
+REX_EXTERN(__imp__sub_83767670);
+REX_HOOK_RAW(sub_83767670) {
+  if (!ng2::video::IsNativeRenderer()) {
+    __imp__sub_83767670(ctx, base);
+  }
+}
+REX_EXTERN(__imp__sub_83767A10);
+REX_HOOK_RAW(sub_83767A10) {
+  if (!ng2::video::IsNativeRenderer()) {
+    __imp__sub_83767A10(ctx, base);
+  }
+}
+
 // Swap: the frame is done.
 REX_EXTERN(__imp__sub_8376AA48);
 REX_HOOK_RAW(sub_8376AA48) {

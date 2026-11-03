@@ -2083,8 +2083,8 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
 
 // The frame's texture lookups by fetch constant: a frame looks up thousands
 // (every slot of every draw) of a few hundred textures. Forgotten at each
-// frame and each resolve (which can change what an address holds, and the
-// layout of a resolved texture).
+// frame, and a resolve forgets the ones at its destination (what it holds and
+// the resolved texture's layout change).
 struct FetchKey {
   uint32_t dwords[6];
   bool operator==(const FetchKey& other) const {
@@ -2097,8 +2097,16 @@ struct FetchKeyHash {
 std::unordered_map<FetchKey, uint32_t, FetchKeyHash> g_frameTextures;
 uint64_t g_frameTexturesFrame = ~0ull;
 
-void ForgetFrameTextures() {
-  g_frameTextures.clear();
+void ForgetFrameTextures(uint32_t base) {
+  for (auto it = g_frameTextures.begin(); it != g_frameTextures.end();) {
+    xenos::xe_gpu_texture_fetch_t fetch;
+    std::memcpy(&fetch.dword_0, it->first.dwords, sizeof(it->first.dwords));
+    if ((uint32_t(fetch.base_address) << 12) == base) {
+      it = g_frameTextures.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
@@ -3971,7 +3979,10 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
     return;
   }
   FlushPendingDraw();
-  ForgetFrameTextures();
+  if (destTexture) {
+    // (texture objects hold CPU virtual addresses; the memo's fetch constants physical)
+    ForgetFrameTextures(PhysicalAddress(uint32_t(ReadTextureFetch(destTexture).base_address) << 12));
+  }
   uint32_t source = flags & 7;
   bool depth = source == 4;
   uint32_t surface = depth ? guest::Load32(device + guest::device::kDepthStencil)
