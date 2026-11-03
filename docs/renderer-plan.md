@@ -10,10 +10,14 @@ the Xenos GPU. It draws by default; ReXGlue's xenos plugin (`NG2_RENDERER=xenos
 - **The game's D3D library keeps running.** Much of NG2's D3D use is inlined
   in game code (vertex declarations, streams, constants written straight into
   the device), so hooking setters alone would miss state. Instead the library
-  runs unmodified against the xenos plugin's **null backend**
-  (patches/rexglue-sdk): its command processor parses the ring and retires
-  fences, interrupts, vblank and swaps without rendering. Verified: 60 fps,
-  same per-frame D3D work as under emulation.
+  runs unmodified. Since 2026-11-03 there is no GPU emulation at all: no GPU
+  plugin is loaded (src/gpu/native_gpu.cpp is the graphics system). Direct3D's
+  command stream is reported consumed at each kick and never read; what the
+  game can see of the GPU (fences, the callback handshakes, the flip and its
+  vsync wait, vblank interrupts) is done at the Direct3D calls that ask for it
+  (InsertFence 8375F810, the handshake 8375FD30, the flip 8376A518; TU3
+  addresses). Before that the xenos plugin's null backend (SDK patch 0001)
+  parsed the ring for them: about 5% of the CPU in a fight.
 - **The renderer hooks the points where work happens** (src/gpu/d3d_hooks.cpp):
   DrawVertices 8373C720, DrawIndexedVertices 8373CB08, BeginVertices
   8373BD50, BeginIndexedVertices 8373C1F0, Clear 837390C8, Resolve 8373D570,

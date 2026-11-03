@@ -75,7 +75,7 @@ step /out/build.log ninja -C /out/build -j'"$jobs"' ng2
 app=$out/AppDir
 rm -rf "$app"
 mkdir -p "$app/usr/bin" "$app/usr/lib" "$app/usr/share/licenses/ng2"
-cp "$out/build/ng2" "$out/build/librexruntime.so" "$out/build/librexgpu-xenos.so" "$app/usr/bin/"
+cp "$out/build/ng2" "$out/build/librexruntime.so" "$app/usr/bin/"  # no GPU plugin: no GPU emulation
 cp "$repo/tools/xdvdfs_extract.py" "$repo/tools/stfs_extract.py" "$repo/tools/find_dlc.py" "$app/usr/bin/"
 cp "$here/AppRun" "$app/AppRun"
 chmod +x "$app/AppRun"

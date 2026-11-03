@@ -25,7 +25,7 @@ tool=${APPIMAGETOOL:-$(command -v appimagetool || echo "$HOME/ngb-recomp/packagi
 app=$out/AppDir
 rm -rf "$app"
 mkdir -p "$app/usr/bin"
-cp "$build/ng2" "$build/librexruntime.so" "$build/librexgpu-xenos.so" "$app/usr/bin/"
+cp "$build/ng2" "$build/librexruntime.so" "$app/usr/bin/"  # no GPU plugin: no GPU emulation
 [ -f "$build/libTracyClient.so" ] && cp "$build/libTracyClient.so" "$app/usr/bin/"
 strip --strip-unneeded "$app/usr/bin/"*
 cp "$repo/tools/xdvdfs_extract.py" "$repo/tools/stfs_extract.py" "$repo/tools/find_dlc.py" "$app/usr/bin/"

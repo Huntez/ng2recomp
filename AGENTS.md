@@ -58,7 +58,9 @@ devices, and none of the player's settings or saves.
 
 ## Environment
 
-- `NG2_RENDERER=xenos`: the SDK's Xenia GPU emulation draws instead of the native renderer.
+- `NG2_RENDERER=xenos`: the SDK's Xenia GPU emulation draws instead of the native renderer (dev
+  builds only: the packages leave out the GPU plugin, `librexgpu-xenos`). The native renderer runs
+  with no GPU emulation (src/gpu/native_gpu.cpp).
 - `NG2_AUDIO=0`: no audio device; the game's audio still runs.
 - `NG2_CONFIG=<file>`: settings file instead of `<exe dir>/ng2.toml`.
 - `NG2_PROFILE=1`: time per renderer stage, once a second. `NG2_HITCHES=1` (or `log_hitches`): slow

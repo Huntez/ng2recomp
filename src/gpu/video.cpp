@@ -2,8 +2,9 @@
 //
 // Native renderer: Vulkan through plume (Unleashed Recompiled's RHI), driven
 // by hooks on the game's D3D calls (d3d_hooks.cpp). The game's D3D library
-// keeps running on the GPU plugin's null backend; at each hooked call this
-// file reads the device and does the host-side work.
+// keeps running (its GPU side done at its calls by native_gpu.cpp, no GPU
+// emulation); at each hooked call this file reads the device and does the
+// host-side work.
 //
 // Commands are recorded on the game's D3D thread as the calls happen and
 // submitted at Swap. Render targets are host textures keyed by their EDRAM
@@ -376,8 +377,8 @@ uint8_t* g_guestMemoryShadow = nullptr;
 
 // Ranges synced: the frame they were last checked in and the frame they last
 // changed in. A range that hasn't changed for a frame is checked once a
-// frame; one that has (a dynamic buffer the game fills in batches, which the
-// null backend never stalls) is checked on every draw, and so is one caught
+// frame; one that has (a dynamic buffer the game fills in batches, which no
+// GPU ever stalls here) is checked on every draw, and so is one caught
 // written between its draws (dynamic) until it stays unchanged for 8 frames.
 //
 // Some buffers are written after the draw that reads them: the game's jobs

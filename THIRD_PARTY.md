@@ -9,7 +9,7 @@ checked out into `thirdparty/` at pinned versions, with this port's changes appl
 
 | Component | Use | License |
 |---|---|---|
-| [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) (`librexruntime`, `librexgpu-xenos`) | the recompiler and Xbox 360 runtime, its GPU emulation | BSD-3-Clause (its `LICENSE`; parts derived from Xenia, BSD-3-Clause) |
+| [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) (`librexruntime`) | the recompiler and Xbox 360 runtime | BSD-3-Clause (its `LICENSE`; parts derived from Xenia, BSD-3-Clause) |
 | [plume](https://github.com/renderbag/plume) | the Vulkan layer of the native renderer | MIT |
 | volk, Vulkan Memory Allocator (through plume) | Vulkan loading and memory | MIT |
 | Vulkan-Headers (through plume) | | Apache-2.0 / MIT |

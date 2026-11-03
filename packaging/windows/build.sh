@@ -101,7 +101,7 @@ pkg=$out/NinjaGaiden2
 rm -rf "${pkg:?}"
 mkdir -p "$pkg/licenses"
 llvm-strip -o "$pkg/ng2.exe" "$build/ng2.exe"
-cp "$sdk/out/install/windows-x64/bin/"{rexruntime,rexgpu-xenos,SDL3}.dll "$pkg/"
+cp "$sdk/out/install/windows-x64/bin/"{rexruntime,SDL3}.dll "$pkg/"
 cp "$deps/ffmpeg/bin/"{avformat-63,avcodec-63,avutil-61,swresample-7,swscale-10}.dll "$pkg/"
 for dll in "${vcruntime_dlls[@]}"; do cp "$deps/vcruntime/$dll.dll" "$pkg/"; done
 # The pipelines recorded playing the game (tools/collect_pipelines.sh), made in the background at

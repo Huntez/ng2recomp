@@ -2,9 +2,9 @@
 //
 // Hooks on the game's D3D library (XDK 2.0.6683; addresses and signatures in
 // docs/d3d-map-*.md). With the native renderer the original still runs, so
-// the D3D library's bookkeeping and command stream stay intact (the GPU
-// plugin's null backend retires that stream); the renderer reads the device
-// state at these points. Otherwise they only call the original.
+// the D3D library's bookkeeping stays intact; the renderer reads the device
+// state at these points, and native_gpu.cpp does the GPU side the game can see
+// (fences, callbacks, the flip). Otherwise they only call the original.
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +22,7 @@
 #include <rex/logging.h>
 
 #include "guest.h"
+#include "native_gpu.h"
 #include "video.h"
 
 namespace {
@@ -204,6 +205,39 @@ REX_HOOK_RAW(sub_83762CF8) {
   __imp__sub_83762CF8(ctx, base);
   if (ng2::video::IsNativeRenderer()) {
     ng2::video::OnResolve(device, flags, rect, texture, point, clearColor, clearZ, clearStencil);
+  }
+}
+
+// InsertFence(dev, command buffer) -> command buffer
+REX_EXTERN(__imp__sub_8375F810);
+REX_HOOK_RAW(sub_8375F810) {
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::gpu::OnInsertFence(ctx.r3.u32);
+  }
+  __imp__sub_8375F810(ctx, base);
+}
+
+// The callback handshake(dev, command buffer, flags, callback, argument) ->
+// command buffer: a CPU callback when the GPU gets there.
+REX_EXTERN(__imp__sub_8375FD30);
+REX_HOOK_RAW(sub_8375FD30) {
+  if (ng2::video::IsNativeRenderer()) {
+    ng2::gpu::OnCallbackHandshake(ctx.r3.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);
+  }
+  __imp__sub_8375FD30(ctx, base);
+}
+
+// The flip(dev, no wait): its handshake (the swap callback) comes from inside.
+REX_EXTERN(__imp__sub_8376A518);
+REX_HOOK_RAW(sub_8376A518) {
+  uint32_t device = ctx.r3.u32, noWait = ctx.r4.u32;
+  bool native = ng2::video::IsNativeRenderer();
+  if (native) {
+    ng2::gpu::OnFlipBegin(device, noWait);
+  }
+  __imp__sub_8376A518(ctx, base);
+  if (native) {
+    ng2::gpu::OnFlipWait(device, noWait);
   }
 }
 

@@ -18,6 +18,7 @@
 #include "aspect.h"
 #include "dlc.h"
 #include "gameplay.h"
+#include "gpu/native_gpu.h"
 #include "gpu/video.h"
 #include "movie/movie.h"
 #include "null_audio.h"
@@ -74,20 +75,12 @@ class Ng2App : public rex::ReXApp {
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
-    // The native renderer (unless NG2_RENDERER=xenos) draws and presents. The GPU
-    // plugin's null backend still runs the game's command stream (fences,
-    // interrupts, vblank) so its D3D library works unmodified.
+    // The native renderer (unless NG2_RENDERER=xenos) draws and presents, and
+    // native_gpu.cpp does the rest of what the game's D3D asks of a GPU: no GPU
+    // emulation, no GPU plugin.
     if (ng2::video::IsNativeRenderer()) {
       config.gpu_plugin.clear();
-      config.graphics = rex::system::LoadGpuPlugin("xenos", "null");
-      if (!config.graphics) {
-        // Without it the game's D3D waits forever on a ring nobody reads.
-        REXLOG_ERROR("the native renderer needs the xenos GPU plugin's null backend");
-        rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
-                                  "The GPU plugin (librexgpu-xenos) is missing or too old.");
-        std::_Exit(1);
-      }
-      REXLOG_INFO("native renderer: GPU emulation off (null command processor)");
+      config.graphics = ng2::gpu::CreateNativeGraphicsSystem();
     }
 
     // NG2_AUDIO=0: run the audio pipeline without an output device.
