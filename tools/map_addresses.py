@@ -1,6 +1,7 @@
-"""Map the guest addresses the code uses from one build of the game to another (1.0 -> TU2).
+"""Map the guest addresses the code uses from one build of the game to another (1.0 -> TU2,
+TU2 -> TU3; "1.0" and "TU2" below are the old and the new build).
 
-usage: map_addresses.py <image_1.0> <image_tu2> <repo>
+usage: map_addresses.py <old image> <new image> <repo>
 
 Code: masked instruction windows (branch displacements and lis-built address
 immediates dropped), matched by rolling hash, must be unique in TU2.

@@ -1,28 +1,28 @@
-# Ninja Gaiden II (544307D5, default.xex 2008-05-09 with Title Update 2) codegen overrides.
+# Ninja Gaiden II (544307D5, default.xex 2008-05-09 with Title Update 3) codegen overrides.
 # Included from ng2_manifest.toml.
 
 # MSVC CRT; libjpeg's error_exit longjmps out of the decoder.
-setjmp_address = 0x8397B4A0
-longjmp_address = 0x8397B180
+setjmp_address = 0x8397B4E0
+longjmp_address = 0x8397B1C0
 
 [functions]
 # this-adjustor thunks (addi r3,r3,N; b ...) the analysis skipped
-0x837803F0 = { size = 8 }
-0x837817B8 = { size = 8 }
+0x83780438 = { size = 8 }
+0x83781800 = { size = 8 }
 # ends in a no-return KeBugCheck; SwitchToFiber starts right after it
-0x8383E8D0 = { size = 0x10 }
-0x8383E8E0 = { name = "SwitchToFiber" }
+0x8383E8F0 = { size = 0x10 }
+0x8383E900 = { name = "SwitchToFiber" }
 
 # XAPI fibers run on the SDK's host fibers.
 [rexcrt]
-ConvertThreadToFiber = 0x83833B00
-ConvertFiberToThread = 0x83833B90
-CreateFiber = 0x83833BE0
-DeleteFiber = 0x83833CC0
-SwitchToFiber = 0x8383E8E0
+ConvertThreadToFiber = 0x83833B20
+ConvertFiberToThread = 0x83833BB0
+CreateFiber = 0x83833C00
+DeleteFiber = 0x83833CE0
+SwitchToFiber = 0x8383E900
 
 # Cheats (src/cheats.cpp): Mission Mode's difficulty count, just loaded.
 [[midasm_hook]]
-address = 0x823E4A48
+address = 0x823E4A80
 name = "Ng2MissionDifficulties"
 registers = ["r11", "r31"]

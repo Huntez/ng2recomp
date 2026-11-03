@@ -137,6 +137,10 @@ else()
     target_link_libraries(ng2_shaders PUBLIC PkgConfig::ZSTD)
 endif()
 target_link_libraries(ng2 PRIVATE ng2_shaders)
+if(WIN32)
+    # The first-run setup (src/windows_setup.cpp): the title update's SHA-1.
+    target_link_libraries(ng2 PRIVATE bcrypt)
+endif()
 
 # Movies decoded on the host (src/movie): the game's WMV3/VC-1 and WMA files.
 if(WIN32)

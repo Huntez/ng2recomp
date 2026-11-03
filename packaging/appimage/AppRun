@@ -14,8 +14,40 @@ error() {
   exit 1
 }
 
-# The game files: NG2_GAME_DIR, the remembered folder, or ask (the extracted
-# folder, or the disc image, which is extracted into the data folder).
+# A disc image or package into a folder, with kdialog's progress bar when
+# qdbus is there to drive it; 130 if the player cancelled.
+extract() {
+  local qdbus ref pid percent
+  qdbus=$(command -v qdbus6 || command -v qdbus || true)
+  if [ -z "$qdbus" ] || ! ref=$(kdialog --title "Ninja Gaiden II" \
+      --progressbar "Copying the game from the disc..." 100 2>/dev/null); then
+    python3 -I "$here/usr/bin/xdvdfs_extract.py" "$1" "$2" 2>"$data_dir/extract.log"
+    return
+  fi
+  "$qdbus" $ref showCancelButton true >/dev/null 2>&1 || true
+  python3 -I "$here/usr/bin/xdvdfs_extract.py" "$1" "$2" --progress \
+    >"$data_dir/extract.progress" 2>"$data_dir/extract.log" &
+  pid=$!
+  while kill -0 $pid 2>/dev/null; do
+    sleep 0.5
+    percent=$(tail -1 "$data_dir/extract.progress" 2>/dev/null)
+    [ -n "$percent" ] && "$qdbus" $ref Set "" value "$percent" >/dev/null 2>&1
+    if [ "$("$qdbus" $ref wasCancelled 2>/dev/null)" = true ]; then
+      kill $pid 2>/dev/null; wait $pid 2>/dev/null
+      "$qdbus" $ref close >/dev/null 2>&1
+      rm -f "$data_dir/extract.progress"
+      return 130
+    fi
+  done
+  wait $pid; local status=$?
+  "$qdbus" $ref close >/dev/null 2>&1 || true
+  rm -f "$data_dir/extract.progress"
+  return $status
+}
+
+# The game files: NG2_GAME_DIR, the remembered folder, or ask: default.xex in
+# an extracted copy, or a disc image or Games on Demand package (its header
+# file, next to the .data folder), which is extracted into the data folder.
 game=${NG2_GAME_DIR:-}
 if [ -z "$game" ] && [ -f "$config_dir/game_dir" ]; then
   game=$(cat "$config_dir/game_dir")
@@ -23,31 +55,58 @@ fi
 if [ -z "$game" ] || [ ! -f "$game/default.xex" ]; then
   command -v kdialog >/dev/null ||
     error "Set NG2_GAME_DIR to the folder with default.xex (kdialog is needed to ask)."
+  kdialog --title "Ninja Gaiden II" --msgbox \
+    "Choose your copy of the game: a disc image (.iso), the Games on Demand package (the file in 544307D5/00007000, next to its .data folder), or default.xex in an extracted copy. A disc image or package is copied into $data_dir/game." || exit 0
   choice=$(kdialog --title "Ninja Gaiden II: game files" \
-    --getopenfilename "$HOME" "*.iso default.xex|Disc image or default.xex") || exit 0
-  case "$choice" in
-    *.iso|*.ISO)
+    --getopenfilename "$HOME" "*|Disc image, Games on Demand package or default.xex") || exit 0
+  name=$(basename "$choice")
+  case "${name,,}" in
+    default.xex) game=$(dirname "$choice") ;;
+    *)
       game=$data_dir/game
       rm -rf "$game.part"
-      python3 -I "$here/usr/bin/xdvdfs_extract.py" "$choice" "$game.part" ||
-        error "Could not read the disc image."
-      rm -rf "$game" && mv "$game.part" "$game"
+      extract "$choice" "$game.part" || {
+        status=$?
+        rm -rf "$game.part"
+        [ $status -eq 130 ] && exit 0  # cancelled
+        error "Could not read the game from that file: $(tail -1 "$data_dir/extract.log")"
+      }
+      [ -f "$game.part/default.xex" ] || { rm -rf "$game.part"; error "There's no default.xex on that disc."; }
+      # The new copy replaces the old one, which is set aside first and only
+      # deleted once its downloadable content and title update are moved over.
+      # One left by a swap that failed halfway: its content first.
+      for keep in dlc default.xexp; do
+        if [ ! -e "$game/$keep" ] && [ -e "$game.old/$keep" ]; then mv "$game.old/$keep" "$game.part/$keep"; fi
+      done
+      rm -rf "$game.old"
+      if [ -e "$game" ]; then
+        mv "$game" "$game.old" || { rm -rf "$game.part"; error "Can't replace $game."; }
+      fi
+      mv "$game.part" "$game" || { mv "$game.old" "$game" 2>/dev/null; error "Can't write to $game."; }
+      kept=1
+      for keep in dlc default.xexp; do
+        if [ -e "$game.old/$keep" ]; then mv "$game.old/$keep" "$game/$keep" || kept=; fi
+      done
+      [ -n "$kept" ] && rm -rf "$game.old"
       ;;
-    *) game=$(dirname "$choice") ;;
   esac
   [ -f "$game/default.xex" ] || error "No default.xex in $game."
   printf '%s\n' "$game" > "$config_dir/game_dir"
 fi
 
-tu2_sha1=22d3be744cc43316e6f93d3d17834a814dd28062
-# Title Update 2 (default.xexp next to default.xex): ask for the update
+tu3_sha1=e9df578781355d9a25e1c0adba8fbb859333456a  # the World disc's (media ID 69F555CB)
+tu2_sha1=22d3be744cc43316e6f93d3d17834a814dd28062  # what earlier builds ran: replaced
+# Title Update 3 (default.xexp next to default.xex): ask for the update
 # package (or an extracted default.xexp) once and put it in the game folder.
+if [ -f "$game/default.xexp" ] && [ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu2_sha1" ]; then
+  mv "$game/default.xexp" "$game/default.xexp.tu2" 2>/dev/null || true
+fi
 if [ ! -f "$game/default.xexp" ]; then
   command -v kdialog >/dev/null ||
-    error "Title Update 2 is missing: put default.xexp in $game (kdialog is needed to ask)."
-  kdialog --title "Ninja Gaiden II: Title Update 2" --msgbox \
-    "This port runs the game with Title Update 2. Choose the update: its package (TU_1A461UL_000000G000000.00000000000G4) or an extracted default.xexp." || exit 0
-  update=$(kdialog --title "Ninja Gaiden II: Title Update 2" \
+    error "Title Update 3 is missing: put default.xexp in $game (kdialog is needed to ask)."
+  kdialog --title "Ninja Gaiden II: Title Update 3" --msgbox \
+    "This port runs the game with Title Update 3 (for the World release, media ID 69F555CB). Choose the update: its package (TU_1A461UL_000000G000000.00000000000O4) or an extracted default.xexp." || exit 0
+  update=$(kdialog --title "Ninja Gaiden II: Title Update 3" \
     --getopenfilename "$HOME" "TU_* default.xexp|Title update or default.xexp") || exit 0
   [ -w "$game" ] || error "Can't write to $game: copy default.xexp there yourself."
   case "$(basename "$update")" in
@@ -55,16 +114,45 @@ if [ ! -f "$game/default.xexp" ]; then
     *) python3 -I "$here/usr/bin/stfs_extract.py" "$update" default.xexp "$game/default.xexp.part" ||
          error "That file isn't the title update." ;;
   esac
-  # Title Update 2's default.xexp, nothing else (another update or game's
-  # wouldn't fit this build).
-  if [ "$(sha1sum "$game/default.xexp.part" | cut -d' ' -f1)" != "$tu2_sha1" ]; then
+  # Title Update 3's default.xexp for this disc, nothing else (the Japanese
+  # release's TU3, another update or game's wouldn't fit this build).
+  if [ "$(sha1sum "$game/default.xexp.part" | cut -d' ' -f1)" != "$tu3_sha1" ]; then
     rm -f "$game/default.xexp.part"
-    error "That isn't Title Update 2 for this game."
+    error "That isn't Title Update 3 for this disc (the World release's: TU_1A461UL_000000G000000.00000000000O4)."
   fi
   mv "$game/default.xexp.part" "$game/default.xexp"
 fi
-[ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu2_sha1" ] ||
-  error "$game/default.xexp isn't Title Update 2 for this game. Remove it to choose the update again."
+[ "$(sha1sum "$game/default.xexp" | cut -d' ' -f1)" = "$tu3_sha1" ] ||
+  error "$game/default.xexp isn't Title Update 3 for this disc. Remove it to choose the update again."
+
+# Downloadable content, offered once: the packages in a chosen folder (at any
+# depth, as the console keeps them) copied into the game folder's dlc/, which
+# the game installs from at start.
+if [ ! -f "$config_dir/dlc_asked" ] && command -v kdialog >/dev/null; then
+  touch "$config_dir/dlc_asked"
+  if kdialog --title "Ninja Gaiden II: downloadable content" --yes-label "Add DLC" --no-label "Skip" \
+      --yesno "Add downloadable content? Choose the folder with the packages (for example 544307D5/00000002). You can also put them in the dlc folder inside the game folder later."; then
+    from=$(kdialog --title "Ninja Gaiden II: downloadable content" --getexistingdirectory "$HOME") || from=
+    if [ -n "$from" ]; then
+      # One of each name, none from the game's own dlc folder.
+      target=$(realpath -m "$game/dlc")
+      packages=()
+      declare -A seen=()
+      while IFS= read -r package; do
+        name=$(basename "$package")
+        case "$(realpath -m "$package")" in "$target"/*) continue ;; esac
+        [ -n "${seen[$name]:-}" ] && continue
+        seen[$name]=1
+        packages+=("$package")
+      done < <(python3 -I "$here/usr/bin/find_dlc.py" "$from")
+      if [ ${#packages[@]} -eq 0 ]; then
+        kdialog --title "Ninja Gaiden II" --error "There's no downloadable content for this game in $from." || true
+      elif ! { mkdir -p "$game/dlc" && cp -f "${packages[@]}" "$game/dlc/"; }; then
+        kdialog --title "Ninja Gaiden II" --error "Can't copy the downloadable content to $game/dlc." || true
+      fi
+    fi
+  fi
+fi
 
 export NG2_CONFIG=${NG2_CONFIG:-$config_dir/ng2.toml}
 exec "$here/usr/bin/ng2" --game_data_root="$game" --user_data_root="$data_dir/user" \

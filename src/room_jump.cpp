@@ -3,7 +3,7 @@
 // NG2_ROOM_JUMP=<from>:<to>: a test aid to reach a cutscene without playing
 // up to it. The story scripts load "rooms" (a stage, plus the cutscene stages
 // that come with it) and play their cutscenes with commands run by
-// sub_824427D0: a command is a u16 opcode (bit 14 picks one of two handler
+// sub_824428A0: a command is a u16 opcode (bit 14 picks one of two handler
 // tables; the story's are in the other, at 0x83AE8A70), a u16 argument count,
 // then u32 arguments. B18 loads a room, B166 waits for it, B20 plays its
 // cutscene, B19 unloads it. Rewriting all four from one room to another keeps
@@ -37,8 +37,8 @@ bool ParseJump(uint32_t& from, uint32_t& to) {
 
 }  // namespace
 
-REX_EXTERN(__imp__sub_824427D0);
-REX_HOOK_RAW(sub_824427D0) {
+REX_EXTERN(__imp__sub_824428A0);
+REX_HOOK_RAW(sub_824428A0) {
   uint32_t from = 0, to = 0;
   if (ParseJump(from, to)) {
     uint32_t command = ctx.r4.u32;
@@ -54,5 +54,5 @@ REX_HOOK_RAW(sub_824427D0) {
       REXLOG_INFO("room jump: story command B{} for room {} now room {}", index, from, to);
     }
   }
-  __imp__sub_824427D0(ctx, base);
+  __imp__sub_824428A0(ctx, base);
 }

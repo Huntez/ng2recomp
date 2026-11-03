@@ -1,13 +1,170 @@
-# Title Update 2
+# Title updates
 
-Since 2026-11-02 the port runs Ninja Gaiden II with Title Update 2 (0.0.2.4): the update's
-`default.xexp` sits next to `default.xex` and the SDK applies it, both when generating the code
-and when the game starts. TU2 is the last update for this disc (media ID 69F555CB) and the one
-Mission Mode needs. The game refuses to start without it; the AppImage asks for the update
-package (`TU_1A461UL_000000G000000.00000000000G4`) once and extracts its `default.xexp`
-(`tools/stfs_extract.py`, checked against its SHA-1).
+Since 2026-11-03 the port runs Ninja Gaiden II with Title Update 3 (0.0.3.4), the last update for
+the World disc (media ID 69F555CB): the update's `default.xexp` sits next to `default.xex` and the
+SDK applies it, both when generating the code and when the game starts. The installers ask for
+the update package (`TU_1A461UL_000000G000000.00000000000O4`, 2,486,272 bytes) once, extract its
+`default.xexp` (2,416,640 bytes, SHA-1 `e9df578781355d9a25e1c0adba8fbb859333456a`) and check it;
+an earlier install's TU2 is replaced. The Japanese release's TU3
+(`TU_1A461UL_000000C000000.00000000000O3`, media ID 0E6FB1CE) has the same size but patches that
+disc's 1.0 (version 3), not this one's (version 4), so it is refused.
 
-## Addresses
+What the updates changed isn't documented. Reports from 2008 tell of a late-July update that came
+with the Mission Mode DLC and froze cutscenes in chapters 10, 12 and 14 for players on Xbox Live,
+and a patch at the end of August that fixed those freezes and sped up the cutscene transitions;
+TU2 and TU3 are most likely those two (an inference: the files carry no dates).
+
+## Addresses, TU2 to TU3
+
+TU3 moves less than TU2 did (most addresses by under 0x900 bytes; the game's data, the 2D buckets,
+the menus' models and views, the title menu's entries don't move). The table maps every address
+the code used under TU2 (in `src/` and `ng2_codegen.toml`) that TU3 moves.
+`ng2_pointer_funcs.toml` was regenerated (`tools/find_pointer_funcs.py`, 48 functions; TU2: 45).
+
+Mapped with `tools/map_addresses.py <TU2 image> <TU3 image> <repo>` (both dumped with
+`ng2_dump_image`), then checked by hand:
+- read-only data by content (vtables by the functions their slots point to, the stage table by
+  its strings); the title menu's picture table moved by 8 bytes (TU3 adds two entries before it);
+- data reached only as base + offset by the bases the code builds near them (hundreds of sites
+  agree on no move): the in-game menu's views, confirmed in TU3's own notifier (83691480..4D0),
+  which calls 83692378 for 85326650, 853268A0 and 8532B800 as TU2's did (the map's 853268A8 for
+  853268A0 rested on one site and was wrong);
+- 83692368 (the menu font's scale) moved far, to 836CEDE8: found through its 19 callers;
+- the small functions by their bytes and the slots pointing at them, where the mapper's windows
+  landed on a neighbour: the movie player's `lwz; lwz; mtctr; bctr` thunks (+8 83888098, +0x48
+  836A41A8, +0x50 836A41B8, +0x5C 83888FD8, +0x60 83888180, +0x78 838881F8) and `kReturnZero`
+  (8242C148, `li r3,0; blr`, which TU3's vtables use where TU2's used 836A3860).
+
+| TU2 | TU3 |
+|---|---|
+| 8206EF3C | 8206EE68 |
+| 82286610 | 82286618 |
+| 82286658 | 82286660 |
+| 822869A0 | 822869B0 |
+| 8228A1B8 | 8228A1C8 |
+| 8228EBDC | 8228EBFC |
+| 822FA8B8 | 822FA8C8 |
+| 822FB368 | 822FB378 |
+| 822FDDF8 | 822FDE08 |
+| 823E1060 | 823E1098 |
+| 823E1200 | 823E1238 |
+| 823E1410 | 823E1448 |
+| 823E16DC | 823E1714 |
+| 823E1714 | 823E174C |
+| 823E174C | 823E1784 |
+| 823E1784 | 823E17BC |
+| 823E37F0 | 823E3828 |
+| 823E4120 | 823E4158 |
+| 823E4278 | 823E42B0 |
+| 823E4378 | 823E43B0 |
+| 823E4720 | 823E4758 |
+| 823E4A48 | 823E4A80 |
+| 823E57A0 | 823E57D8 |
+| 823E5968 | 823E59A0 |
+| 823E5D50 | 823E5D88 |
+| 823E5FA8 | 823E5FE0 |
+| 823E6680 | 823E66B8 |
+| 823E6CC8 | 823E6D00 |
+| 823E7230 | 823E7268 |
+| 823E76D8 | 823E7710 |
+| 823E86E8 | 823E8720 |
+| 82412488 | 82412508 |
+| 82412980 | 82412A00 |
+| 82412E28 | 82412EA8 |
+| 82413160 | 824131E0 |
+| 8242AF00 | 8242AFC0 |
+| 8242BF80 | 8242C048 |
+| 824427D0 | 824428A0 |
+| 8368E2D8 | 8368E2E8 |
+| 8368E4F0 | 8368E500 |
+| 8368E878 | 8368E888 |
+| 8368EA48 | 8368EA58 |
+| 8368EFE8 | 8368EFF8 |
+| 8368F568 | 8368F578 |
+| 8368FDA0 | 8368FDB0 |
+| 836912D8 | 83691298 |
+| 83691498 | 83691458 |
+| 83691B18 | 83691AD8 |
+| 83692368 | 836CEDE8 |
+| 83692538 | 83692378 |
+| 83692988 | 836927A8 |
+| 83693080 | 83692EC0 |
+| 83694370 | 836941B0 |
+| 83695478 | 836952B8 |
+| 836957D0 | 83695610 |
+| 83695828 | 83695668 |
+| 83695908 | 83695748 |
+| 836959C0 | 83695800 |
+| 83695AB0 | 836958F0 |
+| 8369FBA8 | 8369FB08 |
+| 8369FC88 | 8369FBE8 |
+| 836A3860 | 8242C148 |
+| 836A4210 | 836A4B90 |
+| 836A4830 | 836A5200 |
+| 836A50D0 | 836A5AA0 |
+| 836CF9C0 | 836CF0D0 |
+| 836CFA88 | 836CF198 |
+| 836CFA98 | 836CF1A8 |
+| 836CFCA0 | 836CF3B0 |
+| 836D0CD8 | 836D03E8 |
+| 836D1780 | 836D0E90 |
+| 836D1DB0 | 836D14C0 |
+| 836D2968 | 836D2078 |
+| 836D3400 | 836D2B10 |
+| 836D4C78 | 836D43C8 |
+| 837045E0 | 83704630 |
+| 83704790 | 837047E0 |
+| 83704928 | 83704978 |
+| 83705C98 | 83705CE8 |
+| 8370D570 | 8370D5C0 |
+| 8370DD20 | 8370DD70 |
+| 8372D310 | 8372D360 |
+| 83730A58 | 83730AA8 |
+| 8375C500 | 8375C550 |
+| 8375E290 | 8375E2E0 |
+| 8375E538 | 8375E588 |
+| 83760B00 | 83760B50 |
+| 83760EC8 | 83760F18 |
+| 83761488 | 837614D8 |
+| 83761928 | 83761978 |
+| 83761E58 | 83761EA8 |
+| 83762240 | 83762290 |
+| 83762CA8 | 83762CF8 |
+| 8376A9F8 | 8376AA48 |
+| 83774818 | 83774800 |
+| 837803F0 | 83780438 |
+| 837817B8 | 83781800 |
+| 83833360 | 83833380 |
+| 83833928 | 83833948 |
+| 83833B00 | 83833B20 |
+| 83833B90 | 83833BB0 |
+| 83833BE0 | 83833C00 |
+| 83833CC0 | 83833CE0 |
+| 83835940 | 83835960 |
+| 838359D8 | 838359F8 |
+| 8383E678 | 8383E698 |
+| 8383E8D0 | 8383E8F0 |
+| 8383E8E0 | 8383E900 |
+| 83887F58 | 83888098 |
+| 83887F68 | 836A41A8 |
+| 83887F78 | 836A41B8 |
+| 83887F88 | 838880A8 |
+| 83888060 | 83888180 |
+| 83888070 | 83888190 |
+| 838885A8 | 838886D8 |
+| 83888EE0 | 83888FD8 |
+| 8388D3B8 | 838881F8 |
+| 8397B180 | 8397B1C0 |
+| 8397B4A0 | 8397B4E0 |
+| 83AB3870 | 83AB3878 |
+
+## Title Update 2 (2026-11-02 to 2026-11-03)
+
+From 2026-11-02 the port ran Title Update 2 (0.0.2.4, `TU_1A461UL_000000G000000.00000000000G4`,
+its `default.xexp` 2,318,336 bytes, SHA-1 `22d3be744cc43316e6f93d3d17834a814dd28062`), then taken
+for the last update for this disc.
+
+### Addresses, 1.0 to TU2
 
 The update moves most of the game's code and data. Notes written before the move (the other files
 in `docs/`, older commit messages) use 1.0 addresses; the table below maps every address the code

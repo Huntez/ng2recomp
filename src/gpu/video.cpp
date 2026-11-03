@@ -39,6 +39,7 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 
 #define XXH_INLINE_ALL
@@ -354,6 +355,8 @@ void ReportProfile() {
   for (size_t i = 0; i < size_t(Stage::kCount); i++) {
     line += fmt::format(" {} {:.1f}", kStageNames[i], g_profile.nanoseconds[i] / 1e6);
   }
+  REXLOG_INFO("video: {} frames, ms:{}; compared {:.1f} MB, uploaded {:.1f} MB", g_profile.frames,
+              line, g_profile.comparedBytes / 1048576.0, g_profile.uploadedBytes / 1048576.0);
   REXLOG_INFO("video: {} frames, ms:{}; compared {:.1f} MB, uploaded {:.1f} MB", g_profile.frames,
               line, g_profile.comparedBytes / 1048576.0, g_profile.uploadedBytes / 1048576.0);
   g_profile = Profile{};
@@ -2196,6 +2199,7 @@ struct PipelineWorkers {
   bool stop = false;
 } g_pipelineWorkers;
 std::unordered_set<uint64_t> g_pendingPipelines;  // asked of the workers, not taken yet
+std::unordered_set<uint64_t> g_earlyQueued;  // asked early, still in the queue (under its mutex)
 std::filesystem::path g_pipelineListPath;
 std::unordered_set<uint64_t> g_listedPipelines;   // in the list file
 constexpr uint32_t kPipelineListMagic = 0x4E473250;  // "NG2P"
@@ -2213,6 +2217,7 @@ void PipelineWorker() {
       }
       job = w.jobs.front();
       w.jobs.pop_front();
+      g_earlyQueued.erase(job.hash);
     }
     auto pipeline = MakePipeline(job.key, job.vertexShader, job.pixelShader);
     std::lock_guard lock(w.mutex);
@@ -2233,6 +2238,7 @@ void StopPipelineWorkers() {
     std::lock_guard lock(w.mutex);
     w.stop = true;
     w.jobs.clear();
+    g_earlyQueued.clear();
   }
   w.wake.notify_all();
   for (auto& thread : w.threads) {
@@ -2248,12 +2254,28 @@ void StopPipelineWorkers() {
 void AskForPipeline(uint64_t hash, const PipelineKey& key, RenderShader* vertexShader,
                     RenderShader* pixelShader, bool early = false) {
   if (!g_pendingPipelines.insert(hash).second) {
+    if (!early) {
+      // Asked for early (the list, the seed) and still waiting: a draw needs it now.
+      std::lock_guard lock(g_pipelineWorkers.mutex);
+      if (!g_earlyQueued.erase(hash)) {
+        return;  // already made, being made, or already moved up
+      }
+      auto& jobs = g_pipelineWorkers.jobs;
+      auto it = std::find_if(jobs.begin(), jobs.end(),
+                             [&](const PipelineJob& job) { return job.hash == hash; });
+      if (it != jobs.end() && it != jobs.begin()) {
+        PipelineJob job = *it;
+        jobs.erase(it);
+        jobs.push_front(job);
+      }
+    }
     return;
   }
   {
     std::lock_guard lock(g_pipelineWorkers.mutex);
     PipelineJob job{hash, key, vertexShader, pixelShader};
     if (early) {
+      g_earlyQueued.insert(hash);
       g_pipelineWorkers.jobs.push_back(job);
     } else {
       g_pipelineWorkers.jobs.push_front(job);
@@ -2297,42 +2319,56 @@ void ListPipeline(uint64_t hash, const PipelineKey& key) {
 
 RenderShader* HostShader(const ShaderCacheEntry* entry);
 
-// The listed pipelines, asked of the workers at start.
-void MakeListedPipelines() {
-  if (g_pipelineListPath.empty()) {
-    return;
-  }
-  FILE* f = std::fopen(g_pipelineListPath.string().c_str(), "rb");
+// The pipelines in a list file, asked of the workers. The player's list is
+// repaired (a record cut short when the game stopped while writing it) or,
+// from another version, dropped. The seed (packaging: pipelines recorded
+// playing the game at the default 2x antialiasing) is only read, its
+// multisampled pipelines moved to the antialiasing in use.
+uint32_t AskForListedPipelines(const std::filesystem::path& path, bool seed) {
+  FILE* f = std::fopen(path.string().c_str(), "rb");
   if (!f) {
-    return;
+    return 0;
   }
   uint32_t header[3] = {};
   if (std::fread(header, sizeof(header), 1, f) != 1 || header[0] != kPipelineListMagic ||
       header[1] != kPipelineListVersion || header[2] != sizeof(PipelineKey)) {
     std::fclose(f);
-    REXLOG_WARN("video: {} is from another version; starting a new one",
-                g_pipelineListPath.string());
-    std::filesystem::remove(g_pipelineListPath);
-    return;
+    REXLOG_WARN("video: {} is from another version; {}", path.string(),
+                seed ? "not used" : "starting a new one");
+    if (!seed) {
+      std::filesystem::remove(path);
+    }
+    return 0;
   }
-  // A record cut short (the game stopped while writing it) is cut off, so
-  // later ones line up.
-  uint64_t size = std::filesystem::file_size(g_pipelineListPath);
-  uint64_t whole = sizeof(header) + (size - sizeof(header)) / sizeof(PipelineKey) * sizeof(PipelineKey);
-  if (whole != size) {
-    std::fclose(f);
-    std::filesystem::resize_file(g_pipelineListPath, whole);
-    f = std::fopen(g_pipelineListPath.string().c_str(), "rb");
-    if (!f || std::fseek(f, sizeof(header), SEEK_SET) != 0) {
-      if (f) {
-        std::fclose(f);
+  if (!seed) {
+    // A record cut short is cut off, so later ones line up.
+    uint64_t size = std::filesystem::file_size(path);
+    uint64_t whole =
+        sizeof(header) + (size - sizeof(header)) / sizeof(PipelineKey) * sizeof(PipelineKey);
+    if (whole != size) {
+      std::fclose(f);
+      std::filesystem::resize_file(path, whole);
+      f = std::fopen(path.string().c_str(), "rb");
+      if (!f || std::fseek(f, sizeof(header), SEEK_SET) != 0) {
+        if (f) {
+          std::fclose(f);
+        }
+        return 0;
       }
-      return;
     }
   }
+  uint32_t antialiasing = AntialiasingSetting();
   PipelineKey key;
   uint32_t asked = 0;
   while (std::fread(&key, sizeof(key), 1, f) == 1) {
+    if (seed) {
+      // Recorded at 2x antialiasing and render scale 1: a game 2x target had 2 samples, a 4x
+      // one 4 (SampleCount), and the slope bias grows with the scale (PolygonOffset).
+      if (key.samples > 1) {
+        key.samples = antialiasing < 2 ? 1 : std::max(antialiasing, key.samples);
+      }
+      key.slopeDepthBias *= float(g_resolutionScale);
+    }
     uint64_t hash = XXH3_64bits(&key, sizeof(key));
     if (!g_listedPipelines.insert(hash).second) {
       continue;
@@ -2348,7 +2384,35 @@ void MakeListedPipelines() {
     asked++;
   }
   std::fclose(f);
-  REXLOG_INFO("video: making {} listed pipelines in the background", asked);
+  return asked;
+}
+
+// The packaged seed: next to the executable, or in ../share/ng2 (the AppImage).
+std::filesystem::path PipelineSeedPath() {
+  std::filesystem::path dir = rex::filesystem::GetExecutableFolder();
+  std::error_code ec;
+  for (const auto& path : {dir / "ng2-pipelines-seed.bin",
+                           dir.parent_path() / "share" / "ng2" / "ng2-pipelines-seed.bin"}) {
+    if (std::filesystem::is_regular_file(path, ec)) {
+      return path;
+    }
+  }
+  return {};
+}
+
+// The listed pipelines (the player's, then the seed's), asked of the workers
+// at start. The seed's aren't copied into the player's list: it's read at
+// every start, so the player's list holds only what the seed lacks.
+void MakeListedPipelines() {
+  uint32_t own = 0, seeded = 0;
+  if (!g_pipelineListPath.empty()) {
+    own = AskForListedPipelines(g_pipelineListPath, false);
+  }
+  if (std::filesystem::path seed = PipelineSeedPath(); !seed.empty()) {
+    seeded = AskForListedPipelines(seed, true);
+  }
+  REXLOG_INFO("video: making {} listed pipelines and {} from the seed in the background", own,
+              seeded);
 }
 
 RenderPipeline* GetPipeline(const PipelineKey& key, RenderShader* vertexShader,

@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 #include <rex/cvar.h>
 #include <rex/input/input_system.h>
@@ -26,8 +27,9 @@
 
 class Ng2App : public rex::ReXApp {
  public:
-  // Title Update 2's default.xexp (the AppImage also checks its SHA-1).
-  static constexpr uintmax_t kTitleUpdate2Size = 2318336;
+  // Title Update 3's default.xexp, for the World disc (the installers also
+  // check its SHA-1: the Japanese release's TU3 has the same size).
+  static constexpr uintmax_t kTitleUpdate3Size = 2416640;
   static constexpr uint32_t kSystemUiNotification = 0x9;  // XN_SYS_UI
   bool paused_in_background_ = false;
 
@@ -43,7 +45,7 @@ class Ng2App : public rex::ReXApp {
   // runs keep away from the player's settings).
   void OnConfigurePaths(rex::PathConfig& paths) override {
 #ifdef _WIN32
-    // The game folder and Title Update 2 (asked for once), settings and
+    // The game folder and Title Update 3 (asked for once), settings and
     // saves in %LOCALAPPDATA%: what the AppImage's launcher does on Linux.
     if (!ng2::windows_setup::ConfigurePaths(paths)) {
       std::_Exit(0);
@@ -58,12 +60,16 @@ class Ng2App : public rex::ReXApp {
     ng2::recomp_settings::SetAppContext(&app_context());
   }
 
-  // Game-specific defaults (from Xenia's compatibility notes for 544307D5),
-  // unless the user set them: the game reads the zero page.
+  // Game-specific defaults, unless the user set them: the game reads the
+  // zero page (from Xenia's compatibility notes for 544307D5), and its
+  // system link socket stays off the network (no LAN play here; on Windows
+  // it would bring up a firewall prompt).
   void OnPostInitLogging() override {
-    const auto* info = rex::cvar::GetFlagInfo("protect_zero");
-    if (info && info->source == rex::cvar::Source::kDefault) {
-      rex::cvar::SetFlagByName("protect_zero", "false");
+    for (auto [name, value] : {std::pair{"protect_zero", "false"}, {"net_bind_loopback", "true"}}) {
+      const auto* info = rex::cvar::GetFlagInfo(name);
+      if (info && info->source == rex::cvar::Source::kDefault) {
+        rex::cvar::SetFlagByName(name, value);
+      }
     }
   }
 
@@ -104,13 +110,13 @@ class Ng2App : public rex::ReXApp {
   }
 
   void OnPostSetup() override {
-    // The recompiled code is Title Update 2's. Without the update next to
-    // default.xex the game's data would be 1.0's, which that code misreads.
+    // The recompiled code is Title Update 3's. With another update (or none)
+    // next to default.xex the game's data wouldn't fit that code.
     std::error_code ec;
-    if (std::filesystem::file_size(game_data_root() / "default.xexp", ec) != kTitleUpdate2Size) {
-      REXLOG_ERROR("No Title Update 2 default.xexp in {}", game_data_root().string());
+    if (std::filesystem::file_size(game_data_root() / "default.xexp", ec) != kTitleUpdate3Size) {
+      REXLOG_ERROR("No Title Update 3 default.xexp in {}", game_data_root().string());
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
-                                "Title Update 2 is missing: its default.xexp must be next to "
+                                "Title Update 3 is missing: its default.xexp must be next to "
                                 "default.xex in the game folder.");
       std::_Exit(1);
     }

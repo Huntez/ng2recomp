@@ -35,7 +35,7 @@ constexpr uint32_t kText = 0xC4;        // the part's UTF-16 string
 constexpr uint32_t kTextScale = 0xC8;   // x, y
 constexpr uint32_t kTextPosition = 0xD0;  // x, y
 constexpr uint32_t kTextChars = 32;
-constexpr uint32_t kMenuFontSize = 0x1C;  // as the Options rows ask sub_83692368
+constexpr uint32_t kMenuFontSize = 0x1C;  // as the Options rows ask sub_836CEDE8
 // From the frame's anchor (about 953, 650 in the 1280x720 UI) to the top
 // left corner (left edge, line center).
 constexpr float kX = 32.0f - 953.0f, kY = 16.0f - 650.0f;
@@ -86,25 +86,25 @@ uint32_t CallGuest(PPCContext& ctx, uint8_t* base, void (*function)(PPCContext&,
 
 }  // namespace
 
-REX_EXTERN(__imp__sub_83835940);  // XMemAlloc(size, attributes)
-REX_EXTERN(__imp__sub_837045E0);  // a sprite's constructor
-REX_EXTERN(__imp__sub_8242BF80);  // a text part's constructor
-REX_EXTERN(__imp__sub_83692368);  // the menu font's scale for a size -> f1
-REX_EXTERN(__imp__sub_83691B18);  // a text item into this frame's 2D lists: (item, layer)
-REX_EXTERN(__imp__sub_83704790);  // a sprite's resource: (sprite, resource)
-REX_EXTERN(__imp__sub_83704928);  // a sprite's update
+REX_EXTERN(__imp__sub_83835960);  // XMemAlloc(size, attributes)
+REX_EXTERN(__imp__sub_83704630);  // a sprite's constructor
+REX_EXTERN(__imp__sub_8242C048);  // a text part's constructor
+REX_EXTERN(__imp__sub_836CEDE8);  // the menu font's scale for a size -> f1
+REX_EXTERN(__imp__sub_83691AD8);  // a text item into this frame's 2D lists: (item, layer)
+REX_EXTERN(__imp__sub_837047E0);  // a sprite's resource: (sprite, resource)
+REX_EXTERN(__imp__sub_83704978);  // a sprite's update
 
 namespace {
 
 bool MakeItem(PPCContext& ctx, uint8_t* base) {
-  uint32_t item = CallGuest(ctx, base, __imp__sub_83835940,
+  uint32_t item = CallGuest(ctx, base, __imp__sub_83835960,
                             {kItemSize + kTextChars * 2, kAllocAttributes});
   if (!item) {
     return false;
   }
   std::memset(ng2::guest::Virtual(item), 0, kItemSize + kTextChars * 2);
-  CallGuest(ctx, base, __imp__sub_837045E0, {item});
-  CallGuest(ctx, base, __imp__sub_8242BF80, {item + kTextPart});
+  CallGuest(ctx, base, __imp__sub_83704630, {item});
+  CallGuest(ctx, base, __imp__sub_8242C048, {item + kTextPart});
   Store32(item + kText, item + kItemSize);
   // Left aligned and centered on its line; +0xF0: placed by its measured size
   // (as the lists' value text is).
@@ -187,17 +187,17 @@ REX_HOOK_RAW(sub_822F0EF8) {
   }
   if (resource != g_resource) {
     g_resource = resource;
-    CallGuest(ctx, base, __imp__sub_83704790, {g_item, resource});
+    CallGuest(ctx, base, __imp__sub_837047E0, {g_item, resource});
   }
   // The menu font's scale, once its font is loaded.
   double scale = 0.0;
-  CallGuest(ctx, base, __imp__sub_83692368, {kMenuFontSize}, &scale);
+  CallGuest(ctx, base, __imp__sub_836CEDE8, {kMenuFontSize}, &scale);
   if (!std::isfinite(scale) || scale <= 0.0) {
     return;
   }
   StoreFloat(g_item + kTextScale, float(scale));
   StoreFloat(g_item + kTextScale + 4, float(scale));
   std::memcpy(ng2::guest::Virtual(g_item + 0x40), ng2::guest::Virtual(kTextColor), 16);
-  CallGuest(ctx, base, __imp__sub_83704928, {g_item});
-  CallGuest(ctx, base, __imp__sub_83691B18, {g_item, kLayer});
+  CallGuest(ctx, base, __imp__sub_83704978, {g_item});
+  CallGuest(ctx, base, __imp__sub_83691AD8, {g_item, kLayer});
 }

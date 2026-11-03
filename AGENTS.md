@@ -19,11 +19,13 @@ the rules that keep a test run from disturbing the machine it runs on.
   pointers (`tools/find_pointer_funcs.py` on an image dumped with `NG2_DUMP_IMAGE`).
 - `patches/`: changes to the ReXGlue SDK, XenosRecomp and plume (`git am` onto the pinned
   versions in `thirdparty/`, which aren't committed).
-- `packaging/`: the AppImage (`appimage/build.sh`) and the Windows icon and resources.
+- `packaging/`: the AppImage (`appimage/build.sh`: the portable one, built in a container;
+  `appimage/build-local.sh`: the native build, for this machine only), the Windows build
+  (`windows/build.sh`) and their resources.
 - `docs/`: `renderer-plan.md` (the renderer, with what was measured), `menus.md` (the game's menus,
   reverse-engineered), `shaders.md`, the D3D function maps (`d3d-map-*.md`), `xenia-notes.md`.
-  The game is Title Update 2 since 2026-11-02; notes from before then use 1.0 addresses, which
-  `title-update.md` maps (`tools/map_addresses.py` made the map).
+  The game is Title Update 3 since 2026-11-03 (Title Update 2 from 2026-11-02); older notes use
+  TU2 or 1.0 addresses, which `title-update.md` maps (`tools/map_addresses.py` made the maps).
 
 ## Building
 
@@ -41,8 +43,13 @@ devices, and none of the player's settings or saves.
   rotates at 5 MB: read `ng2.1.log` first). `NG2_SHOTS="30 60"` takes screenshots at those seconds.
 - `NG2_PAD_SCRIPT=30000:start,34000:a,...` plays a controller (`<ms>:<button>[:<hold ms>]`;
   buttons and sticks in `src/script_input.h`). From boot, `30000:start,34000:a,37000:a,40000:a,
-  58000:a,63000:a,262000:a` reaches Chapter 1's first fight at about 262 s; Back about 268 s opens
-  the in-game menu.
+  58000:a,63000:a,80000:a,262000:a,280000:a` reaches Chapter 1's first fight at about 280 s (TU3:
+  the chapter card takes the press at 80 s); Back about 300 s opens the in-game menu.
+- `tools/collect_pipelines.sh <out dir>` remakes the packaged pipeline seed
+  (`packaging/ng2-pipelines-seed.bin`): headless runs through Chapter 1 and Mission Mode (missions
+  1-12, fighting), their pipeline lists merged by `tools/merge_pipelines.py`. The game makes the
+  seed's pipelines in the background at start (src/gpu/video.cpp, `MakeListedPipelines`), moved to
+  the player's antialiasing. Remake it when shaders or the pipeline key change.
 - `NG2_ROOM_JUMP=<from>:<to>` swaps a room in the story script (src/room_jump.cpp lists the rooms
   with cutscenes): with the New Game path above, `3:5` plays the cutscene before Chapter 2 at about
   80-110 s.

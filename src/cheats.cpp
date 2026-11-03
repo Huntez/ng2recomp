@@ -2,30 +2,30 @@
 //
 // The Cheats page of RECOMP SETTINGS (recomp_settings.cpp).
 //
-// Infinite Health: damage to a character goes through sub_82412488 (r3 a
+// Infinite Health: damage to a character goes through sub_82412508 (r3 a
 // record whose first word is the character), and the damage that lowers its
-// most health (the red end of the bar) through sub_82412E28 and
-// sub_82413160. Each gives none when the byte at 0x83CB5992 is 1 (anyone),
+// most health (the red end of the bar) through sub_82412EA8 and
+// sub_824131E0. Each gives none when the byte at 0x83CB5992 is 1 (anyone),
 // or 2 and the character is the player (two of the character's own flags,
-// and in sub_82412488 the record's +10 being 0). It is set to 2 for those
+// and in sub_82412508 the record's +10 being 0). It is set to 2 for those
 // calls only, so enemies still take theirs.
 //
 // Infinite Ninpo: a character's ninpo is a u16 at +0x5942 (200 a charge).
-// A ninpo's cost is its item's property 0x19 (sub_83730A58), read only to
-// check a cast can be made (cost <= ninpo, sub_82412980) and to spend it
-// (sub_8372D310, which spends nothing at a cost of 0): it costs 0.
+// A ninpo's cost is its item's property 0x19 (sub_83730AA8), read only to
+// check a cast can be made (cost <= ninpo, sub_82412A00) and to spend it
+// (sub_8372D360, which spends nothing at a cost of 0): it costs 0.
 //
-// Unlock Difficulties: sub_823E1060(clears, d) says difficulty d is open
+// Unlock Difficulties: sub_823E1098(clears, d) says difficulty d is open
 // (some difficulty at or above d - 1 cleared). The New Game path list
 // (sub_8366F4D0) asks it for Mentor and Master Ninja; the answer is yes for
 // those two calls. Mission Mode doesn't ask: choosing a mission
-// (sub_823E4720) sets how many difficulties it offers (1, 2, 3 or 4) from
+// (sub_823E4758) sets how many difficulties it offers (1, 2, 3 or 4) from
 // the mission's record in the profile (cleared flags 0x10..0x80 in byte 7
 // of [0x84C559E0] + 1016 + 8 * mission), except for missions whose table
 // entry (0x83B2E334 + 12 * mission) is 3, which offer one. A hook right
 // after the count is set raises it to 4.
 //
-// Unlock Costumes: the costume list (sub_823E1410) adds a costume per
+// Unlock Costumes: the costume list (sub_823E1448) adds a costume per
 // difficulty the same check says is cleared; it is yes there too.
 //
 // Neither writes the unlocks to the profile (a game played on a difficulty
@@ -66,45 +66,45 @@ void WithoutPlayerDamage(PPCContext& ctx, uint8_t* base, void (*damage)(PPCConte
 
 }  // namespace
 
-REX_EXTERN(__imp__sub_82412488);
-REX_HOOK_RAW(sub_82412488) {
-  WithoutPlayerDamage(ctx, base, __imp__sub_82412488);
+REX_EXTERN(__imp__sub_82412508);
+REX_HOOK_RAW(sub_82412508) {
+  WithoutPlayerDamage(ctx, base, __imp__sub_82412508);
 }
-REX_EXTERN(__imp__sub_82412E28);
-REX_HOOK_RAW(sub_82412E28) {
-  WithoutPlayerDamage(ctx, base, __imp__sub_82412E28);
+REX_EXTERN(__imp__sub_82412EA8);
+REX_HOOK_RAW(sub_82412EA8) {
+  WithoutPlayerDamage(ctx, base, __imp__sub_82412EA8);
 }
-REX_EXTERN(__imp__sub_82413160);
-REX_HOOK_RAW(sub_82413160) {
-  WithoutPlayerDamage(ctx, base, __imp__sub_82413160);
+REX_EXTERN(__imp__sub_824131E0);
+REX_HOOK_RAW(sub_824131E0) {
+  WithoutPlayerDamage(ctx, base, __imp__sub_824131E0);
 }
 
-REX_EXTERN(__imp__sub_83730A58);
-REX_HOOK_RAW(sub_83730A58) {
+REX_EXTERN(__imp__sub_83730AA8);
+REX_HOOK_RAW(sub_83730AA8) {
   if (REXCVAR_GET(cheat_infinite_ninpo)) {
     ctx.r3.u64 = 0;
     return;
   }
-  __imp__sub_83730A58(ctx, base);
+  __imp__sub_83730AA8(ctx, base);
 }
 
 // The unlock check, by caller (its return address).
-REX_EXTERN(__imp__sub_823E1060);
-REX_HOOK_RAW(sub_823E1060) {
+REX_EXTERN(__imp__sub_823E1098);
+REX_HOOK_RAW(sub_823E1098) {
   uint32_t from = uint32_t(ctx.lr);
   bool paths = from == 0x8366F874 || from == 0x8366F8A8;
-  bool costumes = from == 0x823E16DC || from == 0x823E1714 || from == 0x823E174C ||
-                  from == 0x823E1784;
+  bool costumes = from == 0x823E1714 || from == 0x823E174C || from == 0x823E1784 ||
+                  from == 0x823E17BC;
   if ((paths && REXCVAR_GET(cheat_unlock_difficulties)) ||
       (costumes && REXCVAR_GET(cheat_unlock_costumes))) {
     ctx.r3.u64 = 1;
     return;
   }
-  __imp__sub_823E1060(ctx, base);
+  __imp__sub_823E1098(ctx, base);
 }
 
 // Mission Mode: r11 the difficulties offered, r31 the mission screen
-// (+4: the mission). ng2_codegen.toml places it at 0x823E4A48.
+// (+4: the mission). ng2_codegen.toml places it at 0x823E4A80.
 void Ng2MissionDifficulties(PPCRegister& r11, PPCRegister& r31) {
   constexpr uint32_t kMissionTable = 0x83B2E334;  // 12 bytes a mission
   constexpr uint32_t kFixedDifficulty = 3;

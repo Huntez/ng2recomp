@@ -48,28 +48,27 @@ limit; that headroom is what allows 4x-8x and MSAA on top.
 
 1. Download `NinjaGaiden2-x86_64.AppImage` from a test build and make it executable (`chmod +x`, or
    Properties → Allow executing).
-2. Run it. On the first start a window asks for your copy of the game: a disc image (`.iso`) or the
-   `default.xex` of an extracted copy. A disc image is extracted once into the data folder.
-3. It then asks for Title Update 2 (`TU_1A461UL_000000G000000.00000000000G4`, or its
-   `default.xexp`), which the port is built for, and puts it in the game folder.
-4. Downloadable content (Mission Mode, the costume packs): put the packages in a `dlc` folder in
-   the game folder (the console's `544307D5/00000002` folder can go in as it is). They are installed
-   on the next start.
+2. Run it. On the first start it installs the game:
+   1. Your copy of the game: a disc image (`.iso`), the Games on Demand package (the file in
+      `544307D5/00007000`, next to its `.data` folder), or the `default.xex` of an extracted copy.
+      A disc image or package is copied once into the data folder.
+   2. Title Update 3 for the World release (`TU_1A461UL_000000G000000.00000000000O4`, or its
+      `default.xexp`), which the port is built for. It goes in the game folder.
+   3. Downloadable content (Mission Mode, the costume packs), if you have it: the folder with the
+      packages (the console's `544307D5/00000002`). More can go in the game folder's `dlc` folder
+      later; they are installed on the next start.
 
-Needs a 64-bit Linux, a GPU with Vulkan 1.3 drivers, FFmpeg's libraries (libavformat, libavcodec,
-libswresample, libswscale) and `kdialog` for the first-start window. The test AppImages use the
-system's libraries, so a recent distribution is safest.
+Needs a 64-bit Linux with glibc 2.35 or newer (SteamOS, Ubuntu 22.04+, Debian 12, Fedora 36+), a
+GPU with Vulkan 1.3 drivers, Python 3 and `kdialog` for the first-start windows.
 
 ### Windows
 
 1. Download `NinjaGaiden2-windows-x64.zip` from a test build and unpack it anywhere.
-2. Run `ng2.exe`. The first time it asks for the folder with your copy of the game (the one with
-   `default.xex`, extracted from your disc) and for Title Update 2 (its package, or its
-   `default.xexp`), which it copies into that folder. DLC goes in a `dlc` folder there, as on Linux.
+2. Run `ng2.exe`. The first time it installs the game as on Linux: your copy of the game (disc
+   image, Games on Demand package or `default.xex`; a disc or package is copied into
+   `%LOCALAPPDATA%\NinjaGaiden2\game`), Title Update 3, then the DLC if you have it.
 
-Needs a GPU with Vulkan 1.3 drivers and the Microsoft Visual C++ 2015-2022 Redistributable (x64,
-[vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe)).
-Disc images aren't read on Windows yet: extract the disc first.
+Needs a GPU with Vulkan 1.3 drivers. The Microsoft Visual C++ runtime DLLs are included.
 
 ### Where things are kept
 
@@ -135,11 +134,11 @@ libswresample, libswscale).
        cd thirdparty/plume && git checkout 1192686 && git submodule update --init contrib/volk contrib/VulkanMemoryAllocator contrib/Vulkan-Headers
        git am ../../patches/plume/*.patch
 
-3. Extract the disc into `game_files/` and put Title Update 2's `default.xexp` next to
-   `default.xex` (see [docs/title-update.md](docs/title-update.md)):
+3. Extract the disc (or the Games on Demand package) into `game_files/` and put Title Update 3's
+   `default.xexp` next to `default.xex` (see [docs/title-update.md](docs/title-update.md)):
 
        python3 tools/xdvdfs_extract.py "Ninja Gaiden II (World).iso" game_files
-       python3 tools/stfs_extract.py TU_1A461UL_000000G000000.00000000000G4 default.xexp game_files/default.xexp
+       python3 tools/stfs_extract.py TU_1A461UL_000000G000000.00000000000O4 default.xexp game_files/default.xexp
 
 4. Build. This generates about 560 MB of C++ from the game's code and translates its shaders
    (see [docs/shaders.md](docs/shaders.md)):
@@ -147,9 +146,15 @@ libswresample, libswscale).
        cmake --preset linux-amd64-release
        cmake --build out/build/linux-amd64-release
 
-5. Run it, or pack an AppImage with `packaging/appimage/build.sh`:
+5. Run it:
 
        out/build/linux-amd64-release/ng2 --game_data_root=game_files
+
+The AppImage, `packaging/appimage/build.sh`, builds the SDK and the game in an Ubuntu 22.04
+container (Docker; `packaging/appimage/Dockerfile`), so it needs only glibc 2.35 and runs on
+SteamOS and other current distributions. It bundles a small FFmpeg with the movies' codecs and
+writes `out/appimage/NinjaGaiden2-x86_64.AppImage`. `packaging/appimage/build-local.sh` packs
+the native build instead, quicker but only for the machine that built it.
 
 The Windows build is cross-compiled from Linux after the native one: `packaging/windows/build.sh`
 (clang and lld against Microsoft's C runtime and Windows SDK from

@@ -2,8 +2,8 @@
 //
 // Aspect Ratio (Display page of RECOMP SETTINGS): the game draws for 16:9.
 //
-// 3D: the game's only 16:9 float (0x8228EBDC) is the aspect its projections
-// are built with (the camera update sub_822FA8B8 builds them from the field
+// 3D: the game's only 16:9 float (0x8228EBFC) is the aspect its projections
+// are built with (the camera update sub_822FA8C8 builds them from the field
 // of view at camera +176). It is set to the chosen aspect: wider screens see
 // more at the sides; narrower ones (16:10) keep the sides and get a taller
 // field of view (Vert+), set around that update.
@@ -12,8 +12,8 @@
 // presenter stretches it to the chosen aspect (src/gpu/video.cpp), so 2D is
 // drawn squeezed by the inverse, around the centre of the game's 1280x720
 // space, to look right once stretched: sprites and gauges (their four
-// pixel-space vertices, 24 bytes apart, at the quad draw sub_8368EFE8),
-// text (the 4x4 transform the text pass hands sub_8370DD20 by value in
+// pixel-space vertices, 24 bytes apart, at the quad draw sub_8368EFF8),
+// text (the 4x4 transform the text pass hands sub_8370DD70 by value in
 // r4..r10, a row-vector matrix: column 0 the high words of r4/r6/r8/r10,
 // column 1 their low words) and movies (sub_83660FC8 builds a movie's quad
 // in clip space: four vertices 16 bytes apart).
@@ -82,14 +82,14 @@ Squeeze CurrentSqueeze() {
 }
 
 
-// The 2D pass (sub_8368E2D8) draws 91 buckets in order; bucket i's items
+// The 2D pass (sub_8368E2E8) draws 91 buckets in order; bucket i's items
 // are a list (item +4: next) from [kBuckets + parity * 728 + 4 * i],
 // parity = [kBuckets + 1456] ^ 1, each drawn by its vtable +4 method. Every
-// bucket also holds a placeholder (draw method 0x83705C98). The bucket of
+// bucket also holds a placeholder (draw method 0x83705CE8). The bucket of
 // the item being drawn says what it is (the HUD's pieces have their own).
 constexpr uint32_t kBuckets = 0x85325ED8;
 constexpr int kBucketCount = 91;
-constexpr uint32_t kPlaceholderDraw = 0x83705C98;
+constexpr uint32_t kPlaceholderDraw = 0x83705CE8;
 
 std::unordered_map<uint32_t, int> g_itemBucket;  // render pass thread
 int g_drawBucket = -1;
@@ -354,39 +354,39 @@ float Aspect() {
 
 }  // namespace ng2::aspect
 
-// The camera's update (sub_822FA8B8, r3 the camera): its projection
-// (sub_822FB368) and right after it its other frustums (camera +688, +752)
+// The camera's update (sub_822FA8C8, r3 the camera): its projection
+// (sub_822FB378) and right after it its other frustums (camera +688, +752)
 // are built from the field of view at +176, so a narrower aspect's taller
 // one is set around the whole update; the aspect constant is set first.
-REX_EXTERN(__imp__sub_822FA8B8);
-REX_HOOK_RAW(sub_822FA8B8) {
+REX_EXTERN(__imp__sub_822FA8C8);
+REX_HOOK_RAW(sub_822FA8C8) {
   float aspect = ng2::aspect::Aspect();
   if (LoadFloat(kAspectConstant) != aspect && ng2::aspect::g_constantWritable) {
     StoreFloat(kAspectConstant, aspect);
   }
   uint32_t fovAddress = ctx.r3.u32 + kCameraFov;
   if (aspect >= kNative || !ctx.r3.u32) {
-    __imp__sub_822FA8B8(ctx, base);
+    __imp__sub_822FA8C8(ctx, base);
     return;
   }
   float fov = LoadFloat(fovAddress);
   float taller = 2.0f * std::atan(std::tan(fov * 0.5f) * kNative / aspect);
   StoreFloat(fovAddress, taller);
-  __imp__sub_822FA8B8(ctx, base);
-  // The update may add an effect's change to it (sub_822FDDF8): kept.
+  __imp__sub_822FA8C8(ctx, base);
+  // The update may add an effect's change to it (sub_822FDE08): kept.
   StoreFloat(fovAddress, fov + (LoadFloat(fovAddress) - taller));
 }
 
 // A sprite's or gauge's quad, in 1280x720 pixels.
-REX_EXTERN(__imp__sub_8368EFE8);
-REX_HOOK_RAW(sub_8368EFE8) {
+REX_EXTERN(__imp__sub_8368EFF8);
+REX_HOOK_RAW(sub_8368EFF8) {
   Squeeze s = CurrentSqueeze();
   uint32_t vertices = ctx.r4.u32;
   if (!s.active() || !vertices) {
     if (vertices) {
       NoteQuad(vertices, 24);
     }
-    __imp__sub_8368EFE8(ctx, base);
+    __imp__sub_8368EFF8(ctx, base);
     return;
   }
   constexpr uint32_t kStride = 24, kCount = 4;
@@ -394,13 +394,13 @@ REX_HOOK_RAW(sub_8368EFE8) {
   uint8_t saved[kStride * kCount];
   std::memcpy(saved, Virtual(vertices), sizeof(saved));
   SqueezeQuad(vertices, kStride, s);
-  __imp__sub_8368EFE8(ctx, base);
+  __imp__sub_8368EFF8(ctx, base);
   std::memcpy(Virtual(vertices), saved, sizeof(saved));
 }
 
 // A string's transform.
-REX_EXTERN(__imp__sub_8370DD20);
-REX_HOOK_RAW(sub_8370DD20) {
+REX_EXTERN(__imp__sub_8370DD70);
+REX_HOOK_RAW(sub_8370DD70) {
   Squeeze s = CurrentSqueeze();
   NotePoint(High(ctx.r10.u64), Low(ctx.r10.u64));
   if (s.active()) {
@@ -412,7 +412,7 @@ REX_HOOK_RAW(sub_8370DD20) {
     ctx.r10.u64 = Pair(High(ctx.r10.u64) * s.x + MapOffset(s.x, a.x, 1280.0f),
                        Low(ctx.r10.u64) * s.y + MapOffset(s.y, a.y, 720.0f));
   }
-  __imp__sub_8370DD20(ctx, base);
+  __imp__sub_8370DD70(ctx, base);
 }
 
 // A movie's quad, in clip space.
@@ -433,40 +433,40 @@ REX_HOOK_RAW(sub_83660FC8) {
 }
 
 // The 2D pass: its items' buckets first.
-REX_EXTERN(__imp__sub_8368E2D8);
-REX_HOOK_RAW(sub_8368E2D8) {
+REX_EXTERN(__imp__sub_8368E2E8);
+REX_HOOK_RAW(sub_8368E2E8) {
   ScanBuckets();
-  __imp__sub_8368E2D8(ctx, base);
+  __imp__sub_8368E2E8(ctx, base);
   g_drawBucket = -1;
   LogBoxes();
 }
 
 // The items' draw methods: sprite, gauge, text, rectangle, and the other.
-REX_EXTERN(__imp__sub_8368FDA0);
-REX_HOOK_RAW(sub_8368FDA0) {
-  DrawTagged(ctx, base, __imp__sub_8368FDA0);
+REX_EXTERN(__imp__sub_8368FDB0);
+REX_HOOK_RAW(sub_8368FDB0) {
+  DrawTagged(ctx, base, __imp__sub_8368FDB0);
 }
-REX_EXTERN(__imp__sub_8368F568);
-REX_HOOK_RAW(sub_8368F568) {
-  DrawTagged(ctx, base, __imp__sub_8368F568);
+REX_EXTERN(__imp__sub_8368F578);
+REX_HOOK_RAW(sub_8368F578) {
+  DrawTagged(ctx, base, __imp__sub_8368F578);
 }
-REX_EXTERN(__imp__sub_8370D570);
-REX_HOOK_RAW(sub_8370D570) {
-  DrawTagged(ctx, base, __imp__sub_8370D570);
+REX_EXTERN(__imp__sub_8370D5C0);
+REX_HOOK_RAW(sub_8370D5C0) {
+  DrawTagged(ctx, base, __imp__sub_8370D5C0);
 }
-REX_EXTERN(__imp__sub_8368E878);
-REX_HOOK_RAW(sub_8368E878) {
-  DrawTagged(ctx, base, __imp__sub_8368E878);
+REX_EXTERN(__imp__sub_8368E888);
+REX_HOOK_RAW(sub_8368E888) {
+  DrawTagged(ctx, base, __imp__sub_8368E888);
 }
-REX_EXTERN(__imp__sub_8368EA48);
-REX_HOOK_RAW(sub_8368EA48) {
-  DrawTagged(ctx, base, __imp__sub_8368EA48);
+REX_EXTERN(__imp__sub_8368EA58);
+REX_HOOK_RAW(sub_8368EA58) {
+  DrawTagged(ctx, base, __imp__sub_8368EA58);
 }
 
-// An untextured rectangle (sub_8368E878 builds it: 4 vertices 16 bytes
+// An untextured rectangle (sub_8368E888 builds it: 4 vertices 16 bytes
 // apart, x, y, z, colour), e.g. the health bar's red damage piece.
-REX_EXTERN(__imp__sub_8368E4F0);
-REX_HOOK_RAW(sub_8368E4F0) {
+REX_EXTERN(__imp__sub_8368E500);
+REX_HOOK_RAW(sub_8368E500) {
   Squeeze s = CurrentSqueeze();
   uint32_t vertices = ctx.r4.u32;
   constexpr uint32_t kStride = 16, kCount = 4;
@@ -474,36 +474,36 @@ REX_HOOK_RAW(sub_8368E4F0) {
     NoteQuad(vertices, kStride);
   }
   if (!s.active() || !vertices) {
-    __imp__sub_8368E4F0(ctx, base);
+    __imp__sub_8368E500(ctx, base);
     return;
   }
   uint8_t saved[kStride * kCount];
   std::memcpy(saved, Virtual(vertices), sizeof(saved));
   SqueezeQuad(vertices, kStride, s);
-  __imp__sub_8368E4F0(ctx, base);
+  __imp__sub_8368E500(ctx, base);
   std::memcpy(Virtual(vertices), saved, sizeof(saved));
 }
 
-// A clip item (draw method sub_8369FBA8: it saves the device's scissor and
+// A clip item (draw method sub_8369FB08: it saves the device's scissor and
 // sets one from the item's x, y, width and height at +16..+28; its partner
-// sub_8369FC88 puts the saved one back). The boss's health bar fill is
+// sub_8369FBE8 puts the saved one back). The boss's health bar fill is
 // drawn whole and clipped to what is left this way. Its draw is tagged as
 // the others, and the rect it sets (D3D's SetScissorRect(device, RECT*),
 // in the game's 1280x720 pixels) is mapped as the item's pieces are.
-REX_EXTERN(__imp__sub_8369FBA8);
+REX_EXTERN(__imp__sub_8369FB08);
 bool g_inClipItem = false;
-REX_HOOK_RAW(sub_8369FBA8) {
+REX_HOOK_RAW(sub_8369FB08) {
   g_inClipItem = true;
-  DrawTagged(ctx, base, __imp__sub_8369FBA8);
+  DrawTagged(ctx, base, __imp__sub_8369FB08);
   g_inClipItem = false;
 }
 
-REX_EXTERN(__imp__sub_8375C500);
-REX_HOOK_RAW(sub_8375C500) {
+REX_EXTERN(__imp__sub_8375C550);
+REX_HOOK_RAW(sub_8375C550) {
   Squeeze s = CurrentSqueeze();
   uint32_t rect = ctx.r4.u32;
   if (!s.active() || !g_inClipItem || !g_drawItem || !rect) {
-    __imp__sub_8375C500(ctx, base);
+    __imp__sub_8375C550(ctx, base);
     return;
   }
   int32_t r[4];
@@ -511,7 +511,7 @@ REX_HOOK_RAW(sub_8375C500) {
     r[i] = int32_t(Load32(rect + 4 * i));
   }
   if (r[0] <= 0 && r[1] <= 0 && r[2] >= 1280 && r[3] >= 720) {
-    __imp__sub_8375C500(ctx, base);  // the whole screen: left as it is
+    __imp__sub_8375C550(ctx, base);  // the whole screen: left as it is
     return;
   }
   Anchor a = ItemAnchor((r[0] + r[2]) * 0.5f, (r[1] + r[3]) * 0.5f);
@@ -526,7 +526,7 @@ REX_HOOK_RAW(sub_8375C500) {
   for (int i = 0; i < 4; i++) {
     store(rect + 4 * i, mapped[i]);
   }
-  __imp__sub_8375C500(ctx, base);
+  __imp__sub_8375C550(ctx, base);
   for (int i = 0; i < 4; i++) {
     store(rect + 4 * i, r[i]);
   }

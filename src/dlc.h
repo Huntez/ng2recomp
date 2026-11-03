@@ -13,6 +13,10 @@ class KernelState;
 
 namespace ng2::dlc {
 
+// This game's downloadable content: an STFS package (LIVE, PIRS or CON) of
+// content type 2 for title 544307D5.
+bool IsGameDlc(const std::filesystem::path& path);
+
 // Installs every content package (STFS LIVE/PIRS/CON file) under
 // <game_root>/dlc that isn't installed yet. A marker per package in
 // <user_root>/dlc_installed records the size and time of the installed copy,

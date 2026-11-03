@@ -1,7 +1,7 @@
 // ng2 - Ninja Gaiden II static recompilation
 //
 // NG2_DEBUG_WAITS=1: a debugging aid for stalls. Reports guest waits
-// (WaitForSingleObjectEx wrapper 8383E678) still blocked after 5 s or that
+// (WaitForSingleObjectEx wrapper 8383E698) still blocked after 5 s or that
 // took over 2 s, with the handle's last SetEvent caller, failed semaphore
 // releases, and the state of the game's job system (control block
 // 83C07CF0: submit 822F2688, worker run 822F2870), which is how the
@@ -83,8 +83,8 @@ void Watchdog() {
 }  // namespace
 
 // SetEvent(handle)
-REX_EXTERN(__imp__sub_83833360);
-REX_HOOK_RAW(sub_83833360) {
+REX_EXTERN(__imp__sub_83833380);
+REX_HOOK_RAW(sub_83833380) {
   if (Enabled()) {
     std::lock_guard lock(g_mutex);
     auto& set = g_sets[ctx.r3.u32];
@@ -92,14 +92,14 @@ REX_HOOK_RAW(sub_83833360) {
     set.count++;
     set.when = std::chrono::steady_clock::now();
   }
-  __imp__sub_83833360(ctx, base);
+  __imp__sub_83833380(ctx, base);
 }
 
 // WaitForSingleObjectEx(handle, timeout, alertable)
-REX_EXTERN(__imp__sub_8383E678);
-REX_HOOK_RAW(sub_8383E678) {
+REX_EXTERN(__imp__sub_8383E698);
+REX_HOOK_RAW(sub_8383E698) {
   if (!Enabled()) {
-    __imp__sub_8383E678(ctx, base);
+    __imp__sub_8383E698(ctx, base);
     return;
   }
   uint32_t handle = ctx.r3.u32, timeout = ctx.r4.u32, caller = uint32_t(ctx.lr);
@@ -112,7 +112,7 @@ REX_HOOK_RAW(sub_8383E678) {
     id = g_nextWait++;
     g_waiting[id] = {handle, caller, start};
   }
-  __imp__sub_8383E678(ctx, base);
+  __imp__sub_8383E698(ctx, base);
   {
     std::lock_guard lock(g_mutex);
     g_waiting.erase(id);
@@ -133,10 +133,10 @@ REX_HOOK_RAW(sub_8383E678) {
 }
 
 // ReleaseSemaphore(handle, count, &previous): log failures.
-REX_EXTERN(__imp__sub_83833928);
-REX_HOOK_RAW(sub_83833928) {
+REX_EXTERN(__imp__sub_83833948);
+REX_HOOK_RAW(sub_83833948) {
   uint32_t handle = ctx.r3.u32, count = ctx.r4.u32, lr = uint32_t(ctx.lr);
-  __imp__sub_83833928(ctx, base);
+  __imp__sub_83833948(ctx, base);
   if (Enabled() && ctx.r3.u32 == 0) {
     static int reports = 0;
     if (reports++ < 10) {

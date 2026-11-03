@@ -26,21 +26,6 @@ uint32_t BigEndian32(const unsigned char* p) {
   return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
 }
 
-// This game's downloadable content: an STFS package (LIVE, PIRS or CON) of
-// content type 2 for title 544307D5. A game, title update or save copied in
-// with it is skipped.
-bool IsGameDlc(const fs::path& path) {
-  std::ifstream file(path, std::ios::binary);
-  unsigned char header[0x364] = {};
-  if (!file.read(reinterpret_cast<char*>(header), sizeof(header))) {
-    return false;
-  }
-  bool stfs = !std::memcmp(header, "LIVE", 4) || !std::memcmp(header, "PIRS", 4) ||
-              !std::memcmp(header, "CON ", 4);
-  return stfs && BigEndian32(header + 0x344) == kMarketplaceContent &&
-         BigEndian32(header + 0x360) == kTitleId;
-}
-
 // Where InstallContent puts a package (and whether it is still there).
 bool Installed(rex::system::xam::ContentManager* content, const fs::path& package) {
   rex::system::xam::XCONTENT_AGGREGATE_DATA data;
@@ -67,6 +52,19 @@ std::string ReadMarker(const fs::path& path) {
 }
 
 }  // namespace
+
+// A game, title update or save copied in with the packages is not DLC.
+bool IsGameDlc(const fs::path& path) {
+  std::ifstream file(path, std::ios::binary);
+  unsigned char header[0x364] = {};
+  if (!file.read(reinterpret_cast<char*>(header), sizeof(header))) {
+    return false;
+  }
+  bool stfs = !std::memcmp(header, "LIVE", 4) || !std::memcmp(header, "PIRS", 4) ||
+              !std::memcmp(header, "CON ", 4);
+  return stfs && BigEndian32(header + 0x344) == kMarketplaceContent &&
+         BigEndian32(header + 0x360) == kTitleId;
+}
 
 void InstallPackages(rex::system::KernelState* kernel_state, const fs::path& game_root,
                      const fs::path& user_root) {

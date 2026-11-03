@@ -23,10 +23,10 @@ The native renderer (`src/gpu/video.cpp`) follows the Vulkan renderer of
 
 ## From the system
 
-The test AppImages don't carry these; they come from the system:
+These come from the system, except FFmpeg, which the AppImage and the Windows build carry:
 
 | Library | License |
 |---|---|
-| FFmpeg (libavformat, libavcodec, libswresample, libswscale) | LGPL-2.1-or-later (or GPL, depending on how the system's build was configured) |
+| FFmpeg (libavformat, libavcodec, libavutil, libswresample, libswscale) | LGPL-2.1-or-later. The AppImage bundles an LGPL build of FFmpeg 9.0.2 (source: https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz, configured as in `packaging/appimage/Dockerfile`) and the Windows build ships BtbN's LGPL shared build (`packaging/windows/build.sh`); a build from source uses the system's |
 | zstd (the embedded shader cache) | BSD-3-Clause |
 | The Vulkan loader | Apache-2.0 |

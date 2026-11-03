@@ -9,7 +9,7 @@
 namespace ng2::aspect {
 
 // The game's 16:9 float, which the camera's projection is built with.
-constexpr uint32_t kConstantAddress = 0x8228EBDC;
+constexpr uint32_t kConstantAddress = 0x8228EBFC;
 
 // The chosen aspect: 0 16:9, 1 16:10, 2 21:9, 3 32:9 (out of range: 0).
 uint32_t AspectIndex();
