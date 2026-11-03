@@ -36,6 +36,9 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
@@ -347,8 +350,75 @@ void ReportLatency() {
   }
 }
 
+// With NG2_PROFILE, every 5 s: the busiest threads' CPU time (ms of each
+// second, from /proc; Linux only), so a slow machine's log tells which thread
+// limits the frame rate. "(renderer)" is the game's render thread, which runs
+// this renderer.
+void ReportThreads() {
+#if defined(__linux__)
+  static std::unordered_map<int, uint64_t> last;
+  static auto lastTime = std::chrono::steady_clock::now();
+  static const int self = int(gettid());
+  auto now = std::chrono::steady_clock::now();
+  double seconds = std::chrono::duration<double>(now - lastTime).count();
+  if (seconds < 5.0) {
+    return;
+  }
+  lastTime = now;
+  static const double msPerTick = 1000.0 / double(sysconf(_SC_CLK_TCK));
+  std::vector<std::pair<double, std::string>> busy;
+  std::unordered_map<int, uint64_t> current;
+  std::error_code error;
+  for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task", error)) {
+    int tid = std::atoi(entry.path().filename().c_str());
+    FILE* f = std::fopen((entry.path() / "stat").c_str(), "r");
+    if (!f) {
+      continue;
+    }
+    char text[512] = {};
+    size_t n = std::fread(text, 1, sizeof(text) - 1, f);
+    std::fclose(f);
+    text[n] = 0;
+    const char* open = std::strchr(text, '(');
+    const char* close = std::strrchr(text, ')');
+    if (!open || !close) {
+      continue;
+    }
+    // After the name: state (field 3) ... utime (14), stime (15).
+    unsigned long long utime = 0, stime = 0;
+    if (std::sscanf(close + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &utime,
+                    &stime) != 2) {
+      continue;
+    }
+    uint64_t ticks = utime + stime;
+    current[tid] = ticks;
+    auto it = last.find(tid);
+    if (it == last.end() || ticks < it->second) {  // new, or a reused thread id
+      continue;
+    }
+    double ms = double(ticks - it->second) * msPerTick / seconds;
+    if (ms >= 10.0) {
+      std::string name(open + 1, close);
+      busy.emplace_back(ms, tid == self ? name + " (renderer)" : name);
+    }
+  }
+  last = std::move(current);
+  std::sort(busy.begin(), busy.end(), std::greater<>());
+  std::string line;
+  for (size_t i = 0; i < busy.size() && i < 8; i++) {
+    line += fmt::format("{}{} {:.0f}", i ? ", " : " ", busy[i].second, busy[i].first);
+  }
+  if (!line.empty()) {
+    REXLOG_INFO("threads, ms of CPU each second:{}", line);
+  }
+#endif
+}
+
 void ReportProfile() {
   ReportHitch();
+  if (g_profile.enabled) {
+    ReportThreads();
+  }
   g_profile.frames++;
   auto now = std::chrono::steady_clock::now();
   if (!g_profile.enabled || now - g_profile.last < std::chrono::seconds(1)) {
