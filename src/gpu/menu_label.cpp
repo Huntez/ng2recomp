@@ -352,6 +352,10 @@ uint32_t MenuHeaderGeneration() {
   return g_headerGeneration;
 }
 
+bool IsMenuHeaderSize(uint32_t width, uint32_t height) {
+  return height == kHeaderHeight && (width == kHeaderWidth || width == kInGameHeaderWidth);
+}
+
 bool ReplaceMenuHeader(uint32_t width, uint32_t height, const uint8_t* pixels,
                        std::vector<uint8_t>& out, uint32_t& outWidth, MenuHeaderKind& kind) {
   kind = MenuHeaderKind::kNone;

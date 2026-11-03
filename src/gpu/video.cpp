@@ -1368,21 +1368,29 @@ int32_t TiledOffset2D(int32_t x, int32_t y, uint32_t pitch, uint32_t bytesPerBlo
 
 void EndianSwap(uint8_t* data, size_t size, xenos::Endian endian) {
   switch (endian) {
+    // Whole words (the compiler vectorizes these loops).
     case xenos::Endian::k8in16:
       for (size_t i = 0; i + 1 < size; i += 2) {
-        std::swap(data[i], data[i + 1]);
+        uint16_t v;
+        std::memcpy(&v, data + i, 2);
+        v = rex::byte_swap(v);
+        std::memcpy(data + i, &v, 2);
       }
       break;
     case xenos::Endian::k8in32:
       for (size_t i = 0; i + 3 < size; i += 4) {
-        std::swap(data[i], data[i + 3]);
-        std::swap(data[i + 1], data[i + 2]);
+        uint32_t v;
+        std::memcpy(&v, data + i, 4);
+        v = rex::byte_swap(v);
+        std::memcpy(data + i, &v, 4);
       }
       break;
     case xenos::Endian::k16in32:
       for (size_t i = 0; i + 3 < size; i += 4) {
-        std::swap(data[i], data[i + 2]);
-        std::swap(data[i + 1], data[i + 3]);
+        uint32_t v;
+        std::memcpy(&v, data + i, 4);
+        v = (v >> 16) | (v << 16);
+        std::memcpy(data + i, &v, 4);
       }
       break;
     default:
@@ -1575,6 +1583,41 @@ TextureLayout GetTextureLayout(const xenos::xe_gpu_texture_fetch_t& fetch,
 
 // Untiles one level into rows of its blocks. data and size: the memory at
 // the level's base or mip address, endian swapped.
+// A tiled level's rows, a block at a time: Bytes fixed so each copy is a
+// move, not a memcpy call (8- and 16-bit textures made one call a texel).
+template <uint32_t Bytes>
+void CopyTiledRows(const LevelLayout& level, uint32_t blocksX, uint32_t blocksY, uint32_t bppLog2,
+                   const uint8_t* data, uint64_t size, uint8_t* out) {
+  // In Xenos tiling a run of texels along x is contiguous: 8 one-byte texels,
+  // else 16 bytes' worth (x's low bits land in the address's low 3 or 4 bits).
+  constexpr uint32_t kRun = Bytes == 1 ? 8 : (Bytes >= 16 ? 1 : 16 / Bytes);
+  bool aligned = level.offsetX % kRun == 0;
+  for (uint32_t y = 0; y < blocksY; y++) {
+    uint8_t* row = out + uint64_t(y) * blocksX * Bytes;
+    int32_t guestY = int32_t(y + level.offsetY);
+    uint32_t x = 0;
+    if (aligned) {
+      for (; x + kRun <= blocksX; x += kRun) {
+        int32_t offset =
+            TiledOffset2D(int32_t(x + level.offsetX), guestY, level.pitchBlocks, bppLog2);
+        if (offset >= 0 && uint64_t(offset) + kRun * Bytes <= size) {
+          std::memcpy(row + x * Bytes, data + offset, kRun * Bytes);
+        } else if (offset >= 0) {
+          for (uint32_t k = 0; k < kRun && uint64_t(offset) + (k + 1) * Bytes <= size; k++) {
+            std::memcpy(row + (x + k) * Bytes, data + offset + k * Bytes, Bytes);
+          }
+        }
+      }
+    }
+    for (; x < blocksX; x++) {
+      int32_t offset = TiledOffset2D(int32_t(x + level.offsetX), guestY, level.pitchBlocks, bppLog2);
+      if (offset >= 0 && uint64_t(offset) + Bytes <= size) {
+        std::memcpy(row + x * Bytes, data + offset, Bytes);
+      }
+    }
+  }
+}
+
 void CopyLevel(const xenos::xe_gpu_texture_fetch_t& fetch, const TextureFormatInfo& info,
                const LevelLayout& level, const uint8_t* data, uint64_t size, uint8_t* out) {
   uint32_t blocksX = (level.width + info.blockSize - 1) / info.blockSize;
@@ -1587,6 +1630,16 @@ void CopyLevel(const xenos::xe_gpu_texture_fetch_t& fetch, const TextureFormatIn
   }
   data += level.start;
   size -= level.start;
+  if (fetch.tiled) {
+    switch (info.bytesPerBlock) {
+      case 1: return CopyTiledRows<1>(level, blocksX, blocksY, bppLog2, data, size, out);
+      case 2: return CopyTiledRows<2>(level, blocksX, blocksY, bppLog2, data, size, out);
+      case 4: return CopyTiledRows<4>(level, blocksX, blocksY, bppLog2, data, size, out);
+      case 8: return CopyTiledRows<8>(level, blocksX, blocksY, bppLog2, data, size, out);
+      case 16: return CopyTiledRows<16>(level, blocksX, blocksY, bppLog2, data, size, out);
+      default: break;
+    }
+  }
   for (uint32_t y = 0; y < blocksY; y++) {
     uint8_t* row = out + y * rowBytes;
     uint32_t guestY = y + level.offsetY;
@@ -1629,7 +1682,8 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   if ((uint32_t(fetch.base_address) << 12) == g_inGameHeaderBase) {
     g_inGameHeaderBase = ~0u;
   }
-  if (info.format == RenderFormat::R8_UNORM && info.blockSize == 1) {
+  if (info.format == RenderFormat::R8_UNORM && info.blockSize == 1 &&
+      IsMenuHeaderSize(width, height)) {
     std::vector<uint8_t> level0(size_t(width) * height);
     CopyLevel(fetch, info, layout.levels[0], base.data(), base.size(), level0.data());
     MenuHeaderKind kind = MenuHeaderKind::kNone;

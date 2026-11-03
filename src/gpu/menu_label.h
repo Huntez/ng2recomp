@@ -29,6 +29,8 @@ void SetInGameRecompHeader(bool on);
 uint32_t MenuHeaderGeneration();
 // (kind: which header the picture is, ours or not.)
 enum class MenuHeaderKind { kNone, kOptions, kInGame };
+// Only a texture of one of these sizes can be a menu header (ReplaceMenuHeader).
+bool IsMenuHeaderSize(uint32_t width, uint32_t height);
 bool ReplaceMenuHeader(uint32_t width, uint32_t height, const uint8_t* pixels,
                        std::vector<uint8_t>& out, uint32_t& outWidth, MenuHeaderKind& kind);
 
