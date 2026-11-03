@@ -28,6 +28,7 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <array>
 #include <optional>
 #include <unordered_set>
 #include <algorithm>
@@ -849,17 +850,414 @@ RenderSampleCounts SampleCount(uint32_t msaa) {
                         : RenderSampleCount::COUNT_2;
 }
 
+// Render thread -----------------------------------------------------------------
+//
+// The game's render thread calls the hooks, which read guest memory (device
+// state, constants, vertex and index data, textures) into upload memory
+// there: the guest changes it right after. What goes to Vulkan (commands,
+// descriptor writes, submits and presents) is queued instead, in order, and
+// a thread of ours does it (NG2_RENDER_THREAD=0: at once, as before). The
+// game thread stays at most a frame ahead: before it reuses a frame's upload
+// memory it waits for that frame's submit and fence; only it waits on fences
+// (plume's wait resets them). Anything that needs the GPU idle drains the
+// queue first (Flush).
+
+bool RenderThreadEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("NG2_RENDER_THREAD");
+    return !(v && v[0] == '0');
+  }();
+  return enabled;
+}
+
+// The render thread's current command list (the frame's, from its begin).
+RenderCommandList* g_threadList = nullptr;
+
+// Queued work: each a callable stored in a chunked arena (no allocation per
+// item), run with the frame's real command list.
+class OpArena {
+ public:
+  using Run = void (*)(void* op, RenderCommandList* list);
+  using Destroy = void (*)(void* op);
+  struct Header {
+    Run run;
+    Destroy destroy;
+    uint32_t size;  // header and op, aligned
+  };
+
+  template <typename F>
+  void Push(F&& f) {
+    using T = std::decay_t<F>;
+    constexpr uint32_t kAlign = 16;
+    constexpr uint32_t size = (kHeaderSize + uint32_t(sizeof(T)) + kAlign - 1) & ~(kAlign - 1);
+    static_assert(alignof(T) <= kAlign);
+    uint8_t* at = Reserve(size);
+    auto* header = reinterpret_cast<Header*>(at);
+    header->run = [](void* op, RenderCommandList* list) { (*static_cast<T*>(op))(list); };
+    header->destroy = [](void* op) { static_cast<T*>(op)->~T(); };
+    header->size = size;
+    new (at + kHeaderSize) T(std::forward<F>(f));
+    count_++;
+  }
+
+  // Runs every op in order, then forgets them (the chunks are kept).
+  void RunAll() {
+    for (size_t c = 0; c < chunks_.size(); c++) {
+      Chunk& chunk = chunks_[c];
+      for (size_t at = 0; at < chunk.used;) {
+        auto* header = reinterpret_cast<Header*>(chunk.data.get() + at);
+        void* op = chunk.data.get() + at + kHeaderSize;
+        header->run(op, g_threadList);
+        header->destroy(op);
+        at += header->size;
+      }
+      chunk.used = 0;
+    }
+    current_ = 0;
+    count_ = 0;
+  }
+
+  size_t count() const { return count_; }
+
+ private:
+  static constexpr uint32_t kHeaderSize = (sizeof(Header) + 15) & ~15u;
+  static constexpr size_t kChunkSize = 256 << 10;
+  struct Chunk {
+    std::unique_ptr<uint8_t[]> data;
+    size_t used = 0;
+  };
+
+  uint8_t* Reserve(uint32_t size) {
+    while (current_ < chunks_.size() && chunks_[current_].used + size > kChunkSize) {
+      current_++;
+    }
+    if (current_ == chunks_.size()) {
+      Chunk chunk;
+      chunk.data.reset(new uint8_t[kChunkSize]);  // (new is 16-byte aligned on x64)
+      chunks_.push_back(std::move(chunk));
+    }
+    Chunk& chunk = chunks_[current_];
+    uint8_t* at = chunk.data.get() + chunk.used;
+    chunk.used += size;
+    return at;
+  }
+
+  std::vector<Chunk> chunks_;
+  size_t current_ = 0;
+  size_t count_ = 0;
+};
+
+class RenderThread {
+ public:
+  // At exit without DestroyHostDevice: let the thread go (joining could wait
+  // on the driver; a joinable std::thread would terminate the process).
+  ~RenderThread() {
+    if (thread_.joinable()) {
+      {
+        std::lock_guard lock(mutex_);
+        stop_ = true;
+      }
+      cv_.notify_one();
+      thread_.detach();
+    }
+  }
+
+  // On the game thread (under g_mutex): queued, sent on in batches.
+  template <typename F>
+  void Push(F&& f) {
+    if (!batch_) {
+      batch_ = TakeBatch();
+    }
+    batch_->Push(std::forward<F>(f));
+    if (batch_->count() >= kBatchOps) {
+      Send();
+    }
+  }
+
+  // The queued work so far to the thread.
+  void Send() {
+    if (!batch_ || batch_->count() == 0) {
+      return;
+    }
+    {
+      std::lock_guard lock(mutex_);
+      if (stop_) {
+        batch_.reset();  // after Stop: nothing runs it any more
+        return;
+      }
+      queue_.push_back(std::move(batch_));
+      if (!thread_.joinable()) {
+        thread_ = std::thread([this] { Main(); });
+      }
+    }
+    cv_.notify_one();
+  }
+
+  // Until everything queued has been done.
+  void Flush() {
+    Send();
+    std::unique_lock lock(mutex_);
+    idle_.wait(lock, [&] { return queue_.empty() && !busy_; });
+  }
+
+  void Stop() {
+    Flush();
+    {
+      std::lock_guard lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_one();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  // Frames submitted by the thread (the game thread's frame count after each).
+  std::atomic<uint64_t> submitted{0};
+  std::mutex submitMutex;
+  std::condition_variable submitCv;
+
+ private:
+  static constexpr size_t kBatchOps = 256;
+
+  std::unique_ptr<OpArena> TakeBatch() {
+    std::lock_guard lock(mutex_);
+    if (!free_.empty()) {
+      auto batch = std::move(free_.back());
+      free_.pop_back();
+      return batch;
+    }
+    return std::make_unique<OpArena>();
+  }
+
+  void Main() {
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "Render Commands");
+#endif
+    while (true) {
+      std::unique_ptr<OpArena> batch;
+      {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return !queue_.empty() || stop_; });
+        if (queue_.empty()) {
+          return;
+        }
+        batch = std::move(queue_.front());
+        queue_.pop_front();
+        busy_ = true;
+      }
+      batch->RunAll();
+      {
+        std::lock_guard lock(mutex_);
+        free_.push_back(std::move(batch));
+        busy_ = false;
+        if (queue_.empty()) {
+          idle_.notify_all();
+        }
+      }
+    }
+  }
+
+  std::unique_ptr<OpArena> batch_;
+  std::mutex mutex_;
+  std::condition_variable cv_, idle_;
+  std::deque<std::unique_ptr<OpArena>> queue_;
+  std::vector<std::unique_ptr<OpArena>> free_;
+  bool busy_ = false, stop_ = false;
+  std::thread thread_;
+};
+RenderThread g_renderThread;
+
+// Frames handed to the thread (game thread) and their submits (the thread):
+// a frame's slot is reused once its submit is in and its fence has passed.
+uint64_t g_framesQueued = 0;
+uint64_t g_submitTicket[NUM_FRAMES] = {};
+// The thread found the swapchain out of date: the game thread rebuilds it
+// with the GPU idle, at its next frame.
+std::atomic<bool> g_resizeRequested{false};
+
+void FrameSubmitted() {
+  {
+    std::lock_guard lock(g_renderThread.submitMutex);
+    g_renderThread.submitted.fetch_add(1, std::memory_order_release);
+  }
+  g_renderThread.submitCv.notify_all();
+}
+
+// The command list the hooks record into: every call is queued for the
+// thread, its arguments copied.
+class QueuedCommandList final : public RenderCommandList {
+ public:
+  template <typename F>
+  void Op(F&& f) {
+    g_renderThread.Push(std::forward<F>(f));
+  }
+
+  void begin() override {}
+  void end() override {}
+  void barriers(RenderBarrierStages stages, const RenderBufferBarrier* bufferBarriers,
+                uint32_t bufferCount, const RenderTextureBarrier* textureBarriers,
+                uint32_t textureCount) override {
+    std::vector<RenderBufferBarrier> buffers(bufferBarriers, bufferBarriers + bufferCount);
+    std::vector<RenderTextureBarrier> textures(textureBarriers, textureBarriers + textureCount);
+    Op([stages, buffers = std::move(buffers), textures = std::move(textures)](RenderCommandList* l) {
+      l->barriers(stages, buffers.data(), uint32_t(buffers.size()), textures.data(),
+                  uint32_t(textures.size()));
+    });
+  }
+  void drawInstanced(uint32_t a, uint32_t b, uint32_t c, uint32_t d) override {
+    Op([=](RenderCommandList* l) { l->drawInstanced(a, b, c, d); });
+  }
+  void drawIndexedInstanced(uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) override {
+    Op([=](RenderCommandList* l) { l->drawIndexedInstanced(a, b, c, d, e); });
+  }
+  void setPipeline(const RenderPipeline* p) override {
+    Op([=](RenderCommandList* l) { l->setPipeline(p); });
+  }
+  void setGraphicsPipelineLayout(const RenderPipelineLayout* p) override {
+    Op([=](RenderCommandList* l) { l->setGraphicsPipelineLayout(p); });
+  }
+  void setGraphicsPushConstants(uint32_t range, const void* data, uint32_t offset,
+                                uint32_t size) override {
+    std::array<uint8_t, PUSH_CONSTANT_SIZE> bytes{};
+    size = uint32_t(std::min<size_t>(size ? size : PUSH_CONSTANT_SIZE, bytes.size()));
+    std::memcpy(bytes.data(), data, size);
+    Op([=](RenderCommandList* l) { l->setGraphicsPushConstants(range, bytes.data(), offset, size); });
+  }
+  void setGraphicsDescriptorSet(RenderDescriptorSet* set, uint32_t index) override {
+    Op([=](RenderCommandList* l) { l->setGraphicsDescriptorSet(set, index); });
+  }
+  void setIndexBuffer(const RenderIndexBufferView* view) override {
+    std::optional<RenderIndexBufferView> copy;
+    if (view) {
+      copy = *view;
+    }
+    Op([=](RenderCommandList* l) { l->setIndexBuffer(copy ? &*copy : nullptr); });
+  }
+  void setViewports(const RenderViewport* viewports, uint32_t count) override {
+    std::array<RenderViewport, 8> copy{};
+    count = std::min<uint32_t>(count, 8);
+    std::copy_n(viewports, count, copy.begin());
+    Op([=](RenderCommandList* l) { l->setViewports(copy.data(), count); });
+  }
+  void setScissors(const RenderRect* rects, uint32_t count) override {
+    std::array<RenderRect, 8> copy{};
+    count = std::min<uint32_t>(count, 8);
+    std::copy_n(rects, count, copy.begin());
+    Op([=](RenderCommandList* l) { l->setScissors(copy.data(), count); });
+  }
+  void setFramebuffer(const RenderFramebuffer* framebuffer) override {
+    Op([=](RenderCommandList* l) { l->setFramebuffer(framebuffer); });
+  }
+  void clearColor(uint32_t attachment, RenderColor color, const RenderRect* rects,
+                  uint32_t count) override {
+    std::vector<RenderRect> copy(rects, rects + (rects ? count : 0));
+    Op([=, copy = std::move(copy)](RenderCommandList* l) {
+      l->clearColor(attachment, color, copy.empty() ? nullptr : copy.data(), uint32_t(copy.size()));
+    });
+  }
+  void clearDepthStencil(bool depth, bool stencil, float depthValue, uint32_t stencilValue,
+                         const RenderRect* rects, uint32_t count) override {
+    std::vector<RenderRect> copy(rects, rects + (rects ? count : 0));
+    Op([=, copy = std::move(copy)](RenderCommandList* l) {
+      l->clearDepthStencil(depth, stencil, depthValue, stencilValue,
+                           copy.empty() ? nullptr : copy.data(), uint32_t(copy.size()));
+    });
+  }
+  void copyBufferRegion(RenderBufferReference dst, RenderBufferReference src, uint64_t size) override {
+    Op([=](RenderCommandList* l) { l->copyBufferRegion(dst, src, size); });
+  }
+  void copyTextureRegion(const RenderTextureCopyLocation& dst, const RenderTextureCopyLocation& src,
+                         uint32_t x, uint32_t y, uint32_t z, const RenderBox* box) override {
+    std::optional<RenderBox> boxCopy;
+    if (box) {
+      boxCopy = *box;
+    }
+    Op([=](RenderCommandList* l) { l->copyTextureRegion(dst, src, x, y, z, boxCopy ? &*boxCopy : nullptr); });
+  }
+  void resolveTextureRegion(const RenderTexture* dst, uint32_t x, uint32_t y,
+                            const RenderTexture* src, const RenderRect* rect,
+                            RenderResolveMode mode) override {
+    std::optional<RenderRect> rectCopy;
+    if (rect) {
+      rectCopy = *rect;
+    }
+    Op([=](RenderCommandList* l) {
+      l->resolveTextureRegion(dst, x, y, src, rectCopy ? &*rectCopy : nullptr, mode);
+    });
+  }
+
+  // Not used by the renderer.
+  [[noreturn]] static void Unused(const char* name) {
+    REXLOG_ERROR("video: {} isn't queued for the render thread", name);
+    std::abort();
+  }
+  void dispatch(uint32_t, uint32_t, uint32_t) override { Unused("dispatch"); }
+  void traceRays(uint32_t, uint32_t, uint32_t, RenderBufferReference,
+                 const RenderShaderBindingGroupsInfo&) override { Unused("traceRays"); }
+  void setComputePipelineLayout(const RenderPipelineLayout*) override { Unused("setComputePipelineLayout"); }
+  void setComputePushConstants(uint32_t, const void*, uint32_t, uint32_t) override { Unused("setComputePushConstants"); }
+  void setComputeDescriptorSet(RenderDescriptorSet*, uint32_t) override { Unused("setComputeDescriptorSet"); }
+  void setGraphicsRootDescriptor(RenderBufferReference, uint32_t) override { Unused("setGraphicsRootDescriptor"); }
+  void setRaytracingPipelineLayout(const RenderPipelineLayout*) override { Unused("setRaytracingPipelineLayout"); }
+  void setRaytracingPushConstants(uint32_t, const void*, uint32_t, uint32_t) override { Unused("setRaytracingPushConstants"); }
+  void setRaytracingDescriptorSet(RenderDescriptorSet*, uint32_t) override { Unused("setRaytracingDescriptorSet"); }
+  void setVertexBuffers(uint32_t, const RenderVertexBufferView*, uint32_t, const RenderInputSlot*) override { Unused("setVertexBuffers"); }
+  void setDepthBias(float, float, float) override { Unused("setDepthBias"); }
+  void copyBuffer(const RenderBuffer*, const RenderBuffer*) override { Unused("copyBuffer"); }
+  void copyTexture(const RenderTexture*, const RenderTexture*) override { Unused("copyTexture"); }
+  void resolveTexture(const RenderTexture*, const RenderTexture*) override { Unused("resolveTexture"); }
+  void buildBottomLevelAS(const RenderAccelerationStructure*, RenderBufferReference,
+                          const RenderBottomLevelASBuildInfo&) override { Unused("buildBottomLevelAS"); }
+  void buildTopLevelAS(const RenderAccelerationStructure*, RenderBufferReference, RenderBufferReference,
+                       const RenderTopLevelASBuildInfo&) override { Unused("buildTopLevelAS"); }
+  void discardTexture(const RenderTexture*) override { Unused("discardTexture"); }
+  void resetQueryPool(const RenderQueryPool*, uint32_t, uint32_t) override { Unused("resetQueryPool"); }
+  void writeTimestamp(const RenderQueryPool*, uint32_t) override { Unused("writeTimestamp"); }
+};
+QueuedCommandList g_queuedCommandList;
+
+// Work that isn't a command (descriptor writes, the frame's begin and
+// submit): queued with the rest, or done at once without the thread.
+template <typename F>
+void OnRenderThread(F&& f) {
+  if (RenderThreadEnabled()) {
+    g_renderThread.Push(std::forward<F>(f));
+  } else {
+    RenderCommandList* list = g_commandLists[g_frame].get();
+    f(list);
+  }
+}
+
+// A texture heap descriptor written in order with the commands that use it.
+void WriteTextureDescriptor(uint32_t index, RenderTexture* texture, RenderTextureView* view) {
+  OnRenderThread([=](RenderCommandList*) {
+    g_textureDescriptorSet->setTexture(index, texture, RenderTextureLayout::SHADER_READ, view);
+  });
+}
+
 // Frame -----------------------------------------------------------------------
 
 void WaitForFrame(uint32_t frame) {
   if (g_commandListPending[frame]) {
     StageTimer timer(Stage::kWait);
+    if (RenderThreadEnabled()) {
+      // Its submit first (only then has the fence been handed to the GPU).
+      g_renderThread.Send();
+      std::unique_lock lock(g_renderThread.submitMutex);
+      g_renderThread.submitCv.wait(lock, [&] {
+        return g_renderThread.submitted.load(std::memory_order_acquire) >= g_submitTicket[frame];
+      });
+    }
     g_queue->waitForCommandFence(g_commandFences[frame].get());
     g_commandListPending[frame] = false;
   }
 }
 
 void WaitForGPU() {
+  if (RenderThreadEnabled()) {
+    g_renderThread.Flush();
+  }
   for (uint32_t i = 0; i < NUM_FRAMES; i++) {
     WaitForFrame(i);
   }
@@ -867,6 +1265,12 @@ void WaitForGPU() {
 
 RenderCommandList* CommandList() {
   if (!g_recording) {
+    if (g_resizeRequested.load()) {
+      WaitForGPU();  // (queued presents may raise it again: cleared after)
+      g_resizeRequested.store(false);
+      g_swapChainFramebuffers.clear();
+      g_swapChainValid = g_swapChain->resize();
+    }
     WaitForFrame(g_frame);
     g_boundFramebuffer = nullptr;
     g_uploads[g_frame].Reset();
@@ -875,10 +1279,19 @@ RenderCommandList* CommandList() {
       ForgetTexture(texture.get());
     }
     g_garbage[g_frame].clear();
-    g_commandLists[g_frame]->begin();
+    uint32_t frame = g_frame;
+    if (RenderThreadEnabled()) {
+      g_renderThread.Push([frame](RenderCommandList*) {
+        g_threadList = g_commandLists[frame].get();
+        g_threadList->begin();
+      });
+    } else {
+      g_commandLists[g_frame]->begin();
+    }
     g_recording = true;
   }
-  return g_commandLists[g_frame].get();
+  return RenderThreadEnabled() ? static_cast<RenderCommandList*>(&g_queuedCommandList)
+                               : g_commandLists[g_frame].get();
 }
 
 void Transition(HostTexture& texture, RenderTextureLayout layout) {
@@ -901,8 +1314,7 @@ void SetDescriptor(HostTexture& texture) {
       viewDesc.mipLevels = 1;
       texture.view = texture.texture->createTextureView(viewDesc);
     }
-    g_textureDescriptorSet->setTexture(texture.descriptor, texture.texture.get(),
-                                       RenderTextureLayout::SHADER_READ, texture.view.get());
+    WriteTextureDescriptor(texture.descriptor, texture.texture.get(), texture.view.get());
   }
 }
 
@@ -1535,7 +1947,9 @@ uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
     }
     sampler.first = g_nextSampler++;
     sampler.second = g_device->createSampler(desc);
-    g_samplerDescriptorSet->setSampler(sampler.first, sampler.second.get());
+    RenderSampler* made = sampler.second.get();
+    uint32_t index = sampler.first;
+    OnRenderThread([=](RenderCommandList*) { g_samplerDescriptorSet->setSampler(index, made); });
   }
   return sampler.first;
 }
@@ -1890,8 +2304,7 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   host->view = host->texture->createTextureView(viewDesc);
   host->descriptor = g_descriptors.Allocate();
   if (host->descriptor) {
-    g_textureDescriptorSet->setTexture(host->descriptor, host->texture.get(),
-                                       RenderTextureLayout::SHADER_READ, host->view.get());
+    WriteTextureDescriptor(host->descriptor, host->texture.get(), host->view.get());
   }
   return host;
 }
@@ -3447,102 +3860,120 @@ void Present(HostTexture* frontBuffer) {
       !REXCVAR_GET(vsync)) {
     mode = 0;
   }
-  static int32_t loggedMode = -1;
-  bool supported = g_swapChain->setPresentMode(RenderPresentMode(std::clamp(mode, 0, 3)));
-  if (mode != loggedMode) {
-    loggedMode = mode;
-    REXLOG_INFO("video: present mode {}{}", mode, supported ? "" : " not supported, FIFO instead");
-  }
-  g_swapChainValid &= !g_swapChain->needsResize();
-  if (!g_swapChainValid) {
-    // Finish what was recorded, then rebuild the swapchain.
-    commandList->end();
-    g_queue->executeCommandLists(commandList, g_commandFences[g_frame].get());
-    g_commandListPending[g_frame] = true;
-    WaitForGPU();
-    g_swapChainFramebuffers.clear();
-    g_swapChainValid = g_swapChain->resize();
-    commandList->begin();
-  }
 
-  uint32_t index = 0;
-  if (g_swapChainValid) {
-    StageTimer timer(Stage::kWait);
-    g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[g_frame].get(), &index);
+  // On the game thread: what reads its memory or the textures' layouts.
+  HostTexture* movie = MovieTexture();
+  if (frontBuffer) {
+    Transition(*frontBuffer, RenderTextureLayout::SHADER_READ);
   }
-  while (g_renderSemaphores.size() < g_swapChain->getTextureCount()) {
-    g_renderSemaphores.push_back(g_device->createCommandSemaphore());
-  }
-
-  HostTexture* movie = g_swapChainValid ? MovieTexture() : nullptr;
-  if (g_swapChainValid) {
-    if (frontBuffer) {
-      Transition(*frontBuffer, RenderTextureLayout::SHADER_READ);
-    }
-    g_swapChainFramebuffers.resize(g_swapChain->getTextureCount());
-    RenderTexture* target = g_swapChain->getTexture(index);
-    auto& framebuffer = g_swapChainFramebuffers[index];
-    if (!framebuffer) {
-      const RenderTexture* attachments[] = {target};
-      RenderFramebufferDesc desc;
-      desc.colorAttachments = attachments;
-      desc.colorAttachmentsCount = 1;
-      framebuffer = g_device->createFramebuffer(desc);
-    }
-    commandList->barriers(RenderBarrierStage::GRAPHICS,
-                          RenderTextureBarrier(target, RenderTextureLayout::COLOR_WRITE));
-    commandList->setFramebuffer(framebuffer.get());
-    g_boundFramebuffer = framebuffer.get();
-    commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
-
-    HostTexture* source = movie && movie->descriptor ? movie : frontBuffer;
-    if (source && source->descriptor) {
-      // Fit the guest picture into the window at the chosen aspect ratio
-      // (src/aspect.cpp: the game draws for it, into its 16:9 targets); a
-      // movie at its own.
-      float windowWidth = float(g_swapChain->getWidth());
-      float windowHeight = float(g_swapChain->getHeight());
-      float aspect = source == movie ? float(movie->width) / float(movie->height)
-                                     : ng2::aspect::Aspect();
-      float width = std::floor(std::min(windowWidth, windowHeight * aspect));
-      float height = std::floor(std::min(windowHeight, windowWidth / aspect));
-      RenderViewport viewport((windowWidth - width) / 2, (windowHeight - height) / 2, width,
-                              height);
-      RenderRect scissor(0, 0, int32_t(windowWidth), int32_t(windowHeight));
-      uint32_t constants[3] = {source->descriptor, SAMPLER_LINEAR_CLAMP,
-                               g_gammaTable ? g_gammaTable->descriptor : 0u};
-      commandList->setGraphicsPipelineLayout(g_pipelineLayout.get());
-      commandList->setPipeline(g_presentPipeline.get());
-      commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
-      commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
-      commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
-      commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
-      commandList->setGraphicsPushConstants(0, constants, 0, sizeof(constants));
-      commandList->setViewports(&viewport, 1);
-      commandList->setScissors(&scissor, 1);
-      commandList->drawInstanced(3, 1, 0, 0);
-    }
-    commandList->barriers(RenderBarrierStage::GRAPHICS,
-                          RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
-  }
-
-  commandList->end();
+  HostTexture* source = movie && movie->descriptor ? movie : frontBuffer;
+  uint32_t sourceDescriptor = source ? source->descriptor : 0;
+  float aspect = source && source == movie ? float(movie->width) / float(movie->height)
+                                           : ng2::aspect::Aspect();
+  uint32_t gamma = g_gammaTable ? g_gammaTable->descriptor : 0u;
+  uint32_t frame = g_frame;
+  g_boundFramebuffer = nullptr;
   g_recording = false;
+  (void)commandList;
 
-  if (g_swapChainValid) {
-    const RenderCommandList* commandLists[] = {commandList};
-    RenderCommandSemaphore* waitSemaphores[] = {g_acquireSemaphores[g_frame].get()};
-    RenderCommandSemaphore* signalSemaphores[] = {g_renderSemaphores[index].get()};
-    g_queue->executeCommandLists(commandLists, 1, waitSemaphores, 1, signalSemaphores, 1,
-                                 g_commandFences[g_frame].get());
-    g_commandListPending[g_frame] = true;
-    g_swapChainValid = g_swapChain->present(index, signalSemaphores, 1);
-    ReportLatency();
-  } else {
-    g_queue->executeCommandLists(commandList, g_commandFences[g_frame].get());
-    g_commandListPending[g_frame] = true;
+  // The swapchain's part, with the frame's real command list.
+  OnRenderThread([=](RenderCommandList* list) {
+    static int32_t loggedMode = -1;
+    bool supported = g_swapChain->setPresentMode(RenderPresentMode(std::clamp(mode, 0, 3)));
+    if (mode != loggedMode) {
+      loggedMode = mode;
+      REXLOG_INFO("video: present mode {}{}", mode, supported ? "" : " not supported, FIFO instead");
+    }
+    g_swapChainValid &= !g_swapChain->needsResize();
+    if (!g_swapChainValid) {
+      // Finish what was recorded, then rebuild the swapchain: here without
+      // the thread, else by the game thread once the GPU is idle.
+      list->end();
+      g_queue->executeCommandLists(list, g_commandFences[frame].get());
+      if (RenderThreadEnabled()) {
+        g_resizeRequested = true;
+        FrameSubmitted();
+        return;
+      }
+      g_commandListPending[frame] = true;
+      WaitForGPU();
+      g_swapChainFramebuffers.clear();
+      g_swapChainValid = g_swapChain->resize();
+      list->begin();
+    }
+
+    uint32_t index = 0;
+    if (g_swapChainValid) {
+      g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &index);
+    }
+    while (g_renderSemaphores.size() < g_swapChain->getTextureCount()) {
+      g_renderSemaphores.push_back(g_device->createCommandSemaphore());
+    }
+
+    if (g_swapChainValid) {
+      g_swapChainFramebuffers.resize(g_swapChain->getTextureCount());
+      RenderTexture* target = g_swapChain->getTexture(index);
+      auto& framebuffer = g_swapChainFramebuffers[index];
+      if (!framebuffer) {
+        const RenderTexture* attachments[] = {target};
+        RenderFramebufferDesc desc;
+        desc.colorAttachments = attachments;
+        desc.colorAttachmentsCount = 1;
+        framebuffer = g_device->createFramebuffer(desc);
+      }
+      list->barriers(RenderBarrierStage::GRAPHICS,
+                     RenderTextureBarrier(target, RenderTextureLayout::COLOR_WRITE));
+      list->setFramebuffer(framebuffer.get());
+      list->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+
+      if (sourceDescriptor) {
+        // Fit the guest picture into the window at the chosen aspect ratio
+        // (src/aspect.cpp: the game draws for it, into its 16:9 targets); a
+        // movie at its own.
+        float windowWidth = float(g_swapChain->getWidth());
+        float windowHeight = float(g_swapChain->getHeight());
+        float width = std::floor(std::min(windowWidth, windowHeight * aspect));
+        float height = std::floor(std::min(windowHeight, windowWidth / aspect));
+        RenderViewport viewport((windowWidth - width) / 2, (windowHeight - height) / 2, width,
+                                height);
+        RenderRect scissor(0, 0, int32_t(windowWidth), int32_t(windowHeight));
+        uint32_t constants[3] = {sourceDescriptor, SAMPLER_LINEAR_CLAMP, gamma};
+        list->setGraphicsPipelineLayout(g_pipelineLayout.get());
+        list->setPipeline(g_presentPipeline.get());
+        list->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+        list->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+        list->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+        list->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+        list->setGraphicsPushConstants(0, constants, 0, sizeof(constants));
+        list->setViewports(&viewport, 1);
+        list->setScissors(&scissor, 1);
+        list->drawInstanced(3, 1, 0, 0);
+      }
+      list->barriers(RenderBarrierStage::GRAPHICS,
+                     RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
+    }
+
+    list->end();
+    if (g_swapChainValid) {
+      const RenderCommandList* commandLists[] = {list};
+      RenderCommandSemaphore* waitSemaphores[] = {g_acquireSemaphores[frame].get()};
+      RenderCommandSemaphore* signalSemaphores[] = {g_renderSemaphores[index].get()};
+      g_queue->executeCommandLists(commandLists, 1, waitSemaphores, 1, signalSemaphores, 1,
+                                   g_commandFences[frame].get());
+      FrameSubmitted();
+      g_swapChainValid = g_swapChain->present(index, signalSemaphores, 1);
+      ReportLatency();
+    } else {
+      g_queue->executeCommandLists(list, g_commandFences[frame].get());
+      FrameSubmitted();
+    }
+  });
+
+  g_commandListPending[frame] = true;
+  g_submitTicket[frame] = ++g_framesQueued;
+  if (RenderThreadEnabled()) {
+    g_renderThread.Send();
   }
-
   g_frame = (g_frame + 1) % NUM_FRAMES;
   g_frameCount++;
 }
@@ -3812,10 +4243,13 @@ void DestroyHostDevice() {
   std::lock_guard lock(g_mutex);
   if (g_queue) {
     if (g_recording) {
-      g_commandLists[g_frame]->end();
+      OnRenderThread([](RenderCommandList* list) { list->end(); });
       g_recording = false;
     }
     WaitForGPU();
+    if (RenderThreadEnabled()) {
+      g_renderThread.Stop();
+    }
   }
   StopPipelineWorkers();
   g_pipelines.clear();
