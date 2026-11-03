@@ -13,12 +13,32 @@
 
 namespace ng2::guest {
 
+// Memory::TranslateVirtual's result without its calls: only the heap at
+// 0xE0000000-0xFFCFFFFF has a host offset (a page, where the host's allocation
+// granularity is over 4 KB, as on Windows), the same for the whole run.
+struct Bases {
+  uint8_t* virtualBase;
+  uint8_t* physicalBase;
+  uint32_t e0Offset;
+};
+inline const Bases& GetBases() {
+  static const Bases bases = [] {
+    auto* memory = rex::Runtime::instance()->memory();
+    return Bases{memory->virtual_membase(), memory->physical_membase(),
+                 uint32_t(memory->TranslateVirtual<uint8_t*>(0xE0000000) -
+                          (memory->virtual_membase() + 0xE0000000u))};
+  }();
+  return bases;
+}
+
 inline uint8_t* Virtual(uint32_t address) {
-  return rex::Runtime::instance()->memory()->TranslateVirtual<uint8_t*>(address);
+  const Bases& b = GetBases();
+  return b.virtualBase + address +
+         (address >= 0xE0000000u && address < 0xFFD00000u ? b.e0Offset : 0u);
 }
 
 inline uint8_t* Physical(uint32_t address) {
-  return rex::Runtime::instance()->memory()->TranslatePhysical<uint8_t*>(address);
+  return GetBases().physicalBase + (address & 0x1FFFFFFF);
 }
 
 inline uint32_t Load32(uint32_t address) {

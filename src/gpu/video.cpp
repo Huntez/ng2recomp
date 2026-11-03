@@ -220,6 +220,7 @@ struct Profile {
   }();
   uint64_t nanoseconds[size_t(Stage::kCount)] = {};
   uint64_t comparedBytes = 0, uploadedBytes = 0, frames = 0;
+  uint64_t textureLookups = 0, hashedBytes = 0, texturesMade = 0, textureMadeBytes = 0;
   std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 } g_profile;
 
@@ -357,8 +358,12 @@ void ReportProfile() {
   for (size_t i = 0; i < size_t(Stage::kCount); i++) {
     line += fmt::format(" {} {:.1f}", kStageNames[i], g_profile.nanoseconds[i] / 1e6);
   }
-  REXLOG_INFO("video: {} frames, ms:{}; compared {:.1f} MB, uploaded {:.1f} MB", g_profile.frames,
-              line, g_profile.comparedBytes / 1048576.0, g_profile.uploadedBytes / 1048576.0);
+  REXLOG_INFO("video: {} frames, ms:{}; compared {:.1f} MB, uploaded {:.1f} MB; textures {} "
+              "looked up, {:.1f} MB hashed, {} made {:.1f} MB",
+              g_profile.frames, line, g_profile.comparedBytes / 1048576.0,
+              g_profile.uploadedBytes / 1048576.0, g_profile.textureLookups,
+              g_profile.hashedBytes / 1048576.0, g_profile.texturesMade,
+              g_profile.textureMadeBytes / 1048576.0);
   g_profile = Profile{};
   g_profile.last = now;
 }
@@ -403,6 +408,8 @@ struct GuestMemoryRange {
   bool dynamic = false;
 };
 std::unordered_map<uint64_t, GuestMemoryRange> g_guestMemoryRanges;
+constexpr uint64_t kRangeStableFrames = 600;
+constexpr uint64_t kRangeRecheckFrames = 4;
 struct FrameRange {
   uint32_t address, size;
   GuestMemoryRange* range;
@@ -454,11 +461,17 @@ std::unordered_map<const ShaderCacheEntry*, std::unique_ptr<RenderShader>> g_hos
 std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> g_pipelines;
 
 // Guest textures by fetch constant, with the hash of their memory when last
-// uploaded (checked once per frame).
+// uploaded: checked once a frame, or every kTextureRecheckFrames frames it is
+// drawn with once unchanged for kTextureStableFrames (hashing every bound
+// texture each frame was ~40% of the draw stage). A texture rewritten in place
+// after that shows up to that many frames late.
+constexpr uint64_t kTextureStableFrames = 120;
+constexpr uint64_t kTextureRecheckFrames = 8;
 struct CachedTexture {
   std::unique_ptr<HostTexture> host;
   uint64_t contentHash = 0;
   uint64_t checkedFrame = ~0ull;
+  uint64_t changedFrame = 0;
 };
 std::unordered_map<uint64_t, CachedTexture> g_textures;
 // Host textures replaced while a frame may still use them: freed once that
@@ -919,6 +932,8 @@ uint64_t ResolvedKey(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetc
 
 // Host texture backing a guest texture written by resolves.
 // scale: the source's, so the copy is pixel for pixel.
+uint64_t ResolvedMemoryHash(uint32_t address, uint32_t size);
+
 HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetch,
                                    uint32_t scale) {
   RenderFormat format = ResolveTextureFormat(fetch.format);
@@ -961,10 +976,32 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
   auto& memory = g_resolvedMemory[address];
   memory.size = uint32_t(std::min<uint64_t>(uint64_t(width) * height * RenderFormatSize(format),
                                             GUEST_MEMORY_SIZE - address));
-  memory.hash = XXH3_64bits(guest::Physical(address), memory.size);
+  memory.hash = ResolvedMemoryHash(address, memory.size);
   memory.checkedFrame = g_frameCount;
   memory.stale = false;
   return slot.get();
+}
+
+// A hash of the guest memory a resolve went to: whole when small, else its
+// first and last 4 KB and 64 pieces spread over it. The CPU replaces such
+// memory wholesale (a texture loaded where a picture was resolved), and the
+// whole of it (MBs, ~20 resolves a frame, each checked once a frame) was most
+// of the renderer's hashing.
+uint64_t ResolvedMemoryHash(uint32_t address, uint32_t size) {
+  const uint8_t* data = guest::Physical(address);
+  constexpr uint32_t kWhole = 64 << 10, kEdge = 4096, kPieces = 64, kPiece = 256;
+  if (size <= kWhole) {
+    return XXH3_64bits(data, size);
+  }
+  XXH3_state_t state;
+  XXH3_64bits_reset(&state);
+  XXH3_64bits_update(&state, data, kEdge);
+  uint32_t step = (size - 2 * kEdge) / kPieces;
+  for (uint32_t i = 0; i < kPieces; i++) {
+    XXH3_64bits_update(&state, data + kEdge + i * step, std::min(kPiece, step));
+  }
+  XXH3_64bits_update(&state, data + size - kEdge, kEdge);
+  return XXH3_64bits_digest(&state);
 }
 
 // False once the CPU has overwritten the memory resolved to address.
@@ -976,7 +1013,7 @@ bool ResolveCurrent(uint32_t address) {
   auto& memory = it->second;
   if (!memory.stale && memory.checkedFrame != g_frameCount) {
     memory.checkedFrame = g_frameCount;
-    memory.stale = XXH3_64bits(guest::Physical(address), memory.size) != memory.hash;
+    memory.stale = ResolvedMemoryHash(address, memory.size) != memory.hash;
     if (memory.stale && Tracing()) {
       TraceLog("video: resolve memory {:#x} overwritten", address);
     }
@@ -1130,6 +1167,14 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
     return;
   }
   bool first = range.checkedFrame == ~0ull;
+  // Unchanged for kRangeStableFrames: compared every kRangeRecheckFrames
+  // frames (static geometry; comparing it all twice a frame was most of this
+  // stage). A rewrite after that shows up to that many frames late.
+  if (!always && !first && !range.dynamic &&
+      g_frameCount - range.changedFrame > kRangeStableFrames &&
+      g_frameCount - range.checkedFrame < kRangeRecheckFrames) {
+    return;
+  }
   if (!always && range.checkedFrame != g_frameCount) {
     g_frameRanges.push_back({address, size, &range, nullptr});
   }
@@ -1211,6 +1256,9 @@ void FinishGuestMemory() {
 // Shaders ---------------------------------------------------------------------
 
 const ShaderCacheEntry* FindShaderCacheEntry(uint64_t hash) {
+  if (!g_shaderCacheHasMasks) {  // (a real reference: links only against a current cache)
+    return nullptr;
+  }
   auto* begin = g_shaderCacheEntries;
   auto* end = g_shaderCacheEntries + g_shaderCacheEntryCount;
   auto* it = std::lower_bound(begin, end, hash, [](const ShaderCacheEntry& entry,
@@ -1822,8 +1870,7 @@ uint32_t AdjustBloom(const xenos::xe_gpu_texture_fetch_t& fetch, uint32_t descri
   return dest->descriptor | ((dest->scale - 1) << 20);
 }
 
-uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
-  StageTimer timer(Stage::kTexture);
+uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   bool oneD = fetch.dimension == xenos::DataDimension::k1D;
   if (!oneD && fetch.dimension != xenos::DataDimension::k2DOrStacked) {
     ReportUnsupportedTexture("3D or cube", fetch);
@@ -1872,25 +1919,35 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
                          fetch.dword_5 & 0xFFFFFE00};
   uint64_t key = XXH3_64bits(keyData, sizeof(keyData));
   auto& cached = g_textures[key];
-  if (cached.checkedFrame != g_frameCount) {
+  // The headers are made again when ours comes or goes: always checked.
+  bool header = info.format == RenderFormat::R8_UNORM &&
+                (base == g_menuHeader.base || base == g_inGameHeaderBase);
+  bool stable = cached.host && !header && cached.checkedFrame != ~0ull &&
+                g_frameCount - cached.changedFrame > kTextureStableFrames;
+  bool due = stable ? g_frameCount - cached.checkedFrame >= kTextureRecheckFrames
+                    : cached.checkedFrame != g_frameCount;
+  g_profile.textureLookups++;
+  if (due) {
     cached.checkedFrame = g_frameCount;
+    g_profile.hashedBytes += guestSize + layout.mipsSize;
     const uint8_t* data = guest::Physical(base);
     const uint8_t* mipData = guest::Physical(layout.mipAddress);
     uint64_t hash = XXH3_64bits(data, guestSize) ^
                     (layout.mipsSize ? XXH3_64bits(mipData, layout.mipsSize) * 0x9E3779B97F4A7C15ull
                                      : 0);
-    // The headers are made again when ours comes or goes.
-    if (info.format == RenderFormat::R8_UNORM &&
-        (base == g_menuHeader.base || base == g_inGameHeaderBase)) {
+    if (header) {
       hash += MenuHeaderGeneration();
     }
     if (!cached.host || hash != cached.contentHash) {
+      cached.changedFrame = g_frameCount;
       if (cached.host) {
         g_garbage[g_frame].push_back(std::move(cached.host));
       }
       bool retry = false;  // made differently once another texture is seen
       MakeTimer made(g_frameStats.textures, g_frameStats.textureNs);
       g_frameStats.textureBytes += guestSize + layout.mipsSize;
+      g_profile.texturesMade++;
+      g_profile.textureMadeBytes += guestSize + layout.mipsSize;
       cached.host =
           CreateTexture(fetch, info, layout, data, guestSize, mipData, layout.mipsSize, &retry);
       cached.contentHash = retry ? 0 : hash;
@@ -1898,6 +1955,41 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   }
   Transition(*cached.host, RenderTextureLayout::SHADER_READ);
   return cached.host->descriptor;
+}
+
+// The frame's texture lookups by fetch constant: a frame looks up thousands
+// (every slot of every draw) of a few hundred textures. Forgotten at each
+// frame and each resolve (which can change what an address holds, and the
+// layout of a resolved texture).
+struct FetchKey {
+  uint32_t dwords[6];
+  bool operator==(const FetchKey& other) const {
+    return std::memcmp(dwords, other.dwords, sizeof(dwords)) == 0;
+  }
+};
+struct FetchKeyHash {
+  size_t operator()(const FetchKey& key) const { return XXH3_64bits(key.dwords, sizeof(key.dwords)); }
+};
+std::unordered_map<FetchKey, uint32_t, FetchKeyHash> g_frameTextures;
+uint64_t g_frameTexturesFrame = ~0ull;
+
+void ForgetFrameTextures() {
+  g_frameTextures.clear();
+}
+
+uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
+  StageTimer timer(Stage::kTexture);
+  if (g_frameTexturesFrame != g_frameCount) {
+    g_frameTexturesFrame = g_frameCount;
+    g_frameTextures.clear();
+  }
+  FetchKey key;
+  std::memcpy(key.dwords, &fetch.dword_0, sizeof(key.dwords));
+  auto [it, inserted] = g_frameTextures.try_emplace(key, 0u);
+  if (inserted) {
+    it->second = LookUpTexture(fetch);
+  }
+  return it->second;
 }
 
 // Device state ----------------------------------------------------------------
@@ -2638,9 +2730,13 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   for (uint32_t i = 0; i < 8; i++) {
     shared.booleans[i] = guest::Load32(device + 0x2780 + i * 4);
   }
-  // Textures: the 32 fetch constants that hold one (24 bytes each).
+  // Textures: the fetch constants (24 bytes each) of the slots the shaders sample.
   bool widenHeader = false;  // the Options header, ours: a wider picture
+  uint32_t textureSlots = vs->entry->textureSlotMask | (ps ? ps->entry->textureSlotMask : 0);
   for (uint32_t slot = 0; slot < 32; slot++) {
+    if (!(textureSlots & (1u << slot))) {
+      continue;
+    }
     if ((guest::Load32(device + 0x480 + slot * 24) & 3) !=
         uint32_t(xenos::FetchConstantType::kTexture)) {
       continue;
@@ -2806,11 +2902,25 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   Upload psConstants = Allocate(224 * 16);
   const uint32_t* vsSource = reinterpret_cast<const uint32_t*>(guest::Virtual(device + 0x780));
   const uint32_t* psSource = reinterpret_cast<const uint32_t*>(guest::Virtual(device + 0x1780));
-  for (uint32_t i = 0; i < 256 * 4; i++) {
-    reinterpret_cast<uint32_t*>(vsConstants.data)[i] = rex::byte_swap(vsSource[i]);
-  }
-  for (uint32_t i = 0; i < 224 * 4; i++) {
-    reinterpret_cast<uint32_t*>(psConstants.data)[i] = rex::byte_swap(psSource[i]);
+  // Only the registers the shader reads (the rest of the block is never read).
+  auto copyConstants = [](uint8_t* out, const uint32_t* source, const uint64_t (&mask)[4],
+                          uint32_t registers) {
+    auto* dest = reinterpret_cast<uint32_t*>(out);
+    for (uint32_t word = 0; word < 4; word++) {
+      for (uint64_t bits = mask[word]; bits; bits &= bits - 1) {
+        uint32_t r = word * 64 + uint32_t(__builtin_ctzll(bits));
+        if (r >= registers) {
+          break;
+        }
+        for (uint32_t c = 0; c < 4; c++) {
+          dest[r * 4 + c] = rex::byte_swap(source[r * 4 + c]);
+        }
+      }
+    }
+  };
+  copyConstants(vsConstants.data, vsSource, vs->entry->floatConstantMask, 256);
+  if (ps) {
+    copyConstants(psConstants.data, psSource, ps->entry->floatConstantMask, 224);
   }
   Upload sharedUpload = Allocate(sizeof(shared));
   std::memcpy(sharedUpload.data, &shared, sizeof(shared));
@@ -3737,6 +3847,7 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
     return;
   }
   FlushPendingDraw();
+  ForgetFrameTextures();
   uint32_t source = flags & 7;
   bool depth = source == 4;
   uint32_t surface = depth ? guest::Load32(device + guest::device::kDepthStencil)

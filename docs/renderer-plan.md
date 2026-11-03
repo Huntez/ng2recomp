@@ -228,3 +228,17 @@ Test audio (NG2_TEST_AUDIO=disk) is ~70 MB a minute: keep it off a full /tmp.
 Latency (NG2_LATENCY_LOG=1, frame start to present, Chapter 1 fight): 16.63 ms
 average, 18.75 worst with the GPU-wait sleep, 16.63 / 18.60 spinning; CPU 2.36
 vs 3.03 cores. On Windows the sleep is a yield (a sleep there is >= 1 ms).
+
+## Renderer CPU (11-03)
+
+Measured in Chapter 1's first fight on a 9800X3D (NG2_PROFILE, ms of each second): the draw stage
+162 -> 51, resolve 36 -> 5.5. What did it:
+- each shader's float constants and texture slots, recorded by XenosRecomp (patch 0011): a draw
+  byte-swaps only the constant registers its shaders read (median 10 of 480) and looks up only the
+  slots they sample (1.06 on average, against every slot holding a texture before);
+- a per-frame memo of texture lookups by fetch constant (forgotten at each resolve);
+- textures unchanged for 120 frames re-hashed every 8th frame they're drawn with, vertex ranges
+  unchanged for 600 frames compared every 4th frame (a rewrite in place after that shows up to that
+  many frames late);
+- resolve destinations' guest memory hashed by sample (first and last 4 KB and 64 pieces);
+- guest reads translated inline.

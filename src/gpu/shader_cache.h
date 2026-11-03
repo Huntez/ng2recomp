@@ -20,10 +20,17 @@ struct ShaderCacheEntry {
   // Vertex fetch constants 0-95 the shader reads directly (vfetchRaw);
   // declared elements' streams come from the vertex declaration per draw.
   const uint32_t vertexFetchMask[3];
+  // Float constant registers (0-255) and texture fetch slots (0-31) the shader
+  // reads: the others aren't uploaded or looked up for its draws.
+  const uint64_t floatConstantMask[4];
+  const uint32_t textureSlotMask;
   struct GuestShader* guestShader;
 };
 
 extern ShaderCacheEntry g_shaderCacheEntries[];
+// Defined by caches that carry floatConstantMask and textureSlotMask (an older
+// one fails to link instead of drawing with no constants or textures).
+extern const int g_shaderCacheHasMasks;
 extern const size_t g_shaderCacheEntryCount;
 
 extern const uint8_t g_compressedSpirvCache[];
