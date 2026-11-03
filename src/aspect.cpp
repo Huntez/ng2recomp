@@ -100,6 +100,10 @@ uint32_t g_drawItem = 0;
 // first piece it draws.
 struct Anchor {
   int x = 0, y = 0;
+  // Placed by the game's projection (already where the widened 3D picture
+  // has it): kept at its own centre (cx, cy), its shape squeezed about that.
+  bool projected = false;
+  float cx = 0.0f, cy = 0.0f;
 };
 std::unordered_map<uint32_t, Anchor> g_itemAnchor;
 bool g_hud = false;  // the gameplay HUD is up this frame (health bar buckets 57-59)
@@ -234,6 +238,8 @@ Anchor ItemAnchor(float x, float y) {
       a = {0, 1};  // the boss's health bar, drawn with the karma panel: bottom centre
     } else if (g_drawBucket == kKarmaBucket && x > 2560.0f / 3.0f) {
       a = {1, -1};  // the projectile count, top right
+    } else if (g_drawBucket == kKarmaBucket && y > 175.0f) {
+      a = {0, 0, true, x, y};  // the bow's aiming reticle, where the aim points
     } else if (LeftHud(g_drawBucket)) {
       a = {-1, -1};
     } else {
@@ -283,8 +289,14 @@ void SqueezeQuad(uint32_t vertices, uint32_t stride, Squeeze s) {
   Anchor a = ItemAnchor((x0 + x1) * 0.5f, (y0 + y1) * 0.5f);
   for (uint32_t i = 0; i < 4; i++) {
     uint32_t at = vertices + i * stride;
-    StoreFloat(at, Map(LoadFloat(at), kx, a.x, 1280.0f));
-    StoreFloat(at + 4, Map(LoadFloat(at + 4), ky, a.y, 720.0f));
+    float x = LoadFloat(at), y = LoadFloat(at + 4);
+    if (a.projected) {
+      StoreFloat(at, a.cx + (x - a.cx) * kx);
+      StoreFloat(at + 4, a.cy + (y - a.cy) * ky);
+    } else {
+      StoreFloat(at, Map(x, kx, a.x, 1280.0f));
+      StoreFloat(at + 4, Map(y, ky, a.y, 720.0f));
+    }
   }
 }
 
@@ -409,8 +421,9 @@ REX_HOOK_RAW(sub_8370DD70) {
       row->u64 = Pair(High(row->u64) * s.x, Low(row->u64) * s.y);
     }
     // The translation row.
-    ctx.r10.u64 = Pair(High(ctx.r10.u64) * s.x + MapOffset(s.x, a.x, 1280.0f),
-                       Low(ctx.r10.u64) * s.y + MapOffset(s.y, a.y, 720.0f));
+    float offsetX = a.projected ? a.cx * (1.0f - s.x) : MapOffset(s.x, a.x, 1280.0f);
+    float offsetY = a.projected ? a.cy * (1.0f - s.y) : MapOffset(s.y, a.y, 720.0f);
+    ctx.r10.u64 = Pair(High(ctx.r10.u64) * s.x + offsetX, Low(ctx.r10.u64) * s.y + offsetY);
   }
   __imp__sub_8370DD70(ctx, base);
 }
@@ -516,8 +529,10 @@ REX_HOOK_RAW(sub_8375C550) {
   }
   Anchor a = ItemAnchor((r[0] + r[2]) * 0.5f, (r[1] + r[3]) * 0.5f);
   auto at = [](float v) { return std::max(0, int32_t(std::lround(v))); };
-  int32_t mapped[4] = {at(Map(float(r[0]), s.x, a.x, 1280.0f)), at(Map(float(r[1]), s.y, a.y, 720.0f)),
-                       at(Map(float(r[2]), s.x, a.x, 1280.0f)), at(Map(float(r[3]), s.y, a.y, 720.0f))};
+  auto mapX = [&](float v) { return a.projected ? a.cx + (v - a.cx) * s.x : Map(v, s.x, a.x, 1280.0f); };
+  auto mapY = [&](float v) { return a.projected ? a.cy + (v - a.cy) * s.y : Map(v, s.y, a.y, 720.0f); };
+  int32_t mapped[4] = {at(mapX(float(r[0]))), at(mapY(float(r[1]))), at(mapX(float(r[2]))),
+                       at(mapY(float(r[3])))};
   auto store = [](uint32_t address, int32_t value) {
     uint8_t* p = Virtual(address);
     uint32_t v = uint32_t(value);
