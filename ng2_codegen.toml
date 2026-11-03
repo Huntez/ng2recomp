@@ -1,6 +1,21 @@
 # Ninja Gaiden II (544307D5, default.xex 2008-05-09 with Title Update 3) codegen overrides.
 # Included from ng2_manifest.toml.
 
+# Guest registers as C++ locals where they don't carry values between functions:
+# the compiler can keep them in host registers instead of the shared context.
+# Non-volatile registers (r14-r31, f14-f31, v14-v31, v64-v127) are each
+# function's own (its prologue/epilogue save helpers are dropped); SEH funclets
+# keep the shared ones. The vector registers below are read before being
+# written by functions that take values in them from their callers (the video
+# codec's transform kernels: v64, v65, v69, v72; sub_83795F68: v29, v30), found
+# by scanning the generated code, so they stay in the shared context.
+ctr_as_local = true
+xer_as_local = true
+cr_as_local = true
+reserved_as_local = true
+non_volatile_as_local = true
+shared_vector_registers = [29, 30, 64, 65, 69, 72]
+
 # MSVC CRT; libjpeg's error_exit longjmps out of the decoder.
 setjmp_address = 0x8397B4E0
 longjmp_address = 0x8397B1C0
