@@ -13,7 +13,10 @@
 // Infinite Ninpo: a character's ninpo is a u16 at +0x5942 (200 a charge).
 // A ninpo's cost is its item's property 0x19 (sub_83730AA8), read only to
 // check a cast can be made (cost <= ninpo, sub_82412A00) and to spend it
-// (sub_8372D360, which spends nothing at a cost of 0): it costs 0.
+// (sub_8372D360, which spends nothing at a cost of 0): it costs 0. The HUD's
+// gauge still showed a cast's drain, so the player's ninpo is also kept at
+// its most (+0x5940) each frame in play (CheatsFrame, from the frame's
+// start): the gauge stays full.
 //
 // Unlock Difficulties: sub_823E1098(clears, d) says difficulty d is open
 // (some difficulty at or above d - 1 cleared). The New Game path list
@@ -33,10 +36,12 @@
 // are as before.
 
 #include <cstdint>
+#include <cstring>
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
 
+#include "aspect.h"
 #include "gpu/guest.h"
 
 REXCVAR_DEFINE_BOOL(cheat_infinite_health, false, "Cheats", "The player takes no damage");
@@ -79,6 +84,13 @@ REX_HOOK_RAW(sub_824131E0) {
   WithoutPlayerDamage(ctx, base, __imp__sub_824131E0);
 }
 
+// The player's record is the first of the characters' 24-byte records; the
+// game reads its character straight from 0x84C3DC60. The game's own test that
+// a record's character is the player (sub_82412508): the record's +10 is 0,
+// the character's +0x59D3 isn't 0xFF and its +0x59BF is 0.
+constexpr uint32_t kPlayerRecord = 0x84C3DC60;
+constexpr uint32_t kNinpo = 0x5942, kNinpoMost = 0x5940;
+
 REX_EXTERN(__imp__sub_83730AA8);
 REX_HOOK_RAW(sub_83730AA8) {
   if (REXCVAR_GET(cheat_infinite_ninpo)) {
@@ -120,5 +132,25 @@ void Ng2MissionDifficulties(PPCRegister& r11, PPCRegister& r31) {
     r11.u64 = kAll;
     uint8_t* count = ng2::guest::Virtual(r31.u32 + 48);
     count[0] = 0, count[1] = 0, count[2] = 0, count[3] = uint8_t(kAll);
+  }
+}
+
+// Each frame (perf_overlay.cpp's frame start): Infinite Ninpo keeps the
+// gauge full.
+void CheatsFrame() {
+  // In play only: before it the record holds something else.
+  if (!REXCVAR_GET(cheat_infinite_ninpo) || !ng2::aspect::HudShown()) {
+    return;
+  }
+  uint32_t player = ng2::guest::Load32(kPlayerRecord);
+  if (player < 0x40000000u || player >= 0xA0000000u ||
+      ng2::guest::Virtual(kPlayerRecord)[10] != 0 ||
+      ng2::guest::Virtual(player)[0x59D3] == 0xFF || ng2::guest::Virtual(player)[0x59BF] != 0) {
+    return;
+  }
+  uint16_t most = ng2::guest::Load16(player + kNinpoMost);
+  if (most && most <= 0x2000 && ng2::guest::Load16(player + kNinpo) < most) {
+    uint16_t value = rex::byte_swap(most);
+    std::memcpy(ng2::guest::Virtual(player + kNinpo), &value, 2);
   }
 }

@@ -132,11 +132,14 @@ uint32_t FindTextFrame() {
 
 }  // namespace
 
+void CheatsFrame();  // cheats.cpp
+
 // The game starting a frame: time it, and queue the text for it.
 REX_EXTERN(__imp__sub_822F0EF8);
 REX_HOOK_RAW(sub_822F0EF8) {
   __imp__sub_822F0EF8(ctx, base);
   ng2::video::MarkFrameStart();
+  CheatsFrame();
   auto now = std::chrono::steady_clock::now();
   static const bool logFps = [] {
     const char* v = std::getenv("NG2_FPS_LOG");
