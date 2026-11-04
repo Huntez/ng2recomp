@@ -29,6 +29,9 @@
 #include <map>
 #include <mutex>
 #include <array>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #include <optional>
 #include <unordered_set>
 #include <algorithm>
@@ -244,41 +247,67 @@ bool Timing() {
   return g_profile.enabled || g_frameStats.enabled;
 }
 
+// The timers' clock: the CPU's time stamp counter where there is one (a
+// clock_gettime is tens of ns, and the stages are timed thousands of times a
+// frame), converted at a rate measured once against steady_clock.
+uint64_t TimerTicks() {
+#if defined(__x86_64__) || defined(_M_X64)
+  return __rdtsc();
+#else
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+#endif
+}
+uint64_t TicksToNs(uint64_t ticks) {
+#if defined(__x86_64__) || defined(_M_X64)
+  static const double nsPerTick = [] {
+    auto t0 = std::chrono::steady_clock::now();
+    uint64_t c0 = __rdtsc();
+    while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(2)) {
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    uint64_t c1 = __rdtsc();
+    return double(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()) /
+           double(c1 - c0);
+  }();
+  return uint64_t(double(ticks) * nsPerTick);
+#else
+  return ticks;
+#endif
+}
+
 // Times one thing made during the frame (a pipeline, shader or texture).
 class MakeTimer {
  public:
   MakeTimer(uint32_t& count, uint64_t& ns) : count_(count), ns_(ns) {
     if (g_frameStats.enabled) {
-      start_ = std::chrono::steady_clock::now();
+      start_ = TimerTicks();
     }
   }
   ~MakeTimer() {
     if (g_frameStats.enabled) {
       count_++;
-      ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                 std::chrono::steady_clock::now() - start_)
-                 .count();
+      ns_ += TicksToNs(TimerTicks() - start_);
     }
   }
 
  private:
   uint32_t& count_;
   uint64_t& ns_;
-  std::chrono::steady_clock::time_point start_;
+  uint64_t start_ = 0;
 };
 
 class StageTimer {
  public:
   explicit StageTimer(Stage stage) : stage_(stage) {
     if (Timing()) {
-      start_ = std::chrono::steady_clock::now();
+      start_ = TimerTicks();
     }
   }
   ~StageTimer() {
     if (Timing()) {
-      uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - start_)
-                        .count();
+      uint64_t ns = TicksToNs(TimerTicks() - start_);
       if (g_profile.enabled) {
         g_profile.nanoseconds[size_t(stage_)] += ns;
       }
@@ -288,7 +317,7 @@ class StageTimer {
 
  private:
   Stage stage_;
-  std::chrono::steady_clock::time_point start_;
+  uint64_t start_ = 0;
 };
 
 void ReportHitch() {
@@ -2508,18 +2537,24 @@ struct FetchKeyHash {
   size_t operator()(const FetchKey& key) const { return XXH3_64bits(key.dwords, sizeof(key.dwords)); }
 };
 std::unordered_map<FetchKey, uint32_t, FetchKeyHash> g_frameTextures;
+// The memo's keys by base address, for a resolve's (each list is the frame's
+// it's stamped with: older ones are empty).
+struct FrameTextureKeys {
+  uint64_t frame = ~0ull;
+  std::vector<FetchKey> keys;
+};
+std::unordered_map<uint32_t, FrameTextureKeys> g_frameTexturesByBase;
 uint64_t g_frameTexturesFrame = ~0ull;
 
 void ForgetFrameTextures(uint32_t base) {
-  for (auto it = g_frameTextures.begin(); it != g_frameTextures.end();) {
-    xenos::xe_gpu_texture_fetch_t fetch;
-    std::memcpy(&fetch.dword_0, it->first.dwords, sizeof(it->first.dwords));
-    if ((uint32_t(fetch.base_address) << 12) == base) {
-      it = g_frameTextures.erase(it);
-    } else {
-      ++it;
-    }
+  auto it = g_frameTexturesByBase.find(base);
+  if (it == g_frameTexturesByBase.end() || it->second.frame != g_frameCount) {
+    return;
   }
+  for (const FetchKey& key : it->second.keys) {
+    g_frameTextures.erase(key);
+  }
+  it->second.keys.clear();
 }
 
 uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
@@ -2533,6 +2568,12 @@ uint32_t GetTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   auto [it, inserted] = g_frameTextures.try_emplace(key, 0u);
   if (inserted) {
     it->second = LookUpTexture(fetch);
+    FrameTextureKeys& byBase = g_frameTexturesByBase[uint32_t(fetch.base_address) << 12];
+    if (byBase.frame != g_frameCount) {
+      byBase.frame = g_frameCount;
+      byBase.keys.clear();
+    }
+    byBase.keys.push_back(key);
   }
   return it->second;
 }
