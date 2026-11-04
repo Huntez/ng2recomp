@@ -230,6 +230,90 @@ registers = ["r10"]
 after_instruction = true
 
 [[midasm_hook]]
+address = 0x83756930
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756938
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756940
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756948
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756950
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756958
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756960
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756968
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756970
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756978
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756980
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756988
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756990
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756998
+name = "Ng2MaxHealthSegment"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
 address = 0x837569BC
 name = "Ng2MaxNinpo"
 registers = ["r10"]

@@ -170,7 +170,7 @@ void GiveAllWeaponsTo(uint32_t save, int32_t level, bool stageStart) {
       uint32_t slot = slots + 4 * s;
       if (Load16(slot) == item.id) {
         found = slot;
-      } else if (*ng2::guest::Virtual(slot + 2) == 0 && !free) {
+      } else if (Load16(slot) == 0xFFFF && !free) {  // the game's empty slot
         free = slot;
       }
     }
@@ -457,6 +457,13 @@ void Ng2SkullCountR11(PPCRegister& r11) {
 void Ng2MaxHealth(PPCRegister& r10) {
   if (REXCVAR_GET(cheat_max_health_ninpo)) {
     r10.u64 = 3600;
+  }
+}
+// The health bar's other segments (1-7, current and most; 0xFFFF: unused):
+// unused, so the first one's 3600 is the whole bar.
+void Ng2MaxHealthSegment(PPCRegister& r10) {
+  if (REXCVAR_GET(cheat_max_health_ninpo)) {
+    r10.u64 = 0xFFFF;
   }
 }
 // (the ninpo the character starts with, and its most)

@@ -216,58 +216,29 @@ struct Page {
   std::array<PageRow, 8> rows;
   uint32_t count;
 };
-// List rows made in our own memory, for a page without room for them.
-constexpr uint32_t kOursCheats = 0;
-constexpr uint32_t kTitleRowsSize = 0x1000;
-static_assert(kOursCheats + 3 * kListSize <= kTitleRowsSize);
+// Every row is an arrow list made in our own memory (g_titleRows, one per
+// setting), so a page's own layout doesn't limit what it holds: the game's
+// page objects give their builder, their Restore Defaults row and their
+// slot in the menu model.
+constexpr uint32_t kTitleRowsSize = (28 * kListSize + 0xFFF) & ~0xFFFu;
+constexpr PageRow Row(uint32_t setting) {
+  return {setting, setting * kListSize, true, true, true};
+}
 constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
-     {{{0, 0x1E0, true, false},
-       {1, 0x450, true, true},
-       {2, 0x450 + kListSize, true, true},
-       {3, 0xA60, true, true}}},
-     4},
-    {u"Display", 2, 0x1CC0, 0x1A20,
-     {{{4, 0x1E0, true, true},
-       {5, 0x1E0 + kListSize, true, true},
-       {15, 0xA60, true, true},
-       {6, 0x7F0, true, true},
-       {7, 0xE00, false, false},
-       // in the Swimming Controls row's widget, which the page no longer uses
-       {17, 0x1410, true, true},
-       {16, 0x1410 + kListSize, true, true}}},
+     {{Row(0), Row(3), Row(1), Row(22), Row(2), Row(21), Row(23)}},
      7},
-    // The Camera Settings page: its two four-choice rows, and lists over its
-    // two sliders.
+    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(15), Row(6)}}, 4},
+    // (its name in the game's third category name, which holds 7 letters)
     {u"Cheats", 3, 0x13E0, 0x1300,
-     {{{8, 0x1E0, false, false},
-       {9, 0x7F0, false, false},
-       {10, 0xE00, true, true},
-       {11, 0x1080, true, true},
-       {25, kOursCheats, true, true, true},
-       {26, kOursCheats + kListSize, true, true, true},
-       {27, kOursCheats + 2 * kListSize, true, true, true}}},
+     {{Row(8), Row(9), Row(10), Row(11), Row(25), Row(26), Row(27)}},
      7},
-    // Page 4 (laid out as Audio Settings): lists over its sliders and its
-    // Speaker Output row (all before its Restore Defaults).
-    {u"Gameplay", 4, 0x26A0, 0xAA0,
-     {{{12, 0x1E0, true, true},
-       {13, 0x1E0 + kListSize, true, true},
-       {14, 0x1E0 + 2 * kListSize, true, true}}},
-     3},
+    {u"Interface", 4, 0x26A0, 0xAA0, {{Row(20), Row(24), Row(7), Row(16), Row(17)}}, 5},
     // The Audio Settings page (5, builder sub_836D54F8, which stores its
-    // page number at +12): lists over its sliders and its Speaker Output
-    // row, before its Restore Defaults (+0x1380).
-    {u"Extras", 5, 0x1460, 0x1380,
-     {{{18, 0x1E0, true, true},
-       {19, 0x1E0 + kListSize, true, true},
-       {20, 0x1E0 + 2 * kListSize, true, true},
-       {21, 0x1E0 + 3 * kListSize, true, true},
-       {22, 0x1E0 + 4 * kListSize, true, true},
-       {23, 0x1E0 + 5 * kListSize, true, true},
-       {24, 0x1E0 + 6 * kListSize, true, true}}},
-     7},
+    // page number at +12; Restore Defaults at +0x1380).
+    {u"Gameplay", 5, 0x1460, 0x1380, {{Row(12), Row(13), Row(18), Row(19), Row(14)}}, 5},
 };
+static_assert(std::size(kSettings) * kListSize <= kTitleRowsSize);
 constexpr uint32_t kPageCount = std::size(kPages);
 constexpr std::u16string_view kRestoreText = u"Restore Defaults";
 
@@ -1366,6 +1337,37 @@ REX_HOOK_RAW(sub_823E5FE0) {
 REX_EXTERN(__imp__sub_823E7710);
 REX_HOOK_RAW(sub_823E7710) {
   Handle(ctx, base, __imp__sub_823E7710);
+}
+
+// The button hints under a page (sub_836D6898(&flags): 0x10 Change Storage
+// Device, 8 Test Volume, 4 Restore Defaults, 2 Confirm, 1 Back), by the
+// game's page and row: on ours, Restore Defaults and Back on every row.
+REX_EXTERN(__imp__sub_836D6898);
+REX_HOOK_RAW(sub_836D6898) {
+  uint32_t flags = ctx.r3.u32;
+  if (!g_open || !flags || !PageOf(ng2::guest::Load32(kPage))) {
+    __imp__sub_836D6898(ctx, base);
+    return;
+  }
+  uint32_t game = ng2::guest::Load32(flags);
+  Store32(flags, 0x5);
+  __imp__sub_836D6898(ctx, base);
+  Store32(flags, game);
+}
+
+// The hints' selector (sub_836D6AC8(view, model)) gives the Game Settings
+// page's rows 5 and 6 Change Storage Device before the flags above: on ours
+// it sees that page as another, which has none.
+REX_EXTERN(__imp__sub_836D6AC8);
+REX_HOOK_RAW(sub_836D6AC8) {
+  uint32_t model = ctx.r4.u32;
+  if (!g_open || !model || !PageOf(ng2::guest::Load32(kPage)) || ng2::guest::Load32(model) != 1) {
+    __imp__sub_836D6AC8(ctx, base);
+    return;
+  }
+  Store32(model, 2);
+  __imp__sub_836D6AC8(ctx, base);
+  Store32(model, 1);
 }
 
 // The Game Settings page's play time, formatted each frame into a shared

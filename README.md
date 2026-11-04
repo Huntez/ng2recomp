@@ -91,18 +91,20 @@ Windows pass `--game_data_root=<folder>`).
 Everything is in the game's own menus: **RECOMP SETTINGS** on the title menu, and **Recomp
 Settings** in the in-game menu (Back, under Save Method). Changes apply at once and are saved.
 
-- **Graphics**: render scale (1x–8x, with the resolution it draws at, as "2x 2240x1168"), texture filtering (the game's, or 4x–16x anisotropic), bloom
-  (off, reduced, on), anti-aliasing (off, or 2x as on the console, 4x, 8x MSAA)
+- **Graphics**: render scale (1x–8x, with the resolution it draws at, as "2x 2240x1168"),
+  anti-aliasing (off, or 2x as on the console, 4x, 8x MSAA), texture filtering (the game's, or
+  4x–16x anisotropic), texture LOD bias (the game's, 0, -1), bloom (off, reduced, on),
+  no post-effects (no blur, no white flashes), smooth HUD and menus
 - **Display**: window mode (windowed, borderless, fullscreen), window size, aspect ratio (16:9,
   16:10, 21:9, 32:9, 4:3), V-Sync (Off, FIFO, Mailbox, Adaptive; a mode the driver lacks falls back
-  to FIFO), show FPS, mouse sensitivity, button prompts (Auto follows the device in use; Xbox,
-  PlayStation, Nintendo, Keyboard)
+  to FIFO)
 - **Cheats**: infinite health, infinite ninpo, unlock difficulties, unlock costumes, all weapons and
   ninpo (Level 1 or 3), all crystal skulls, max HP and ninpo
-- **Gameplay**: skip intro, skip cutscenes (seen or not), pause in background
-- **Extras**: skip death screen, auto chapter screen, HUD (shown, fade out when not fighting,
-  hidden), no post-effects (no blur, no white flashes), texture LOD bias (the game's, 0, -1), smooth
-  HUD and menus, hi-res font (from the next start)
+- **Interface**: HUD (shown, fade out when not fighting, hidden), hi-res font (from the next start),
+  show FPS, button prompts (Auto follows the device in use; Xbox, PlayStation, Nintendo, Keyboard),
+  mouse sensitivity
+- **Gameplay**: skip intro, skip cutscenes (seen or not), skip death screen, auto chapter screen,
+  pause in background
 
 In the in-game menu, a page with seven settings has no Restore Defaults row (the list has no room
 for it); the title menu's has.

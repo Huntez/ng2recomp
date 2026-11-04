@@ -287,3 +287,14 @@ average, 1% low 55.4, 0.1% low 52.6, CPU 32%, GPU 48% (7 W), Deck 11 W from the 
 ran into the end of the fight (lighter last seconds). Xenia was driven by XTest keys from Python
 (CachyOS's xdotool needs a newer CPU than the Deck's) and starts with a small picture under
 --fullscreen in Game Mode until F11 is pressed twice; its storage prompt needs a real A press.
+
+## Draw worker (NG2_DRAW_WORKER=1, off by default; 11-04)
+
+The game's render thread records each Direct3D call and a worker draws them (src/gpu/video.cpp, "The
+draw worker"). On the Steam Deck the game's render thread went from about 675 to 400 ms of CPU a
+second and play hitches from 9-13 to 2.5 a minute. Known limits before it can be the default:
+- an immediate-mode draw (BeginVertices) of over 2 MB of vertices or indices doesn't fit the
+  staging half and is dropped (none seen in Chapter 1);
+- a GPU step (a fence, the handshake) made on another thread than the one with an inline draw
+  pending counts the calls before that draw only: its fence could signal before the draw's data
+  was copied.

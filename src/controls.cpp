@@ -106,20 +106,26 @@ void Frame() {
   // puts back what it found, so the pointer is checked again on the UI
   // thread on a change and twice a second: hidden while a pad is in use,
   // auto-hidden while the keyboard is and the driver isn't capturing.
-  static std::atomic<bool> queued{false}, keyboardInUse{false};
+  static std::atomic<bool> queued{false}, keyboardInUse{false}, overlayOpen{false};
   static Device last = Device::kUnknown;
+  static bool lastOverlay = false;
   static uint32_t frames = 0, soon = 0;
+  // Nothing used yet (at start, or a pad of no known kind): no mouse look,
+  // as with a pad. An overlay of the SDK's open (F3, F4): the pointer free
+  // and shown for it.
   Device device = ActiveDevice();
-  if (device == Device::kUnknown) {
-    return;
-  }
-  bool keyboard = device == Device::kKeyboard;
+  auto* runtime = rex::Runtime::instance();
+  auto* input = runtime ? static_cast<rex::input::InputSystem*>(runtime->input_system()) : nullptr;
+  bool overlay = input && input->IsOverlayOpen();
+  bool keyboard = device == Device::kKeyboard && !overlay;
   rex::input::mnk::SetMouseLookActive(keyboard);
   keyboardInUse.store(keyboard);
-  if (device != last) {
+  overlayOpen.store(overlay);
+  if (device != last || overlay != lastOverlay) {
     soon = 10;  // the next frames too, after the driver's own release
   }
   last = device;
+  lastOverlay = overlay;
   bool now = soon > 0 || ++frames % 30 == 0;
   if (soon > 0) {
     soon--;
@@ -136,7 +142,11 @@ void Frame() {
       return;
     }
     using Visibility = rex::ui::Window::CursorVisibility;
-    if (!keyboard) {
+    if (overlayOpen.load()) {
+      if (window->GetCursorVisibility() != Visibility::kVisible) {
+        window->SetCursorVisibility(Visibility::kVisible);
+      }
+    } else if (!keyboard) {
       if (window->GetCursorVisibility() != Visibility::kHidden) {
         window->SetCursorVisibility(Visibility::kHidden);
       }

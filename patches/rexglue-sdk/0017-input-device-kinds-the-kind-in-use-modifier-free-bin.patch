@@ -1,4 +1,4 @@
-From 0c2d8a6acf08d29eccba1a900b051d0a658fef9d Mon Sep 17 00:00:00 2001
+From ac8f00548b350bf0cb2ddee6f0d5c8ff665b5272 Mon Sep 17 00:00:00 2001
 From: gambuzino24 <gambuzino24@gmail.com>
 Date: Wed, 4 Nov 2026 20:23:08 +0000
 Subject: [PATCH] input: device kinds, the kind in use, modifier-free binds
@@ -10,12 +10,14 @@ prompts. A keyboard bind without modifiers works whatever modifiers are held,
 so a bare modifier (Shift) can be bound and holding it doesn't silence the
 other keys.
 ---
- include/rex/input/device.h         |  5 +++++
- include/rex/input/input_system.h   |  8 ++++++++
- src/input/input_system.cpp         | 12 ++++++++++++
- src/input/mnk/mnk_input_driver.cpp | 17 +++++++++++------
- src/input/sdl/sdl_input_driver.cpp | 16 ++++++++++++++++
- 5 files changed, 52 insertions(+), 6 deletions(-)
+ include/rex/input/device.h               |  5 +++++
+ include/rex/input/input_system.h         | 13 +++++++++++++
+ src/input/input_system.cpp               | 12 ++++++++++++
+ src/input/mnk/mnk_input_driver.cpp       | 17 +++++++++++------
+ src/input/sdl/sdl_input_driver.cpp       | 16 ++++++++++++++++
+ src/input/xinput/xinput_input_driver.cpp |  1 +
+ src/ui/rex_app.cpp                       |  3 +++
+ 7 files changed, 61 insertions(+), 6 deletions(-)
 
 diff --git a/include/rex/input/device.h b/include/rex/input/device.h
 index 7b67ceb..8bf7728 100644
@@ -40,10 +42,14 @@ index 7b67ceb..8bf7728 100644
  
  }  // namespace rex::input
 diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
-index 1cb3faa..e3f17bf 100644
+index 1cb3faa..6e8623d 100644
 --- a/include/rex/input/input_system.h
 +++ b/include/rex/input/input_system.h
-@@ -13,6 +13,9 @@
+@@ -10,9 +10,13 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <functional>
  #include <memory>
  #include <vector>
  
@@ -53,7 +59,17 @@ index 1cb3faa..e3f17bf 100644
  #include <rex/input/device_assignment.h>
  #include <rex/input/input.h>
  #include <rex/input/input_driver.h>
-@@ -47,6 +50,10 @@ class InputSystem : public system::IInputSystem {
+@@ -38,6 +42,9 @@ class InputSystem : public system::IInputSystem {
+   void AddDriver(std::unique_ptr<InputDriver> driver);
+   void AttachWindow(rex::ui::Window* window);
+   void SetActiveCallback(std::function<bool()> callback);
++  // Whether one of the app's overlays (debug, console, settings) is open.
++  void SetOverlayOpenCallback(std::function<bool()> callback) { overlay_open_ = std::move(callback); }
++  bool IsOverlayOpen() const { return overlay_open_ && overlay_open_(); }
+ 
+   /// Replaces any previous assignment. Call before the guest starts polling.
+   void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
+@@ -47,7 +54,12 @@ class InputSystem : public system::IInputSystem {
    X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
    X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
  
@@ -62,9 +78,11 @@ index 1cb3faa..e3f17bf 100644
 +  DeviceKind ActiveKind(uint32_t user_index) const;
 +
   private:
++  std::function<bool()> overlay_open_;
    /// Re-enumerates every driver and notifies the assignment when the set
    /// changed.
-@@ -60,6 +67,7 @@ class InputSystem : public system::IInputSystem {
+   void RefreshDevices();
+@@ -60,6 +72,7 @@ class InputSystem : public system::IInputSystem {
  
    std::unique_ptr<DeviceAssignment> assignment_;
    ActiveDeviceTracker active_devices_;
@@ -172,6 +190,32 @@ index c7c440d..892540c 100644
      out.push_back(info);
    }
  }
+diff --git a/src/input/xinput/xinput_input_driver.cpp b/src/input/xinput/xinput_input_driver.cpp
+index a6a1da9..1fb9d9a 100644
+--- a/src/input/xinput/xinput_input_driver.cpp
++++ b/src/input/xinput/xinput_input_driver.cpp
+@@ -145,6 +145,7 @@ void XinputInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
+     DeviceInfo info;
+     info.id = DeviceForSlot(slot);
+     info.name = "XInput Controller";
++    info.kind = DeviceKind::kXbox;
+     info.synthetic = false;
+     out.push_back(info);
+   }
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index eb441a8..43171f2 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -256,6 +256,9 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+           return true;
+         return !imgui_drawer_->GetIO().WantCaptureMouse;
+       });
++      input_sys->SetOverlayOpenCallback([this]() {
++        return debug_overlay_ || console_overlay_ || settings_overlay_ || achievements_overlay_;
++      });
+     }
+   }
+ 
 -- 
 2.56.0
 
