@@ -141,8 +141,8 @@ NG2_DEBUG_WHITE_TEXTURES=1.
   alpha-to-coverage, gamma (k_8_8_8_8_GAMMA, PWL ramp).
 - EDRAM aliasing between surfaces that share EDRAM (Xenia's render target
   cache is the reference).
-- Performance: present on a render thread like Unleashed; cheaper guest
-  memory and texture invalidation than per-frame hashing.
+- Performance: done. Vulkan work on a thread of ours (11-03), textures and vertex ranges
+  rechecked less often (see the sections below).
 - Review notes for the present path (window size on the UI thread, acquire
   timeout, window handle from ReXGlue).
 - From the draw path review (2026-10-28), not done yet:
@@ -157,7 +157,7 @@ NG2_DEBUG_WHITE_TEXTURES=1.
     lists, signed texture components, packed mip tails;
   - Present holds the renderer mutex through swapchain acquire;
   - pipelines are created on the game thread (hitches until a pipeline
-    cache exists).
+    cache exists). Fixed since: async_pipelines.
 
 Audio: ReXGlue's SDL3 output with its XMA decoder (libavcodec); Unleashed's
 SDL driver only if this turns out worse.
@@ -197,7 +197,8 @@ Scripts: a sampler following the test run's own process (the player's game may r
 recomp's pad script, and for Xenia xdotool keys inside gamescope (`--keybind_a=J`: the default A key,
 semicolon, doesn't reach it there; its sign-in prompt is Right, Return). The SDK's GPU emulation is
 much heavier than current Xenia Edge; the recomp's own CPU time is higher than Xenia's (its threads
-spin more), worth a look.
+spin more), worth a look. Fixed since: see Threads and the Steam Deck (0.4 cores against
+Xenia's 2.3).
 
 CPU (10-30): the recomp used more than Xenia because the game's D3D wait for
 the GPU (sub_8373A4D0, stepping sub_83737AE0 until the GPU's read pointer
@@ -236,9 +237,43 @@ Measured in Chapter 1's first fight on a 9800X3D (NG2_PROFILE, ms of each second
 - each shader's float constants and texture slots, recorded by XenosRecomp (patch 0011): a draw
   byte-swaps only the constant registers its shaders read (median 10 of 480) and looks up only the
   slots they sample (1.06 on average, against every slot holding a texture before);
-- a per-frame memo of texture lookups by fetch constant (forgotten at each resolve);
+- a per-frame memo of texture lookups by fetch constant (a resolve forgets only the textures at its
+  destination, found by base address);
 - textures unchanged for 120 frames re-hashed every 8th frame they're drawn with, vertex ranges
   unchanged for 600 frames compared every 4th frame (a rewrite in place after that shows up to that
   many frames late);
 - resolve destinations' guest memory hashed by sample (first and last 4 KB and 64 pieces);
 - guest reads translated inline.
+
+## Threads and the Steam Deck (11-03 to 11-04)
+
+On the Steam Deck (4 cores, 8 threads) frame drops came from the game's render thread running out
+of time, not the GPU (it waited ~0 ms on the GPU). Measured with the per-thread line of
+NG2_PROFILE; in a heavy fight frame the renderer's share was 12-21 ms.
+- Busy-waits that held cores: the game's main loop handing frames to the render thread
+  (sub_822F34C0), the render thread's vblank limiter (sub_822F0BF8), the SDK's alertable waits (a
+  sub-millisecond timeout rounded down to 0) and its timer queue (SDK patch 0014): they now pause, yield and sleep.
+- Guest registers as locals in the generated code (ng2_codegen.toml, SDK patch 0015 keeps the
+  vector registers some functions take from their callers shared): main thread -40%.
+- The Vulkan work on a thread of ours ("Render Commands"): the hooks still read guest memory on
+  the game's render thread, everything for Vulkan is queued (a RenderCommandList that copies its
+  arguments) and replayed there.
+- D3D's writers of constant packets (sub_83767670, sub_83767A10) are skipped with the native
+  renderer: nothing reads its command stream any more.
+- The texture memo indexed by address: a resolve (about 30 a frame) no longer walks the whole memo.
+  The stage timers read the CPU's time stamp counter instead of clock_gettime.
+- File reads the game asks to be asynchronous run on an I/O thread (SDK patch 0016): with reads
+  slowed to SD card speed, Chapter 1's loading hitches went from 33 (3 s) to 3 (0.1 s).
+- Untiling a run of texels at a time: a 1280x720 8-bit texture 4.9 -> 0.55 ms.
+What's left on the Deck: the game itself only starts a frame on a vblank, so a frame that needs
+more than 16.7 ms is shown for 33; heavy effects (fire, many particles) still do that for a second
+or two. Tried and dropped: zero-copy guest memory (fences, inline vertices and memory export would
+all have to change, for ~10-15%), checking long-unchanged vertex ranges less often at the end of a
+frame (a pooled buffer reused mid-frame would draw stale for up to 8 frames).
+
+Compared on the desktop on 11-04 (README table): same Chapter 1 fight, headless gamescope at
+1280x720, GPU busy from the driver and the game process's CPU time over 30 s. The port: 19% / 21%
+GPU at 1x / 3x, 0.4 cores. Xenia Edge: 14-16% at 1x, 2.3 cores; at 3x it froze in the opening
+cutscene in both tries (Xenia's own watchdog showed every guest thread blocked). Xenia's first-start
+dialogs (profile, "add games") come in a varying order, so its runs start from a folder where they
+were already answered.

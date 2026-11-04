@@ -30,17 +30,22 @@ played through, and there are no releases yet. Test builds are posted in issues.
 ## Performance
 
 Measured on one machine (Ryzen 7 9800X3D, Radeon RX 9070, Mesa RADV, Linux), in the same Chapter 1 fight,
-headless at 1280x720, 30 seconds each. All held 60 fps; what differs is how hard the GPU works to do
-it (GPU busy, of which about 5% is the desktop) and the CPU time used.
+headless at 1280x720, 30 seconds each. All held 60 fps (Xenia Edge's 3x figure is from an earlier run, see below); what differs is how hard the GPU works to do
+it (GPU busy, of which about 5% is the desktop) and the CPU time used (in cores: 1.0 is one core kept
+busy).
 
 | | GPU busy, 1x | GPU busy, 3x | CPU cores |
 |---|---|---|---|
-| This port's Vulkan renderer | 13% | 21% | 2.4 |
-| The same recompiled game on ReXGlue's GPU emulation (Xenia's) | 80% | 85% | 3.4-3.5 |
-| Xenia Edge (the emulator) | 18% | 54% | 2.3 |
+| This port (November 2026) | 19% | 21% | 0.4 |
+| Xenia Edge (the emulator) | 14-16% | 54%* | 2.3 |
+| This port on ReXGlue's GPU emulation (October 2026) | 80% | 85% | 3.4-3.5 |
 
-The native renderer leaves the GPU most of its time free at 3x, where GPU emulation is near its
-limit; that headroom is what allows 4x-8x and MSAA on top.
+\* From an earlier run: in this round Xenia Edge froze in the opening cutscene at 3x, twice.
+
+At 1x both are light (at such low loads the GPU drops its clocks, which inflates the busy figure). At
+3x the port's GPU load barely moves; that headroom is what allows 4x-8x and MSAA on top. The CPU
+figure is where the port differs most: about a sixth of what the emulator uses, which is what
+matters on a 4-core handheld like the Steam Deck.
 
 ## Getting started
 

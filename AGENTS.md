@@ -63,8 +63,16 @@ devices, and none of the player's settings or saves.
   with no GPU emulation (src/gpu/native_gpu.cpp).
 - `NG2_AUDIO=0`: no audio device; the game's audio still runs.
 - `NG2_CONFIG=<file>`: settings file instead of `<exe dir>/ng2.toml`.
-- `NG2_PROFILE=1`: time per renderer stage, once a second. `NG2_HITCHES=1` (or `log_hitches`): slow
-  frames with what they were spent on. `NG2_FPS_LOG=1`: the game's frame rate once a second.
+- `NG2_PROFILE=1`: time per renderer stage, once a second, and every 5 s (Linux) the busiest threads' CPU
+  time ("threads, ms of CPU each second"; "(renderer)" is the game's render thread, "Render
+  Commands" ours). `NG2_HITCHES=1` (or `log_hitches`): slow frames with what they were spent on.
+  `NG2_FPS_LOG=1`: the game's frame rate once a second.
+- `NG2_RENDER_THREAD=0`: Vulkan commands, submits and presents on the game's render thread again
+  instead of the "Render Commands" thread (for comparisons).
+- `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).
+  `--async_file_reads=false`: reads the game asks to be asynchronous block its thread again.
+  `--test_read_delay_us_per_mb=12000`: slow every read to about SD card speed, to measure loading
+  hitches on a fast disk.
 - `NG2_TRACE_FRAME=t<sec>+<count>`: log every draw of those frames.
 - F7, or `NG2_TRACE_FILE=<file>` (starts when the file appears): every draw of the next
   `NG2_TRACE_FRAMES` (60) frames and a small picture every 10, in `~/ng2-trace-<n>` (`HOME` decides

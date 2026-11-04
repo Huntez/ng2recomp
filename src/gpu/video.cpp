@@ -383,7 +383,7 @@ void ReportLatency() {
 // With NG2_PROFILE, every 5 s: the busiest threads' CPU time (ms of each
 // second, from /proc; Linux only), so a slow machine's log tells which thread
 // limits the frame rate. "(renderer)" is the game's render thread, which runs
-// this renderer.
+// the renderer's hooks (the Vulkan side is on "Render Commands").
 void ReportThreads() {
 #if defined(__linux__)
   static std::unordered_map<int, uint64_t> last;
