@@ -34,21 +34,18 @@ game's heaviest scenes. On it, fights now hold 60 fps, with occasional single dr
 effects (fire, many particles).
 
 On a desktop, measured on one machine (Ryzen 7 9800X3D, Radeon RX 9070, Mesa RADV, Linux), in the
-same Chapter 1 fight, headless at 1280x720, 30 seconds each. All held 60 fps; what differs is how
-hard the GPU works to do it (GPU busy, of which about 5% is the desktop) and the CPU time used (in
-cores: 1.0 is one core kept busy).
+same Chapter 1 fight, headless at 1280x720, 30 seconds each. All held 60 fps; what differs is the
+graphics card's power draw while doing it (27-33 W at idle) and the CPU time used (in cores: 1.0 is
+one core kept busy).
 
-| | GPU busy, 1x | GPU busy, 3x | CPU cores |
+| | GPU power, 1x | GPU power, 3x | CPU cores |
 |---|---|---|---|
-| This port (November 2026) | 15-19% | 21% | 0.4 |
-| Xenia Edge (the emulator) | 14-16% | 58% | 2.3 |
-| This port on ReXGlue's GPU emulation (October 2026) | 80% | 85% | 3.4-3.5 |
+| This port (November 2026) | 40 W | 57 W | 0.4 |
+| Xenia Edge (the emulator) | 51 W | 84 W | 2.3 |
 
-At 1x the busy figures are close, because at such light loads the GPU lowers its clocks and stays
-busy longer. The card's power draw tells them apart: 13 W above idle for the port, 24 W for Xenia
-Edge. At 3x the port's GPU load barely moves; that headroom is what allows 4x-8x and MSAA on top.
-The CPU figure is where the port differs most: about a sixth of what the emulator uses, which is
-what matters on a 4-core handheld like the Steam Deck.
+Above idle, the port's card uses about half of what the emulator's does, at 1x and at 3x; that
+headroom is what allows 4x-8x and MSAA on top. The CPU figure is where the port differs most: about a
+sixth of what the emulator uses, which is what matters on a 4-core handheld like the Steam Deck.
 
 ## Getting started
 
