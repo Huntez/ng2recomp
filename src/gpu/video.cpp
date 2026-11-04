@@ -113,6 +113,9 @@ REXCVAR_DEFINE_INT32(bloom, 2, "Video", "The game's bloom: 0 off, 1 reduced (hal
 REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "Video",
                     "Shift drawing by half a pixel where the game uses D3D's pixel centers, "
                     "as the console does");
+// Extras' Texture LOD Bias: the game's own mip bias (-1.5 on most textures),
+// or 0 or -1 for every texture (less shimmer at higher render scales).
+REXCVAR_DEFINE_INT32(texture_lod_bias, 0, "Extras", "0: the game's, 1: 0, 2: -1");
 REXCVAR_DEFINE_INT32(anisotropic_filtering, -1, "Video",
                      "Anisotropic filtering for mipmapped textures: -1 as the game asks, "
                      "0 off, 1-5 for 1x, 2x, 4x, 8x, 16x")
@@ -1965,6 +1968,9 @@ uint32_t GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch) {
                                          : std::max(uint32_t(fetch.mip_min_level), 1u));
   desc.maxLOD = fetch.mip_filter == xenos::TextureFilter::kBaseMap ? desc.minLOD : FLT_MAX;
   desc.mipLODBias = std::clamp(float(fetch.lod_bias) / 32.0f, -15.0f, 15.0f);
+  if (int32_t bias = REXCVAR_GET(texture_lod_bias); bias == 1 || bias == 2) {
+    desc.mipLODBias = bias == 1 ? 0.0f : -1.0f;
+  }
   // Anisotropy as the fetch constant asks (1x-16x), for filtered mipmapped
   // sampling like Xenia's; it implies linear filtering.
   uint32_t aniso = uint32_t(fetch.aniso_filter);

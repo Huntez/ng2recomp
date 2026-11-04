@@ -175,6 +175,18 @@ constexpr Setting kSettings[] = {
      "button_prompts", Kind::kLevel},
     {u"Mouse Sensitivity", {u"0.25", u"0.5", u"0.75", u"1", u"1.5", u"2"}, 6, "mnk_sensitivity",
      Kind::kSensitivity},
+    // Extras (extras.cpp, and the renderer's Texture LOD Bias).
+    {u"Skip Death Screen", {u"On", u"Off"}, 2, "skip_death_screen", Kind::kOnOff},
+    {u"Auto Chapter Screen", {u"On", u"Off"}, 2, "auto_chapter_screen", Kind::kOnOff},
+    {u"HUD", {u"Shown", u"Fade Out", u"Hidden"}, 3, "hud_mode", Kind::kLevel},
+    {u"No Post-Effects", {u"On", u"Off"}, 2, "no_post_effects", Kind::kOnOff},
+    {u"Texture LOD Bias", {u"Game", u"0.0", u"-1.0"}, 3, "texture_lod_bias", Kind::kLevel},
+    {u"Smooth HUD and Menus", {u"On", u"Off"}, 2, "smooth_hud", Kind::kOnOff},
+    {u"Hi-Res Font", {u"On", u"Off"}, 2, "hires_font", Kind::kOnOff},
+    {u"All Weapons and Ninpo", {u"Off", u"Level 1", u"Level 3"}, 3, "cheat_all_weapons",
+     Kind::kLevel},
+    {u"All Crystal Skulls", {u"On", u"Off"}, 2, "cheat_all_skulls", Kind::kOnOff},
+    {u"Max HP and Ninpo", {u"On", u"Off"}, 2, "cheat_max_health_ninpo", Kind::kOnOff},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -191,9 +203,10 @@ std::u16string_view Choice(const Setting& setting, uint32_t k) {
 
 struct PageRow {
   uint32_t setting;
-  uint32_t widget;  // offset in the page object
+  uint32_t widget;  // offset in the page object (ours: in g_titleRows)
   bool list;        // an arrow list (else two choices)
   bool make;        // a list widget we make there
+  bool ours = false;  // made in our own memory (the page has no room)
 };
 struct Page {
   std::u16string_view name;
@@ -203,6 +216,10 @@ struct Page {
   std::array<PageRow, 8> rows;
   uint32_t count;
 };
+// List rows made in our own memory, for a page without room for them.
+constexpr uint32_t kOursCheats = 0;
+constexpr uint32_t kTitleRowsSize = 0x1000;
+static_assert(kOursCheats + 3 * kListSize <= kTitleRowsSize);
 constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
      {{{0, 0x1E0, true, false},
@@ -226,15 +243,30 @@ constexpr Page kPages[] = {
      {{{8, 0x1E0, false, false},
        {9, 0x7F0, false, false},
        {10, 0xE00, true, true},
-       {11, 0x1080, true, true}}},
-     4},
-    // The Audio Settings page: lists over its sliders and its Speaker
-    // Output row (all before its Restore Defaults).
+       {11, 0x1080, true, true},
+       {25, kOursCheats, true, true, true},
+       {26, kOursCheats + kListSize, true, true, true},
+       {27, kOursCheats + 2 * kListSize, true, true, true}}},
+     7},
+    // Page 4 (laid out as Audio Settings): lists over its sliders and its
+    // Speaker Output row (all before its Restore Defaults).
     {u"Gameplay", 4, 0x26A0, 0xAA0,
      {{{12, 0x1E0, true, true},
        {13, 0x1E0 + kListSize, true, true},
        {14, 0x1E0 + 2 * kListSize, true, true}}},
      3},
+    // The Audio Settings page (5, builder sub_836D54F8, which stores its
+    // page number at +12): lists over its sliders and its Speaker Output
+    // row, before its Restore Defaults (+0x1380).
+    {u"Extras", 5, 0x1460, 0x1380,
+     {{{18, 0x1E0, true, true},
+       {19, 0x1E0 + kListSize, true, true},
+       {20, 0x1E0 + 2 * kListSize, true, true},
+       {21, 0x1E0 + 3 * kListSize, true, true},
+       {22, 0x1E0 + 4 * kListSize, true, true},
+       {23, 0x1E0 + 5 * kListSize, true, true},
+       {24, 0x1E0 + 6 * kListSize, true, true}}},
+     7},
 };
 constexpr uint32_t kPageCount = std::size(kPages);
 constexpr std::u16string_view kRestoreText = u"Restore Defaults";
@@ -982,9 +1014,11 @@ uint32_t ListString(PPCContext& ctx, uint8_t* base, std::u16string_view text) {
 
 // A list widget made in place, as the Game Settings page's constructor
 // (sub_836A5200) makes its language list.
-void MakeList(PPCContext& ctx, uint8_t* base, uint32_t widget) {
+void MakeList(PPCContext& ctx, uint8_t* base, uint32_t widget, bool ours) {
   uint8_t* bytes = ng2::guest::Virtual(widget);
-  g_savedWidgets.emplace_back(widget, std::vector<uint8_t>(bytes, bytes + kListSize));
+  if (!ours) {
+    g_savedWidgets.emplace_back(widget, std::vector<uint8_t>(bytes, bytes + kListSize));
+  }
   std::memset(ng2::guest::Virtual(widget), 0, kListSize);
   Store32(widget, kListVtable);
   for (uint32_t sprite : {0x50u, 0xE0u, 0x170u}) {
@@ -993,6 +1027,26 @@ void MakeList(PPCContext& ctx, uint8_t* base, uint32_t widget) {
   }
   CallGuest(ctx, base, __imp__sub_8242C048, {widget + 0x200});
   Store32(widget + 0x260, 1);
+}
+
+// Our own rows for the title's pages (kOurs*), made once.
+uint32_t g_titleRows = 0;
+bool MakeTitleRowsOnce(PPCContext& ctx, uint8_t* base) {
+  if (!g_titleRows) {
+    g_titleRows = CallGuest(ctx, base, __imp__sub_83835960, {kTitleRowsSize, 0xB2800000});
+    if (g_titleRows) {
+      std::memset(ng2::guest::Virtual(g_titleRows), 0, kTitleRowsSize);
+    }
+  }
+  return g_titleRows != 0;
+}
+
+bool HasOurRows(const Page& page) {
+  bool ours = false;
+  for (uint32_t i = 0; i < page.count; i++) {
+    ours |= page.rows[i].ours;
+  }
+  return ours;
 }
 
 // Our rows onto a page object, after its builder (model: the builder's
@@ -1014,10 +1068,10 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
   for (uint32_t i = 0; i < page.count; i++) {
     const PageRow& row = page.rows[i];
     const Setting& setting = kSettings[row.setting];
-    uint32_t widget = object + row.widget;
+    uint32_t widget = (row.ours ? g_titleRows : object) + row.widget;
     uint32_t value = ValueOf(setting);
     if (row.make) {
-      MakeList(ctx, base, widget);
+      MakeList(ctx, base, widget, row.ours);
     }
     place(widget);
     if (row.list) {
@@ -1083,6 +1137,10 @@ void Build(PPCContext& ctx, uint8_t* base, void (*builder)(PPCContext&, uint8_t*
   g_buildingSize = page->size;
   builder(ctx, base);
   g_building = 0;
+  if (HasOurRows(*page) && !MakeTitleRowsOnce(ctx, base)) {
+    REXLOG_WARN("recomp settings: no memory for the {} page's rows", ng2::guest::Load32(kPage));
+    return;
+  }
   BuildPage(ctx, base, *page, object, model);
 }
 
@@ -1261,7 +1319,11 @@ REX_HOOK_RAW(sub_836D2B10) {
 }
 REX_EXTERN(__imp__sub_836D43C8);
 REX_HOOK_RAW(sub_836D43C8) {
-  Build(ctx, base, __imp__sub_836D43C8, 4);  // Audio Settings
+  Build(ctx, base, __imp__sub_836D43C8, 4);  // page 4's
+}
+REX_EXTERN(__imp__sub_836D54F8);
+REX_HOOK_RAW(sub_836D54F8) {
+  Build(ctx, base, __imp__sub_836D54F8, 5);  // Audio Settings
 }
 
 // A choice or a row from a builder whose rows are left out.
@@ -1610,10 +1672,20 @@ bool SetUpInGameRows(PPCContext& ctx, uint8_t* base) {
   return true;
 }
 
+// The in-game list has a slot for a page's Restore Defaults after its rows
+// unless they fill the column (the title's pages still have it).
+bool InGameRestore(const Page& page) {
+  return kFirstPageRow + page.count < kGameRows;
+}
+static_assert(std::all_of(std::begin(kPages), std::end(kPages),
+                          [](const Page& p) { return kFirstPageRow + p.count <= kGameRows; }));
+
 // Restore Defaults after a page's rows, and the empty rows after it.
 void SetUpPageEnd(PPCContext& ctx, uint8_t* base, uint32_t restoreSlot) {
-  InitRow(ctx, base, g_restoreRow, restoreSlot);
-  Store32(g_restoreRow + kRowLabel, g_restoreText);
+  if (restoreSlot < kGameRows) {
+    InitRow(ctx, base, g_restoreRow, restoreSlot);
+    Store32(g_restoreRow + kRowLabel, g_restoreText);
+  }
   for (uint32_t i = 0; i < std::size(g_emptyRows); i++) {
     InitRow(ctx, base, g_emptyRows[i], restoreSlot + 1 + i, true);
     Store32(g_emptyRows[i] + kRowLabel, g_emptyText);
@@ -1745,8 +1817,10 @@ void ShowInGameRows(PPCContext& ctx, uint8_t* base, bool ours, uint32_t category
   }
   uint32_t restoreSlot = kFirstPageRow + page.count;
   SetUpPageEnd(ctx, base, restoreSlot);
-  rows[restoreSlot] = g_restoreRow;
-  PlacePageRow(g_restoreRow, false);
+  if (InGameRestore(page)) {
+    rows[restoreSlot] = g_restoreRow;
+    PlacePageRow(g_restoreRow, false);
+  }
   for (uint32_t i = restoreSlot + 1; i < kGameRows; i++) {
     rows[i] = g_emptyRows[i - restoreSlot - 1];
   }
@@ -1968,7 +2042,7 @@ REX_HOOK_RAW(sub_823E8720) {
       // A page: up and down pick a row, left and right change it, Y sets its
       // default, Confirm on Restore Defaults sets the page's.
       const Page& page = kPages[g_category];
-      uint32_t rowCount = page.count + 1;
+      uint32_t rowCount = page.count + (InGameRestore(page) ? 1 : 0);
       uint32_t row = std::min(cursor - std::min(cursor, kFirstPageRow), rowCount - 1);
       uint32_t moved = row;
       if (pressed(0)) {

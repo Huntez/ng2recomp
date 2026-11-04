@@ -93,8 +93,19 @@ Settings** in the in-game menu (Back, under Save Method). Changes apply at once 
 
 - **Graphics**: render scale (1x–8x, with the resolution it draws at, as "2x 2240x1168"), texture filtering (the game's, or 4x–16x anisotropic), bloom
   (off, reduced, on), anti-aliasing (off, or 2x as on the console, 4x, 8x MSAA)
-- **Display**: window mode (windowed, borderless, fullscreen), window size, V-Sync (Off, FIFO,
-  Mailbox, Adaptive; a mode the driver lacks falls back to FIFO), show FPS
+- **Display**: window mode (windowed, borderless, fullscreen), window size, aspect ratio (16:9,
+  16:10, 21:9, 32:9, 4:3), V-Sync (Off, FIFO, Mailbox, Adaptive; a mode the driver lacks falls back
+  to FIFO), show FPS, mouse sensitivity, button prompts (Auto follows the device in use; Xbox,
+  PlayStation, Nintendo, Keyboard)
+- **Cheats**: infinite health, infinite ninpo, unlock difficulties, unlock costumes, all weapons and
+  ninpo (Level 1 or 3), all crystal skulls, max HP and ninpo
+- **Gameplay**: skip intro, skip cutscenes (seen or not), pause in background
+- **Extras**: skip death screen, auto chapter screen, HUD (shown, fade out when not fighting,
+  hidden), no post-effects (no blur, no white flashes), texture LOD bias (the game's, 0, -1), smooth
+  HUD and menus, hi-res font (from the next start)
+
+In the in-game menu, a page with seven settings has no Restore Defaults row (the list has no room
+for it); the title menu's has.
 
 The game's own Options (camera, controller, sound, screen) are where they always were.
 
@@ -107,8 +118,21 @@ Some settings have no menu entry yet; they go in `ng2.toml`:
 
 ## Controls
 
-A controller works as on the Xbox 360. Keyboard and mouse go through ReXGlue's mapping and aren't
-tuned for this game yet.
+A controller works as on the Xbox 360. Keyboard and mouse work too:
+
+| Key | Action | Key | Action |
+|---|---|---|---|
+| W A S D | move | mouse | camera |
+| left mouse, J | quick attack (X) | right mouse, K | strong attack (Y) |
+| Space | jump (A) | E | projectile (B) |
+| F | ninpo (Y + B) | C | water run (A + X) |
+| Shift | block (LT) | Q, middle mouse | RT |
+| R | LB | V | RB |
+| Z / X | stick clicks | Tab / Escape | Back / Start |
+| arrows | d-pad | Return / Backspace | A / B in menus |
+
+The keys can be changed in `ng2.toml` (`keybind_a = "Space,C,Return"` and so on). The mouse only
+moves the camera while the keyboard is in use, and the pointer is hidden while a controller is.
 
 ## Known issues
 

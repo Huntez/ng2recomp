@@ -213,6 +213,17 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   functions, and a ninpo cost of 0 (ninpo is a u16 at character +0x5942,
   200 a charge, the most at +0x5940; the player's character is the first
   word of the record at 0x84C23C70).
+- Options page objects (TU3, 11-04): built once as Options opens, back to back from 0x8532F390:
+  page 1 (builder sub_836D14C0, 0x2BB0 bytes), 2 (sub_836D2078, 0x1CC0), 3 (sub_836D2B10, 0x13E0),
+  4 (sub_836D43C8, 0x26A0), then Screen Settings (sub_836D3550, 0xB20: three rows of class
+  0x82286C38, no Restore Defaults). Each builder stores its page number at +12 (the one before at
+  +8): Screen Settings is page 11; the Audio Settings page with the volume sliders is page 5
+  (sub_836D54F8, constructor sub_836A5558: rows at +0x1E0, +0x450, +0x6C0, +0x930, +0xF40,
+  Restore Defaults at +0x1380). A page object's vtable V has its builder at V + 0x2C. A Restore
+  Defaults row is 0xE0 bytes: vtable 0x822868F8, +0x14 = 0, a sprite (sub_83704630) at +0x40.
+  Extras is page 5; the three newer cheats' list rows are made in memory of ours (Cheats' page
+  object has no room). The button hints under a page are the game's, by page and row (page 5's
+  first rows say "Test Volume").
 - The game's UI clips with D3D's scissor (draw-list helpers sub_8366EF58 /
   sub_8367C908 set D3DRS_SCISSORTESTENABLE and a widget's rect): the in-game
   camera speed sliders' fill stops at the knob through it. The renderer

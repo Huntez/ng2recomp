@@ -53,3 +53,190 @@ registers = ["r11"]
 [[midasm_hook]]
 address = 0x822F0C68
 name = "Ng2VblankWait"
+
+# Extras and their cheats (src/extras.cpp).
+# The pad state before the four pads are merged: r5 the first pad's words.
+[[midasm_hook]]
+address = 0x822F337C
+name = "Ng2ExtrasPad"
+registers = ["r5"]
+
+# Skip Death Screen: the death sequence's waits, and the GAME OVER caption.
+[[midasm_hook]]
+address = 0x82442EB4
+name = "Ng2DeathWait"
+registers = ["r29"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8244306C
+name = "Ng2DeathWait"
+registers = ["r29"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8244315C
+name = "Ng2DeathFade"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83695D1C
+name = "Ng2DeathCaption"
+jump_address_on_true = 0x83695D20
+
+# No Post-Effects: a blur pass asked for inline, the passes' mask as read, the
+# white flash.
+[[midasm_hook]]
+address = 0x82362710
+name = "Ng2PostBlur"
+jump_address_on_true = 0x82362720
+
+[[midasm_hook]]
+address = 0x83648E6C
+name = "Ng2PostPasses"
+registers = ["r26"]
+
+[[midasm_hook]]
+address = 0x8269D054
+name = "Ng2WhiteFlash"
+jump_address_on_true = 0x8269D058
+
+# Smooth HUD and Menus: the four sprite draws' branch around the filtered path.
+[[midasm_hook]]
+address = 0x83802350
+name = "Ng2SmoothSprite"
+jump_address_on_true = 0x83802354
+
+[[midasm_hook]]
+address = 0x83802DE8
+name = "Ng2SmoothSprite"
+jump_address_on_true = 0x83802DEC
+
+[[midasm_hook]]
+address = 0x83803078
+name = "Ng2SmoothSprite"
+jump_address_on_true = 0x8380307C
+
+[[midasm_hook]]
+address = 0x83803300
+name = "Ng2SmoothSprite"
+jump_address_on_true = 0x83803304
+
+# Hi-Res Font: glyphs made at twice the size, their metrics halved.
+[[midasm_hook]]
+address = 0x83797658
+name = "Ng2FontSize"
+registers = ["f31"]
+
+[[midasm_hook]]
+address = 0x83797724
+name = "Ng2FontMetrics"
+registers = ["r31"]
+
+[[midasm_hook]]
+address = 0x83799A68
+name = "Ng2FontBox"
+registers = ["r1"]
+
+[[midasm_hook]]
+address = 0x83799DAC
+name = "Ng2FontGlyphSize"
+registers = ["f1"]
+
+[[midasm_hook]]
+address = 0x83799E84
+name = "Ng2FontGlyphSize"
+registers = ["f1"]
+
+[[midasm_hook]]
+address = 0x8379A044
+name = "Ng2FontGlyphCell"
+registers = ["r31"]
+
+[[midasm_hook]]
+address = 0x8379B78C
+name = "Ng2FontLine"
+registers = ["r31"]
+
+[[midasm_hook]]
+address = 0x8379BA60
+name = "Ng2FontExtent"
+registers = ["r29", "r31"]
+
+[[midasm_hook]]
+address = 0x83798E4C
+name = "Ng2FontOwnSize"
+jump_address_on_true = 0x83798E50
+
+[[midasm_hook]]
+address = 0x83798EB4
+name = "Ng2FontOwnSize"
+jump_address_on_true = 0x83798EB8
+
+# All Weapons and Ninpo: a new game's save, made (sub_82458130's tail call).
+[[midasm_hook]]
+address = 0x8245835C
+name = "Ng2NewGameSave"
+
+# All Crystal Skulls: the count found, just loaded.
+[[midasm_hook]]
+address = 0x8242CE28
+name = "Ng2SkullCountR7"
+registers = ["r7"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x82434BD4
+name = "Ng2SkullCountR3"
+registers = ["r3"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x8245B6EC
+name = "Ng2SkullCountR10"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x836DD9F8
+name = "Ng2SkullCountR11"
+registers = ["r11"]
+after_instruction = true
+
+# Max HP and Ninpo: the save's upgrades as a character is made, just loaded.
+[[midasm_hook]]
+address = 0x83756910
+name = "Ng2MaxHealth"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756918
+name = "Ng2MaxHealth"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756920
+name = "Ng2MaxHealth"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x83756928
+name = "Ng2MaxHealth"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x837569BC
+name = "Ng2MaxNinpo"
+registers = ["r10"]
+after_instruction = true
+
+[[midasm_hook]]
+address = 0x837569C4
+name = "Ng2MaxNinpo"
+registers = ["r10"]
+after_instruction = true
