@@ -273,7 +273,8 @@ frame (a pooled buffer reused mid-frame would draw stale for up to 8 frames).
 
 Compared on the desktop on 11-04 (README table): same Chapter 1 fight, headless gamescope at
 1280x720, GPU busy from the driver and the game process's CPU time over 30 s. The port: 19% / 21%
-GPU at 1x / 3x, 0.4 cores. Xenia Edge: 14-16% at 1x, 58% at 3x, 2.3 cores. Xenia's first-start
+GPU at 1x / 3x, 0.4 cores. Xenia Edge: 14-16% at 1x, 58% at 3x, 2.3 cores. At 1x busy % follows the clock more than the work
+(a later pair read 15% each); board power above idle (27 W) separates them: port 13 W, Xenia 24 W. Xenia's first-start
 dialogs (profile, "add games") come in a varying order, so its runs start from a folder where they
 were already answered, and the keys wait for the storage dialog by screenshot: runs on fixed timings
 drifted at 3x, and those froze in cutscenes (Xenia's watchdog showed every guest thread blocked).
