@@ -37,6 +37,7 @@
 // Each step was checked against the packets TU3's functions write.
 
 #include "native_gpu.h"
+#include "video.h"
 
 #include <algorithm>
 #include <atomic>
@@ -252,17 +253,19 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     }
   }
 
+  // A step runs once the draw worker (if on) has drawn the calls before it.
   void Step(std::function<void()> step) {
+    uint64_t after = ng2::video::RecordedCalls();
     {
       std::lock_guard lock(steps_mutex_);
-      steps_.push_back(std::move(step));
+      steps_.push_back({after, std::move(step)});
     }
     steps_cv_.notify_one();
   }
 
   int EffectThread() {
     while (running_) {
-      std::function<void()> step;
+      PendingStep step;
       {
         std::unique_lock lock(steps_mutex_);
         steps_cv_.wait(lock, [&] { return !steps_.empty() || !running_; });
@@ -272,7 +275,8 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         step = std::move(steps_.front());
         steps_.pop_front();
       }
-      step();
+      ng2::video::WaitForRecordedCalls(step.after);
+      step.run();
     }
     return 0;
   }
@@ -377,7 +381,11 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   std::recursive_mutex interrupt_mutex_;
   std::mutex steps_mutex_;
   std::condition_variable steps_cv_;
-  std::deque<std::function<void()>> steps_;
+  struct PendingStep {
+    uint64_t after = 0;  // the draw worker's calls recorded before it
+    std::function<void()> run;
+  };
+  std::deque<PendingStep> steps_;
   std::mutex waits_mutex_;
   std::condition_variable waits_cv_;
   uint64_t wakes_ = 0;

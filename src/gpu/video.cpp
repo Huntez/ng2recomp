@@ -23,6 +23,9 @@
 #include <deque>
 #include <filesystem>
 #include <thread>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -1371,6 +1374,15 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
   key.width = ((dims >> 18) & 0x3FFF) + 1;
   key.height = ((dims >> 3) & 0x7FFF) + 1;
   key.msaa = guest::Load16(surface + 24) & 3;
+  if (key.width > 4096 || key.height > 4096) {
+    // No target is near this big: a surface read wrong (one would lose the GPU).
+    static uint32_t logged = 0;
+    if (logged++ < 4) {
+      REXLOG_WARN("video: ignored a {} target {}x{} (surface {:#x})", depth ? "depth" : "color",
+                  key.width, key.height, surface);
+    }
+    return nullptr;
+  }
 
   auto& slot = g_surfaces[key];
   if (!slot) {
@@ -3215,10 +3227,13 @@ void FlushPendingDraw() {
   SyncGuestMemory(PhysicalAddress(data.vertexAddress), data.vertexBytes, true);
   if (Tracing()) {
     const uint32_t* v = reinterpret_cast<const uint32_t*>(guest::Virtual(data.vertexAddress));
-    TraceLog("  inline vertices at {:#x} ({} bytes): {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-                data.vertexAddress, data.vertexBytes, rex::byte_swap(v[0]), rex::byte_swap(v[1]),
-                rex::byte_swap(v[2]), rex::byte_swap(v[3]), rex::byte_swap(v[4]),
-                rex::byte_swap(v[5]));
+    // (up to the first 256 bytes)
+    std::string words;
+    for (uint32_t i = 0; i < std::min(data.vertexBytes, 256u) / 4; i++) {
+      words += fmt::format(" {:08x}", rex::byte_swap(v[i]));
+    }
+    TraceLog("  inline vertices at {:#x} ({} bytes):{}", data.vertexAddress, data.vertexBytes,
+             words);
   }
   if (data.indexAddress) {
     uint32_t indexSize = data.wideIndices ? 4 : 2;
@@ -4280,7 +4295,10 @@ void SetPipelineListPath(const std::filesystem::path& path) {
   g_pipelineListPath = path;
 }
 
+void StopDrawWorker();
+
 void DestroyHostDevice() {
+  StopDrawWorker();
   std::lock_guard lock(g_mutex);
   if (g_queue) {
     if (g_recording) {
@@ -4353,7 +4371,7 @@ void DestroyHostDevice() {
 
 // D3D hooks -------------------------------------------------------------------
 
-void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uint32_t flags,
+void RunClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uint32_t flags,
              uint32_t color, float z, uint32_t stencil) {
   std::lock_guard lock(g_mutex);
   if (!g_device) {
@@ -4446,7 +4464,7 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
   }
 }
 
-void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t destTexture,
+void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t destTexture,
                uint32_t destPoint, uint32_t clearColor, float clearZ, uint32_t clearStencil) {
   std::lock_guard lock(g_mutex);
   StageTimer timer(Stage::kResolve);
@@ -4547,7 +4565,7 @@ void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t de
   }
 }
 
-void OnCreateShader(uint32_t object, uint32_t container, bool pixel) {
+void RunCreateShader(uint32_t object, uint32_t container, bool pixel) {
   std::lock_guard lock(g_mutex);
   if (!g_device || !object || !container) {
     return;
@@ -4577,7 +4595,7 @@ void OnCreateShader(uint32_t object, uint32_t container, bool pixel) {
   g_guestShaders[object] = std::move(shader);
 }
 
-void OnDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
+void RunDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
             bool indexed, uint32_t startIndex) {
   std::lock_guard lock(g_mutex);
   if (!g_device) {
@@ -4587,7 +4605,7 @@ void OnDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t 
   Draw(device, primitive, startVertex, count, indexed, startIndex);
 }
 
-void OnBeginVertices(uint32_t device, uint32_t primitive, uint32_t vertexCount, uint32_t stride,
+void RunBeginVertices(uint32_t device, uint32_t primitive, uint32_t vertexCount, uint32_t stride,
                      uint32_t vertexData) {
   std::lock_guard lock(g_mutex);
   if (!g_device || !vertexData) {
@@ -4601,7 +4619,7 @@ void OnBeginVertices(uint32_t device, uint32_t primitive, uint32_t vertexCount, 
   Draw(device, primitive, 0, vertexCount, false, 0, &data);
 }
 
-void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseVertex,
+void RunBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseVertex,
                             uint32_t vertexCount, uint32_t indexCount, bool wideIndices,
                             uint32_t stride, uint32_t indexData, uint32_t vertexData) {
   std::lock_guard lock(g_mutex);
@@ -4702,7 +4720,7 @@ void ApplyRenderScale() {
   REXLOG_INFO("video: render scale {}, antialiasing {}", scale, samples);
 }
 
-void OnSwap(uint32_t device, uint32_t frontBuffer) {
+void RunSwap(uint32_t device, uint32_t frontBuffer) {
   std::lock_guard lock(g_mutex);
   if (!g_device) {
     return;
@@ -4729,6 +4747,672 @@ void OnSwap(uint32_t device, uint32_t frontBuffer) {
   Present(front);
   ApplyRenderScale();
   ReportProfile();
+}
+
+
+// The draw worker (NG2_DRAW_WORKER=1) ----------------------------------------
+//
+// The game's render thread only records each Direct3D call: the device's
+// 64-byte blocks that changed since the call before (the window 0x480-0x3200
+// the drawing reads), the call's arguments, and what it points to that the
+// game reuses at once (Clear's and Resolve's rects, the immediate-mode
+// vertices). A worker replays the records with the same code (Run*) against
+// a mirror of the device in guest memory, so the drawing reads the device as
+// before. Guest memory the drawing reads (vertex and index buffers, textures,
+// shaders, declarations) is read on the worker, later: the GPU steps
+// (native_gpu.cpp) wait for the worker to pass the calls before them, so a
+// fence the game waits on to reuse memory passes only once it was drawn, and
+// the game is held at most one frame ahead (at Swap). Shader creation drains
+// the worker and runs at the call. Edge of Time
+// Recompiled's render thread did the same.
+
+namespace {
+
+constexpr uint32_t kWindowBegin = 0x480, kWindowEnd = 0x3200, kBlock = 64;
+// The mirror: the device window, Swap's fields (the front buffer's format at
+// +0x3518, the gamma table at +0x3A8C, 1536 bytes), then Resolve's rect,
+// point and clear color.
+constexpr uint32_t kFrontFormat = 0x3518, kGamma = 0x3A8C, kGammaBytes = 1536;
+constexpr uint32_t kMirrorRect = 0x4100, kMirrorPoint = 0x4110, kMirrorColor = 0x4120;
+// Copies of objects the device points to, which the game may change or free
+// right after the call (on the console D3D copies them into the command
+// buffer at the call): the index buffer's header, the vertex declaration, a
+// resolve's or Swap's texture header. The mirror's pointer is set to the copy.
+constexpr uint32_t kIndexBufferField = 0x308C, kDeclarationField = 0x2E24;
+constexpr uint32_t kMirrorIndexBuffer = 0x4140, kIndexBufferBytes = 32;
+constexpr uint32_t kMirrorTexture = 0x4180, kTextureBytes = 64;
+constexpr uint32_t kMirrorDeclaration = 0x4200, kDeclarationMax = 52 + 64 * 12;
+// The 4 render targets' and the depth surface's objects (their fields at +0
+// to +40), the same way.
+constexpr uint32_t kSurfaceFields = 0x3090, kSurfaceCount = 5, kSurfaceBytes = 48;
+constexpr uint32_t kMirrorSurfaces = 0x4600;
+constexpr uint32_t kMirrorSize = 0x4800;
+// Immediate-mode data (HUD-sized), a half for each frame, from the game's
+// physical memory (the drawing takes its physical address).
+constexpr uint32_t kStagingHalf = 2u << 20;
+
+enum class Rec : uint32_t { kDraw, kInline, kClear, kResolve, kSwap };
+struct RecHeader {
+  Rec type;
+  uint32_t bytes;  // the whole record, this header and the delta included
+};
+struct DrawArgs {
+  uint32_t primitive, start, count, indexed, startIndex;
+};
+// After the args of draws: the index buffer header (indexed draws), then the
+// declaration (its size first, 0: none).
+struct InlineArgs {
+  uint32_t primitive, baseVertex, vertexCount, count, indexed, wide, stride, vertexBytes,
+      indexBytes;
+};
+struct ClearArgs {
+  uint32_t count, flags, color, stencil;
+  float z;
+  int32_t rects[8][4];
+};
+struct ResolveArgs {
+  uint32_t flags, texture, hasRect, hasPoint, hasColor, clearStencil;
+  float clearZ;
+  uint8_t rect[16], point[8], color[16], textureHeader[kTextureBytes];
+};
+struct SwapArgs {
+  uint32_t frontBuffer;
+  uint8_t format[4];
+  uint8_t gamma[kGammaBytes];
+  uint8_t frontHeader[kTextureBytes];
+};
+
+struct DrawWorker {
+  std::mutex mutex;
+  std::condition_variable work_cv, done_cv;
+  std::vector<uint8_t> queue;  // (mutex) records not yet taken
+  bool waiting = false;        // (mutex) the worker sleeps for work
+  bool stop = false;           // (mutex)
+  std::thread thread;
+  std::atomic<bool> started{false};
+  // Records queued / replayed; Swaps queued / replayed.
+  std::atomic<uint64_t> queued{0}, done{0};
+  // The lowest record count a waiter waits for (~0: none): the worker wakes
+  // waiters only once it gets there, not at every record.
+  std::atomic<uint64_t> wakeAt{~0ull};
+  uint64_t lastSwapRecord = 0;  // (producer) the last Swap's record count
+
+  // The game's render thread's side.
+  std::mutex producer;
+  std::vector<uint8_t> record;
+  uint8_t shadow[kWindowEnd] = {};
+  uint32_t device = 0;
+  // An immediate-mode draw: its record (the device as at its call) waits for
+  // its data, which the game writes after the call.
+  struct {
+    bool pending = false;
+    std::vector<uint8_t> record;
+    uint32_t vertexData = 0, vertexBytes = 0, indexData = 0, indexBytes = 0;
+    std::thread::id thread;  // the one writing its data
+  } inl;
+  bool failed = false;  // (producer) no guest memory: the calls run at once
+
+  // The worker's side: guest memory for the mirror and the staging.
+  uint32_t mirror = 0, staging = 0, stagingUsed = 0, stagingHalf = 0;
+
+};
+// Never destroyed: an exit without DestroyHostDevice leaves the thread running
+// on it.
+DrawWorker& g_worker = *new DrawWorker;
+
+bool DrawWorkerEnabled() {
+  static const bool on = [] {
+    const char* v = std::getenv("NG2_DRAW_WORKER");
+    return v && v[0] == '1';
+  }();
+  return on;
+}
+
+uint32_t AllocGuest(uint32_t size) {
+  auto* heap = rex::Runtime::instance()->memory()->LookupHeapByType(true, 4096);
+  uint32_t address = 0;
+  if (!heap || !heap->Alloc(size, 4096,
+                            rex::memory::kMemoryAllocationReserve |
+                                rex::memory::kMemoryAllocationCommit,
+                            rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite,
+                            true, &address)) {
+    return 0;
+  }
+  return address;
+}
+
+void Put(const void* data, size_t bytes) {
+  auto& r = g_worker.record;
+  size_t at = r.size();
+  r.resize(at + bytes);
+  std::memcpy(r.data() + at, data, bytes);
+}
+template <class T>
+void Put(const T& value) {
+  Put(&value, sizeof(value));
+}
+
+// Starts a record: its header, then the device's changed blocks.
+void BeginRecord(Rec type, uint32_t device) {
+  auto& w = g_worker;
+  w.record.clear();
+  Put(RecHeader{type, 0});
+  if (device != w.device) {
+    w.device = device;
+    std::memset(w.shadow, 0xA5, sizeof(w.shadow));  // all blocks sent again
+    w.shadow[kWindowBegin] ^= 0xFF;
+  }
+  size_t countAt = w.record.size();
+  Put(uint32_t(0));
+  uint32_t count = 0;
+  const uint8_t* dev = guest::Virtual(device);
+  for (uint32_t off = kWindowBegin; off < kWindowEnd; off += kBlock) {
+    if (std::memcmp(dev + off, w.shadow + off, kBlock) == 0) {
+      continue;
+    }
+    std::memcpy(w.shadow + off, dev + off, kBlock);
+    Put(off);
+    Put(dev + off, kBlock);
+    count++;
+  }
+  std::memcpy(w.record.data() + countAt, &count, 4);
+}
+
+// The surfaces' objects, after the delta of draws, clears and resolves.
+void PutSurfaces(uint32_t device) {
+  for (uint32_t i = 0; i < kSurfaceCount; i++) {
+    uint8_t object[kSurfaceBytes] = {};
+    uint32_t surface = guest::Load32(device + kSurfaceFields + i * 4);
+    if (surface) {
+      std::memcpy(object, guest::Virtual(surface), sizeof(object));
+    }
+    Put(uint32_t(surface != 0));
+    Put(object, sizeof(object));
+  }
+}
+
+void DrawWorkerThread();
+
+// The worker is used (under the producer lock): started on first use; without
+// its guest memory the calls run at once.
+bool Recording() {
+  auto& w = g_worker;
+  if (!DrawWorkerEnabled() || w.failed) {
+    return false;
+  }
+  if (!w.started) {
+    // The mirror is only read through virtual addresses: the system heap.
+    w.mirror = rex::Runtime::instance()->memory()->SystemHeapAlloc(kMirrorSize, 4096);
+    w.staging = AllocGuest(kStagingHalf * 2);
+    if (!w.mirror || !w.staging) {
+      REXLOG_WARN("video: draw worker: no guest memory for it, the calls run at once");
+      w.failed = true;
+      return false;
+    }
+    REXLOG_INFO("video: draw worker on (mirror {:#x}, staging {:#x})", w.mirror, w.staging);
+    w.started = true;
+    w.thread = std::thread(DrawWorkerThread);
+  }
+  return true;
+}
+
+// Hands the record to the worker.
+void SendRecord() {
+  auto& w = g_worker;
+  uint32_t bytes = uint32_t(w.record.size());
+  std::memcpy(w.record.data() + offsetof(RecHeader, bytes), &bytes, 4);
+  bool wake;
+  {
+    std::lock_guard lock(w.mutex);
+    w.queue.insert(w.queue.end(), w.record.begin(), w.record.end());
+    wake = w.waiting;
+  }
+  w.queued.fetch_add(1, std::memory_order_release);
+  if (wake) {
+    w.work_cv.notify_one();
+  }
+}
+
+// An immediate-mode draw's data is written after its call: recorded at the
+// next call (or GPU step).
+void FlushInline() {
+  auto& w = g_worker;
+  if (!w.inl.pending) {
+    return;
+  }
+  w.inl.pending = false;
+  w.record.swap(w.inl.record);
+  Put(guest::Virtual(w.inl.vertexData), w.inl.vertexBytes);
+  if (w.inl.indexBytes) {
+    Put(guest::Virtual(w.inl.indexData), w.inl.indexBytes);
+  }
+  SendRecord();
+}
+
+// A draw's copies: the index buffer's header, the vertex declaration.
+void PutDrawCopies(uint32_t device, bool indexed) {
+  if (indexed) {
+    uint32_t ib = guest::Load32(device + kIndexBufferField);
+    uint8_t header[kIndexBufferBytes] = {};
+    if (ib) {
+      std::memcpy(header, guest::Virtual(ib), sizeof(header));
+    }
+    Put(header, sizeof(header));
+  }
+  uint32_t declaration = guest::Load32(device + kDeclarationField);
+  uint32_t bytes = 0;
+  if (declaration) {
+    bytes = std::min(52 + std::min(guest::Load32(declaration + 24), 64u) * 12, kDeclarationMax);
+  }
+  Put(bytes);
+  if (bytes) {
+    Put(guest::Virtual(declaration), bytes);
+  }
+}
+
+// Records an immediate-mode draw's call (the device now), sent with its data.
+void BeginInline(uint32_t device, const InlineArgs& args, uint32_t vertexData,
+                 uint32_t indexData) {
+  auto& w = g_worker;
+  BeginRecord(Rec::kInline, device);
+  PutSurfaces(device);
+  Put(args);
+  PutDrawCopies(device, false);
+  w.inl.record.swap(w.record);
+  w.inl.pending = true;
+  w.inl.thread = std::this_thread::get_id();
+  w.inl.vertexData = vertexData, w.inl.vertexBytes = args.vertexBytes;
+  w.inl.indexData = indexData, w.inl.indexBytes = args.indexBytes;
+}
+
+void WaitForWorker(uint64_t records) {
+  auto& w = g_worker;
+  if (w.done.load(std::memory_order_acquire) >= records) {
+    return;
+  }
+  std::unique_lock lock(w.mutex);
+  w.done_cv.wait(lock, [&] {
+    if (w.done.load(std::memory_order_seq_cst) >= records || w.stop) {
+      return true;
+    }
+    // (lowered under the lock; MarkReplayed resets it under the lock)
+    uint64_t at = w.wakeAt.load(std::memory_order_seq_cst);
+    while (records < at && !w.wakeAt.compare_exchange_weak(at, records)) {
+    }
+    return w.done.load(std::memory_order_seq_cst) >= records;
+  });
+}
+
+// The worker's copy of immediate-mode data, in guest memory.
+uint32_t Stage(const uint8_t* data, uint32_t bytes) {
+  auto& w = g_worker;
+  uint32_t size = (bytes + 255) & ~255u;
+  if (!w.staging || size > kStagingHalf) {
+    return 0;
+  }
+  if (w.stagingUsed + size > kStagingHalf) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_WARN("video: draw worker: more than {} MB of immediate-mode data in a frame",
+                  kStagingHalf >> 20);
+    }
+    w.stagingUsed = 0;
+  }
+  uint32_t address = w.staging + w.stagingHalf * kStagingHalf + w.stagingUsed;
+  w.stagingUsed += size;
+  std::memcpy(guest::Virtual(address), data, bytes);
+  return address;
+}
+
+// A record replayed (the steps and the frame limit waiting for it may go).
+void MarkReplayed() {
+  auto& w = g_worker;
+  uint64_t done = w.done.fetch_add(1, std::memory_order_seq_cst) + 1;
+  if (done < w.wakeAt.load(std::memory_order_seq_cst)) {
+    return;
+  }
+  {
+    std::lock_guard lock(w.mutex);  // (a waiter checks done under it)
+    w.wakeAt.store(~0ull, std::memory_order_seq_cst);  // the waiters still short set it again
+  }
+  w.done_cv.notify_all();
+}
+
+// Points the mirror's field at a copy in the mirror.
+void PointAt(uint32_t field, uint32_t copy) {
+  uint8_t* m = guest::Virtual(g_worker.mirror);
+  uint32_t address = rex::byte_swap(g_worker.mirror + copy);
+  std::memcpy(m + field, &address, 4);
+}
+
+// A draw's copies after its args: the index buffer header, the declaration.
+void ApplyDrawCopies(const uint8_t*& at, bool indexed) {
+  uint8_t* m = guest::Virtual(g_worker.mirror);
+  if (indexed) {
+    static constexpr uint8_t kNone[kIndexBufferBytes] = {};
+    if (std::memcmp(at, kNone, kIndexBufferBytes) == 0) {
+      std::memset(m + kIndexBufferField, 0, 4);  // none at the call
+    } else {
+      std::memcpy(m + kMirrorIndexBuffer, at, kIndexBufferBytes);
+      PointAt(kIndexBufferField, kMirrorIndexBuffer);
+    }
+    at += kIndexBufferBytes;
+  }
+  uint32_t bytes;
+  std::memcpy(&bytes, at, 4);
+  at += 4;
+  if (bytes) {
+    std::memcpy(m + kMirrorDeclaration, at, bytes);
+    PointAt(kDeclarationField, kMirrorDeclaration);
+    at += bytes;
+  } else {
+    std::memset(m + kDeclarationField, 0, 4);
+  }
+}
+
+void Replay(const uint8_t* p) {
+  auto& w = g_worker;
+  RecHeader h;
+  std::memcpy(&h, p, sizeof(h));
+  const RecHeader* header = &h;
+  const uint8_t* at = p + sizeof(RecHeader);
+  uint32_t count;
+  std::memcpy(&count, at, 4);
+  at += 4;
+  uint8_t* mirror = guest::Virtual(w.mirror);
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t off;
+    std::memcpy(&off, at, 4);
+    std::memcpy(mirror + off, at + 4, kBlock);
+    at += 4 + kBlock;
+  }
+  if (header->type != Rec::kSwap) {
+    for (uint32_t i = 0; i < kSurfaceCount; i++) {
+      uint32_t present;
+      std::memcpy(&present, at, 4);
+      uint32_t copy = kMirrorSurfaces + i * kSurfaceBytes;
+      std::memcpy(mirror + copy, at + 4, kSurfaceBytes);
+      if (present) {
+        PointAt(kSurfaceFields + i * 4, copy);
+      } else {
+        std::memset(mirror + kSurfaceFields + i * 4, 0, 4);
+      }
+      at += 4 + kSurfaceBytes;
+    }
+  }
+  uint32_t device = w.mirror;
+  switch (header->type) {
+    case Rec::kDraw: {
+      DrawArgs a;
+      std::memcpy(&a, at, sizeof(a));
+      at += sizeof(a);
+      ApplyDrawCopies(at, a.indexed != 0);
+      RunDraw(device, a.primitive, a.start, a.count, a.indexed != 0, a.startIndex);
+      break;
+    }
+    case Rec::kInline: {
+      InlineArgs a;
+      std::memcpy(&a, at, sizeof(a));
+      at += sizeof(a);
+      ApplyDrawCopies(at, false);
+      {
+        // The previous immediate-mode draw is uploaded before staging may wrap over it.
+        std::lock_guard lock(g_mutex);
+        FlushPendingDraw();
+      }
+      uint32_t vertices = Stage(at, a.vertexBytes);
+      uint32_t indices = a.indexBytes ? Stage(at + a.vertexBytes, a.indexBytes) : 0;
+      if (!vertices || (a.indexBytes && !indices)) {
+        break;
+      }
+      if (a.indexed) {
+        RunBeginIndexedVertices(device, a.primitive, a.baseVertex, a.vertexCount, a.count,
+                                a.wide != 0, a.stride, indices, vertices);
+      } else {
+        RunBeginVertices(device, a.primitive, a.vertexCount, a.stride, vertices);
+      }
+      break;
+    }
+    case Rec::kClear: {
+      ClearArgs a;
+      std::memcpy(&a, at, sizeof(a));
+      RunClear(device, a.count, a.rects, a.flags, a.color, a.z, a.stencil);
+      break;
+    }
+    case Rec::kResolve: {
+      ResolveArgs a;
+      std::memcpy(&a, at, sizeof(a));
+      std::memcpy(mirror + kMirrorRect, a.rect, sizeof(a.rect));
+      std::memcpy(mirror + kMirrorPoint, a.point, sizeof(a.point));
+      std::memcpy(mirror + kMirrorColor, a.color, sizeof(a.color));
+      std::memcpy(mirror + kMirrorTexture, a.textureHeader, sizeof(a.textureHeader));
+      RunResolve(device, a.flags, a.hasRect ? w.mirror + kMirrorRect : 0,
+                 a.texture ? w.mirror + kMirrorTexture : 0,
+                 a.hasPoint ? w.mirror + kMirrorPoint : 0,
+                 a.hasColor ? w.mirror + kMirrorColor : 0, a.clearZ, a.clearStencil);
+      break;
+    }
+    case Rec::kSwap: {
+      SwapArgs a;
+      std::memcpy(&a, at, sizeof(a));
+      std::memcpy(mirror + kFrontFormat, a.format, sizeof(a.format));
+      std::memcpy(mirror + kGamma, a.gamma, sizeof(a.gamma));
+      std::memcpy(mirror + kMirrorTexture, a.frontHeader, sizeof(a.frontHeader));
+      RunSwap(device, a.frontBuffer ? w.mirror + kMirrorTexture : 0);
+      w.stagingHalf ^= 1;
+      w.stagingUsed = 0;
+      break;
+    }
+  }
+}
+
+void DrawWorkerThread() {
+#if defined(__linux__)
+  pthread_setname_np(pthread_self(), "Draw Worker");
+#endif
+  auto& w = g_worker;
+  std::vector<uint8_t> batch;
+  for (;;) {
+    {
+      std::unique_lock lock(w.mutex);
+      w.waiting = true;
+      w.work_cv.wait(lock, [&] { return !w.queue.empty() || w.stop; });
+      w.waiting = false;
+      if (w.stop) {
+        return;
+      }
+      batch.swap(w.queue);
+    }
+    for (size_t at = 0; at < batch.size();) {
+      RecHeader header;
+      std::memcpy(&header, batch.data() + at, sizeof(header));
+      Replay(batch.data() + at);
+      at += header.bytes;
+      MarkReplayed();
+    }
+    batch.clear();
+  }
+}
+
+}  // namespace
+
+void StopDrawWorker() {
+  auto& w = g_worker;
+  if (!w.started) {
+    return;
+  }
+  {
+    std::lock_guard lock(w.mutex);
+    w.stop = true;
+  }
+  w.work_cv.notify_all();
+  w.done_cv.notify_all();
+  if (w.thread.joinable()) {
+    w.thread.join();
+  }
+}
+
+uint64_t RecordedCalls() {
+  if (!DrawWorkerEnabled()) {
+    return 0;
+  }
+  auto& w = g_worker;
+  std::lock_guard lock(w.producer);
+  if (!w.started) {
+    return 0;
+  }
+  // (only the thread writing a pending immediate-mode draw's data knows it's written)
+  if (w.inl.pending && w.inl.thread == std::this_thread::get_id()) {
+    FlushInline();
+  }
+  return w.queued.load(std::memory_order_acquire);
+}
+
+void WaitForRecordedCalls(uint64_t records) {
+  if (DrawWorkerEnabled() && records) {
+    WaitForWorker(records);
+  }
+}
+
+void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uint32_t flags,
+             uint32_t color, float z, uint32_t stencil) {
+  std::unique_lock lock(g_worker.producer);
+  if (!Recording()) {
+    lock.unlock();
+    RunClear(device, rectCount, rects, flags, color, z, stencil);
+    return;
+  }
+  FlushInline();
+  ClearArgs a{};
+  a.count = std::min(rectCount, 8u);
+  a.flags = flags, a.color = color, a.stencil = stencil, a.z = z;
+  if (rects) {
+    std::memcpy(a.rects, rects, a.count * sizeof(a.rects[0]));
+  }
+  BeginRecord(Rec::kClear, device);
+  PutSurfaces(device);
+  Put(a);
+  SendRecord();
+}
+
+void OnResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t destTexture,
+               uint32_t destPoint, uint32_t clearColor, float clearZ, uint32_t clearStencil) {
+  std::unique_lock lock(g_worker.producer);
+  if (!Recording()) {
+    lock.unlock();
+    RunResolve(device, flags, sourceRect, destTexture, destPoint, clearColor, clearZ,
+               clearStencil);
+    return;
+  }
+  FlushInline();
+  ResolveArgs a{};
+  a.flags = flags, a.texture = destTexture, a.clearStencil = clearStencil, a.clearZ = clearZ;
+  a.hasRect = sourceRect != 0, a.hasPoint = destPoint != 0, a.hasColor = clearColor != 0;
+  if (sourceRect) {
+    std::memcpy(a.rect, guest::Virtual(sourceRect), sizeof(a.rect));
+  }
+  if (destPoint) {
+    std::memcpy(a.point, guest::Virtual(destPoint), sizeof(a.point));
+  }
+  if (clearColor) {
+    std::memcpy(a.color, guest::Virtual(clearColor), sizeof(a.color));
+  }
+  if (destTexture) {
+    std::memcpy(a.textureHeader, guest::Virtual(destTexture), sizeof(a.textureHeader));
+  }
+  BeginRecord(Rec::kResolve, device);
+  PutSurfaces(device);
+  Put(a);
+  SendRecord();
+}
+
+void OnSwap(uint32_t device, uint32_t frontBuffer) {
+  uint64_t swaps;
+  {
+    std::unique_lock lock(g_worker.producer);
+    if (!Recording()) {
+      lock.unlock();
+      RunSwap(device, frontBuffer);
+      return;
+    }
+    FlushInline();
+    SwapArgs a{};
+    a.frontBuffer = frontBuffer;
+    std::memcpy(a.format, guest::Virtual(device + kFrontFormat), sizeof(a.format));
+    std::memcpy(a.gamma, guest::Virtual(device + kGamma), sizeof(a.gamma));
+    if (frontBuffer) {
+      std::memcpy(a.frontHeader, guest::Virtual(frontBuffer), sizeof(a.frontHeader));
+    }
+    BeginRecord(Rec::kSwap, device);
+    Put(a);
+    uint64_t previous = g_worker.lastSwapRecord;
+    SendRecord();
+    g_worker.lastSwapRecord = g_worker.queued.load(std::memory_order_relaxed);
+    swaps = previous;
+  }
+  // At most one frame ahead of the worker: the previous Swap replayed.
+  WaitForWorker(swaps);
+}
+
+void OnCreateShader(uint32_t object, uint32_t container, bool pixel) {
+  if (DrawWorkerEnabled()) {
+    WaitForWorker(RecordedCalls());  // (rare: at loads) the worker idle, then at the call
+  }
+  RunCreateShader(object, container, pixel);
+}
+
+void OnDraw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
+            bool indexed, uint32_t startIndex) {
+  std::unique_lock lock(g_worker.producer);
+  if (!Recording()) {
+    lock.unlock();
+    RunDraw(device, primitive, startVertex, count, indexed, startIndex);
+    return;
+  }
+  FlushInline();
+  BeginRecord(Rec::kDraw, device);
+  PutSurfaces(device);
+  Put(DrawArgs{primitive, startVertex, count, indexed ? 1u : 0u, startIndex});
+  PutDrawCopies(device, indexed);
+  SendRecord();
+}
+
+void OnBeginVertices(uint32_t device, uint32_t primitive, uint32_t vertexCount, uint32_t stride,
+                     uint32_t vertexData) {
+  std::unique_lock lock(g_worker.producer);
+  if (!Recording()) {
+    lock.unlock();
+    RunBeginVertices(device, primitive, vertexCount, stride, vertexData);
+    return;
+  }
+  if (!vertexData) {
+    return;
+  }
+  FlushInline();
+  BeginInline(device,
+              InlineArgs{primitive, 0, vertexCount, vertexCount, 0, 0, stride, vertexCount * stride, 0},
+              vertexData, 0);
+}
+
+void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseVertex,
+                            uint32_t vertexCount, uint32_t indexCount, bool wideIndices,
+                            uint32_t stride, uint32_t indexData, uint32_t vertexData) {
+  std::unique_lock lock(g_worker.producer);
+  if (!Recording()) {
+    lock.unlock();
+    RunBeginIndexedVertices(device, primitive, baseVertex, vertexCount, indexCount, wideIndices,
+                            stride, indexData, vertexData);
+    return;
+  }
+  if (!vertexData || !indexData) {
+    return;
+  }
+  FlushInline();
+  BeginInline(device,
+              InlineArgs{primitive, baseVertex, vertexCount, indexCount, 1, wideIndices ? 1u : 0u,
+                         stride, vertexCount * stride, indexCount * (wideIndices ? 4u : 2u)},
+              vertexData, indexData);
 }
 
 }  // namespace ng2::video

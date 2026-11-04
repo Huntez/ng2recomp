@@ -50,4 +50,10 @@ void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseVe
                             uint32_t vertexCount, uint32_t indexCount, bool wideIndices,
                             uint32_t stride, uint32_t indexData, uint32_t vertexData);
 
+// The draw worker (NG2_DRAW_WORKER=1, video.cpp): the calls recorded so far
+// (0 when it's off), and a wait until the worker has replayed that many. The
+// GPU steps (native_gpu.cpp) run after the calls before them were drawn.
+uint64_t RecordedCalls();
+void WaitForRecordedCalls(uint64_t records);
+
 }  // namespace ng2::video
