@@ -32,6 +32,8 @@
 // stand-in makes the same physical allocations (ReservePhysical) and holds
 // them until the game releases the player.
 
+#include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -302,6 +304,50 @@ REX_HOOK_RAW(sub_838886D8) {
   ctx.r3.u64 = 0;
 }
 
+// The planes frames were written to lately (physical addresses), for
+// IsFrameTexture: a few movies' worth, each with when a frame last went to it
+// (a playing movie writes one every frame; a freed plane's address may be a
+// later texture's, so an entry counts only while its movie plays).
+constexpr size_t kFrameTextures = 12;
+constexpr int64_t kFrameTextureMs = 1000;
+std::atomic<uint32_t> g_frameTextures[kFrameTextures];
+std::atomic<int64_t> g_frameTextureMs[kFrameTextures];
+std::atomic<uint32_t> g_frameTextureNext{0};
+int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+void NoteFrameTexture(uint32_t address) {
+  if (!address) {
+    return;
+  }
+  uint32_t physical = (address & 0x1FFFFFFF) + (address >= 0xE0000000u ? 0x1000u : 0u);
+  int64_t now = NowMs();
+  for (size_t i = 0; i < kFrameTextures; i++) {
+    if (g_frameTextures[i].load(std::memory_order_relaxed) == physical) {
+      g_frameTextureMs[i].store(now, std::memory_order_relaxed);
+      return;
+    }
+  }
+  size_t i = g_frameTextureNext++ % kFrameTextures;
+  g_frameTextureMs[i].store(now, std::memory_order_relaxed);
+  g_frameTextures[i].store(physical, std::memory_order_relaxed);
+}
+
+namespace ng2::movie {
+bool IsFrameTexture(uint32_t physical) {
+  int64_t now = NowMs();
+  for (size_t i = 0; i < kFrameTextures; i++) {
+    if (g_frameTextures[i].load(std::memory_order_relaxed) == physical &&
+        now - g_frameTextureMs[i].load(std::memory_order_relaxed) < kFrameTextureMs) {
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace ng2::movie
+
 // +72: the frame due now into the caller's Y/U/V planes
 REX_EXTERN(__imp__sub_836A41A8);
 REX_HOOK_RAW(sub_836A41A8) {
@@ -320,6 +366,9 @@ REX_HOOK_RAW(sub_836A41A8) {
             std::memset(Virtual(address), p == 0 ? 16 : 128, Load32(desc + 24 + p * 4));
           }
         }
+      }
+      for (int p = 0; p < 3; p++) {
+        NoteFrameTexture(Load32(desc + 12 + p * 4));
       }
       if (player->movie) {
         ng2::movie::HostMovie::Planes planes;

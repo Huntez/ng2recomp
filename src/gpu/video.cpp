@@ -13,6 +13,7 @@
 
 #include "video.h"
 #include "../aspect.h"
+#include "../movie/movie.h"
 
 #include <atomic>
 #include <bit>
@@ -3159,6 +3160,7 @@ struct PendingDraw {
   DrawRecord record;
   InlineData data;
   float widen = 1.0f;  // the Options header's: x by this much from its left edge
+  bool movie = false;  // a movie the game draws itself (a scroll's): 2D at other aspects
 };
 std::optional<PendingDraw> g_pendingDraw;
 
@@ -3222,6 +3224,34 @@ void FlushPendingDraw() {
       uint32_t bits;
       std::memcpy(&bits, &x, sizeof(bits));
       *reinterpret_cast<uint32_t*>(guest::Virtual(address)) = rex::byte_swap(bits);
+    }
+  }
+  // A movie in the 2D (a scroll's) is placed in the game's 1280x720 space
+  // but not by the 2D's hooks (aspect.cpp): squeezed about the centre as the
+  // 2D around it is, for the presenter to stretch back. A full-screen one
+  // stays as it is.
+  float sx = aspect::SqueezeX(), sy = aspect::SqueezeY();
+  if (pending.movie && (sx != 1.0f || sy != 1.0f) && data.stride >= 8) {
+    uint32_t count = data.vertexBytes / data.stride;
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+    for (uint32_t i = 0; i < count; i++) {
+      float x = guest::LoadFloat(data.vertexAddress + i * data.stride);
+      float y = guest::LoadFloat(data.vertexAddress + i * data.stride + 4);
+      x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+    }
+    // (pixels, not a clip-space quad, which aspect.cpp's movie hook places)
+    bool pixels = x1 - x0 > 4.0f && y1 - y0 > 4.0f;
+    if (pixels && !(x0 <= 1.0f && x1 >= 1279.0f && y0 <= 1.0f && y1 >= 719.0f)) {
+      for (uint32_t i = 0; i < count; i++) {
+        uint32_t address = data.vertexAddress + i * data.stride;
+        float p[2] = {640.0f + (guest::LoadFloat(address) - 640.0f) * sx,
+                      360.0f + (guest::LoadFloat(address + 4) - 360.0f) * sy};
+        for (int k = 0; k < 2; k++) {
+          uint32_t bits;
+          std::memcpy(&bits, &p[k], sizeof(bits));
+          *reinterpret_cast<uint32_t*>(guest::Virtual(address + 4 * k)) = rex::byte_swap(bits);
+        }
+      }
     }
   }
   SyncGuestMemory(PhysicalAddress(data.vertexAddress), data.vertexBytes, true);
@@ -3333,6 +3363,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   }
   // Textures: the fetch constants (24 bytes each) of the slots the shaders sample.
   bool widenHeader = false;  // the Options header, ours: a wider picture
+  bool movieQuad = false;    // samples a movie's frame (movie.h)
   uint32_t textureSlots = vs->entry->textureSlotMask | (ps ? ps->entry->textureSlotMask : 0);
   for (uint32_t slot = 0; slot < 32; slot++) {
     if (!(textureSlots & (1u << slot))) {
@@ -3348,6 +3379,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
       dwords[i] = guest::Load32(device + 0x480 + slot * 24 + i * 4);
     }
     uint32_t descriptor = GetTexture(fetch);
+    movieQuad |= inlineData && movie::IsFrameTexture(uint32_t(fetch.base_address) << 12);
     widenHeader |= (uint32_t(fetch.base_address) << 12) == g_menuHeader.base &&
                    g_menuHeader.widthScale != 1.0f;
     if (slot == kBloomSlot && ps &&
@@ -3677,7 +3709,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   record.startVertex = startVertex;
   if (inlineData) {
     g_pendingDraw = PendingDraw{std::move(record), *inlineData,
-                                widenHeader ? g_menuHeader.widthScale : 1.0f};
+                                widenHeader ? g_menuHeader.widthScale : 1.0f, movieQuad};
   } else {
     SubmitDraw(record);
   }
