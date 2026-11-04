@@ -137,6 +137,8 @@ constexpr WindowSize kWindowSizes[][kWindowSizeCount] = {
      {3840, 1600, u"3840x1600"}, {5120, 2160, u"5120x2160"}},
     {{2560, 720, u"2560x720"}, {3840, 1080, u"3840x1080"}, {5120, 1440, u"5120x1440"},
      {6880, 1440, u"6880x1440"}, {7680, 2160, u"7680x2160"}},
+    {{960, 720, u"960x720"}, {1024, 768, u"1024x768"}, {1440, 1080, u"1440x1080"},
+     {1600, 1200, u"1600x1200"}, {2048, 1536, u"2048x1536"}},
 };
 
 constexpr Setting kSettings[] = {
@@ -163,7 +165,7 @@ constexpr Setting kSettings[] = {
     {u"Skip Intro", {u"On", u"Off"}, 2, "skip_intro", Kind::kOnOff},
     {u"Skip Cutscenes", {u"On", u"Off"}, 2, "skip_cutscenes", Kind::kOnOff},
     {u"Pause in Background", {u"On", u"Off"}, 2, "pause_in_background", Kind::kOnOff},
-    {u"Aspect Ratio", {u"16:9", u"16:10", u"21:9", u"32:9"}, 4, "aspect_ratio", Kind::kAspect},
+    {u"Aspect Ratio", {u"16:9", u"16:10", u"21:9", u"32:9", u"4:3"}, 5, "aspect_ratio", Kind::kAspect},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {

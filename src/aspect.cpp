@@ -5,7 +5,7 @@
 // 3D: the game's only 16:9 float (0x8228EBFC) is the aspect its projections
 // are built with (the camera update sub_822FA8C8 builds them from the field
 // of view at camera +176). It is set to the chosen aspect: wider screens see
-// more at the sides; narrower ones (16:10) keep the sides and get a taller
+// more at the sides; narrower ones (16:10, 4:3) keep the sides and get a taller
 // field of view (Vert+), set around that update.
 //
 // The picture is still drawn into the game's 16:9 targets, and the
@@ -38,7 +38,7 @@
 
 #include "gpu/guest.h"
 
-REXCVAR_DEFINE_INT32(aspect_ratio, 0, "Display", "0: 16:9, 1: 16:10, 2: 21:9, 3: 32:9");
+REXCVAR_DEFINE_INT32(aspect_ratio, 0, "Display", "0: 16:9, 1: 16:10, 2: 21:9, 3: 32:9, 4: 4:3");
 
 namespace {
 
@@ -221,6 +221,13 @@ bool MenuBucket(int bucket) {
          (bucket >= 80 && bucket <= 86);
 }
 
+// The combo counter ("12 HITS", its number at 210,240 and its word at 340,240,
+// and their animated copies) is drawn with the karma panel too: it stays with
+// the left column, not where the bow's reticle would be.
+bool ComboCounter(float x, float y) {
+  return x < 1280.0f / 3.0f && y > 190.0f && y < 290.0f;
+}
+
 // The anchor of the item being drawn, from a point of its first piece.
 Anchor ItemAnchor(float x, float y) {
   // The counter's words (copies of its text item, which keep its layer at
@@ -238,7 +245,7 @@ Anchor ItemAnchor(float x, float y) {
       a = {0, 1};  // the boss's health bar, drawn with the karma panel: bottom centre
     } else if (g_drawBucket == kKarmaBucket && x > 2560.0f / 3.0f) {
       a = {1, -1};  // the projectile count, top right
-    } else if (g_drawBucket == kKarmaBucket && y > 175.0f) {
+    } else if (g_drawBucket == kKarmaBucket && y > 175.0f && !ComboCounter(x, y)) {
       a = {0, 0, true, x, y};  // the bow's aiming reticle, where the aim points
     } else if (LeftHud(g_drawBucket)) {
       a = {-1, -1};
@@ -341,7 +348,7 @@ float SqueezeY() {
 
 uint32_t AspectIndex() {
   int32_t index = REXCVAR_GET(aspect_ratio);
-  return index >= 0 && index < 4 ? uint32_t(index) : 0;
+  return index >= 0 && index < 5 ? uint32_t(index) : 0;
 }
 
 void SetConstantWritable(bool writable) {
@@ -359,6 +366,8 @@ float Aspect() {
       return 21.0f / 9.0f;
     case 3:
       return 32.0f / 9.0f;
+    case 4:
+      return 4.0f / 3.0f;
     default:
       return kNative;
   }
