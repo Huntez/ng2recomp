@@ -181,6 +181,10 @@ How it works: [docs/renderer-plan.md](docs/renderer-plan.md) (the renderer),
   renderer follows its Vulkan renderer (GPL-3.0)
 - [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) by hedge-dev: the shader translator (MIT)
 - [plume](https://github.com/renderbag/plume) by renderbag: the Vulkan layer (MIT)
+- [Xelu's controller and keyboard prompts](https://thoseawesomeguys.com/prompts/) by Nicolae "Xelu"
+  Berbece: the PlayStation, Nintendo and keyboard button prompts (CC0)
+- [Ninja Gaiden II Master Edition](https://github.com/alicenotmech/ng2-master-edition) by
+  alicenotmech: a reference for this port's own versions of some of its options
 
 *Ninja Gaiden* is a trademark of Koei Tecmo. This project is not affiliated with or endorsed by Koei
 Tecmo or Team Ninja.

@@ -15,6 +15,7 @@
 #include <rex/system/gpu_plugin.h>
 #include <rex/system/xmemory.h>
 
+#include "controls.h"
 #include "aspect.h"
 #include "dlc.h"
 #include "gameplay.h"
@@ -59,6 +60,7 @@ class Ng2App : public rex::ReXApp {
     ng2::recomp_settings::SetConfigPath(paths.config_path);
     ng2::video::SetPipelineListPath(paths.config_path.parent_path() / "ng2-pipelines.bin");
     ng2::recomp_settings::SetAppContext(&app_context());
+    ng2::controls::SetAppContext(&app_context());
   }
 
   // Game-specific defaults, unless the user set them: the game reads the
@@ -72,6 +74,7 @@ class Ng2App : public rex::ReXApp {
         rex::cvar::SetFlagByName(name, value);
       }
     }
+    ng2::controls::ApplyDefaults();  // keyboard and mouse
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {

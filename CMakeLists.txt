@@ -32,6 +32,8 @@ set(NG2_SOURCES
     src/gpu/video.cpp
     src/gpu/native_gpu.cpp
     src/gpu/menu_label.cpp
+    src/gpu/prompts.cpp
+    src/controls.cpp
     src/gpu/d3d_hooks.cpp
     src/perf_overlay.cpp
     src/recomp_settings.cpp

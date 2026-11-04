@@ -31,6 +31,7 @@
 #include <string_view>
 #include <vector>
 
+#include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
@@ -113,8 +114,11 @@ constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97;
 constexpr uint32_t kSlotCount = 0x98;  // past the last index used
 
 enum class Kind {
-  kScale, kFiltering, kLevel, kOnOff, kPresent, kWindowMode, kWindowSize, kSamples, kAspect
+  kScale, kFiltering, kLevel, kOnOff, kPresent, kWindowMode, kWindowSize, kSamples, kAspect,
+  kSensitivity
 };
+// Mouse Sensitivity's choices (mnk_sensitivity).
+constexpr double kSensitivities[] = {0.25, 0.5, 0.75, 1.0, 1.5, 2.0};
 struct Setting {
   std::u16string_view label;
   std::array<std::u16string_view, 10> choices;
@@ -166,6 +170,11 @@ constexpr Setting kSettings[] = {
     {u"Skip Cutscenes", {u"On", u"Off"}, 2, "skip_cutscenes", Kind::kOnOff},
     {u"Pause in Background", {u"On", u"Off"}, 2, "pause_in_background", Kind::kOnOff},
     {u"Aspect Ratio", {u"16:9", u"16:10", u"21:9", u"32:9", u"4:3"}, 5, "aspect_ratio", Kind::kAspect},
+    // The prompts follow the device in use (gpu/prompts.cpp).
+    {u"Button Prompts", {u"Auto", u"Xbox", u"PlayStation", u"Nintendo", u"Keyboard"}, 5,
+     "button_prompts", Kind::kLevel},
+    {u"Mouse Sensitivity", {u"0.25", u"0.5", u"0.75", u"1", u"1.5", u"2"}, 6, "mnk_sensitivity",
+     Kind::kSensitivity},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -191,7 +200,7 @@ struct Page {
   uint32_t page;   // its Options page (category + 1)
   uint32_t size;   // its page object's
   uint32_t restore;  // the Restore Defaults row's widget
-  std::array<PageRow, 6> rows;
+  std::array<PageRow, 8> rows;
   uint32_t count;
 };
 constexpr Page kPages[] = {
@@ -206,8 +215,11 @@ constexpr Page kPages[] = {
        {5, 0x1E0 + kListSize, true, true},
        {15, 0xA60, true, true},
        {6, 0x7F0, true, true},
-       {7, 0xE00, false, false}}},
-     5},
+       {7, 0xE00, false, false},
+       // in the Swimming Controls row's widget, which the page no longer uses
+       {17, 0x1410, true, true},
+       {16, 0x1410 + kListSize, true, true}}},
+     7},
     // The Camera Settings page: its two four-choice rows, and lists over its
     // two sliders.
     {u"Cheats", 3, 0x13E0, 0x1300,
@@ -540,6 +552,16 @@ uint32_t ValueOf(const Setting& setting) {
     }
     case Kind::kLevel:
       return uint32_t(std::clamp(GetInt(setting.name), 0, int32_t(setting.count) - 1));
+    case Kind::kSensitivity: {
+      double value = std::atof(GetSetting(setting.name).c_str());
+      uint32_t nearest = 3;
+      for (uint32_t i = 0; i < std::size(kSensitivities); i++) {
+        if (std::abs(kSensitivities[i] - value) < std::abs(kSensitivities[nearest] - value)) {
+          nearest = i;
+        }
+      }
+      return nearest;
+    }
     case Kind::kAspect:
       return ng2::aspect::AspectIndex();
     case Kind::kOnOff:
@@ -649,6 +671,9 @@ void SetValue(const Setting& setting, uint32_t value) {
       break;
     case Kind::kLevel:
       SetSetting(setting.name, std::to_string(value));
+      break;
+    case Kind::kSensitivity:
+      SetSetting(setting.name, fmt::format("{}", kSensitivities[std::min<size_t>(value, std::size(kSensitivities) - 1)]));
       break;
     case Kind::kAspect: {
       // The window keeps its place in Window Size's list, at the new shape.

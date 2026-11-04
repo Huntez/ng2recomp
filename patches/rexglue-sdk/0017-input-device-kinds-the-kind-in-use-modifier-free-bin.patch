@@ -1,0 +1,177 @@
+From 0c2d8a6acf08d29eccba1a900b051d0a658fef9d Mon Sep 17 00:00:00 2001
+From: gambuzino24 <gambuzino24@gmail.com>
+Date: Wed, 4 Nov 2026 20:23:08 +0000
+Subject: [PATCH] input: device kinds, the kind in use, modifier-free binds
+
+DeviceInfo says what a device is (a PlayStation or Nintendo pad from SDL's
+gamepad type, an Xbox layout for the rest, or the keyboard and mouse), and
+InputSystem::ActiveKind says which kind each user last used, for button
+prompts. A keyboard bind without modifiers works whatever modifiers are held,
+so a bare modifier (Shift) can be bound and holding it doesn't silence the
+other keys.
+---
+ include/rex/input/device.h         |  5 +++++
+ include/rex/input/input_system.h   |  8 ++++++++
+ src/input/input_system.cpp         | 12 ++++++++++++
+ src/input/mnk/mnk_input_driver.cpp | 17 +++++++++++------
+ src/input/sdl/sdl_input_driver.cpp | 16 ++++++++++++++++
+ 5 files changed, 52 insertions(+), 6 deletions(-)
+
+diff --git a/include/rex/input/device.h b/include/rex/input/device.h
+index 7b67ceb..8bf7728 100644
+--- a/include/rex/input/device.h
++++ b/include/rex/input/device.h
+@@ -22,12 +22,17 @@ constexpr uint32_t kMaxGuestUsers = 4;
+ /// device took the freed slot.
+ enum class DeviceId : uint64_t { kInvalid = 0 };
+ 
++/// What a device is, for button prompts: a pad by its maker's layout, or the
++/// keyboard and mouse.
++enum class DeviceKind : uint8_t { kUnknown, kXbox, kPlayStation, kNintendo, kKeyboard };
++
+ struct DeviceInfo {
+   DeviceId id = DeviceId::kInvalid;
+   uint32_t ordinal = 0;  // connection order, assigned by InputSystem
+   std::string name;
+   std::string guid;
+   bool synthetic = false;  // keyboard/mouse emulation or the NOP stand-in
++  DeviceKind kind = DeviceKind::kUnknown;
+ };
+ 
+ }  // namespace rex::input
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..e3f17bf 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -13,6 +13,9 @@
+ #include <memory>
+ #include <vector>
+ 
++#include <array>
++#include <atomic>
++
+ #include <rex/input/device_assignment.h>
+ #include <rex/input/input.h>
+ #include <rex/input/input_driver.h>
+@@ -47,6 +50,10 @@ class InputSystem : public system::IInputSystem {
+   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
+   X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags, X_INPUT_KEYSTROKE* out_keystroke);
+ 
++  /// What the device last used by the user is (any thread; kUnknown until a
++  /// device has been used).
++  DeviceKind ActiveKind(uint32_t user_index) const;
++
+  private:
+   /// Re-enumerates every driver and notifies the assignment when the set
+   /// changed.
+@@ -60,6 +67,7 @@ class InputSystem : public system::IInputSystem {
+ 
+   std::unique_ptr<DeviceAssignment> assignment_;
+   ActiveDeviceTracker active_devices_;
++  std::array<std::atomic<uint8_t>, kMaxGuestUsers> active_kind_{};
+ 
+   // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
+   // does not renumber pad two.
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..8613f46 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -212,6 +212,13 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
+ }
+ 
++DeviceKind InputSystem::ActiveKind(uint32_t user_index) const {
++  if (user_index >= kMaxGuestUsers) {
++    return DeviceKind::kUnknown;
++  }
++  return DeviceKind(active_kind_[user_index].load(std::memory_order_relaxed));
++}
++
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+@@ -234,6 +241,11 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+       continue;
+     }
+     active_devices_.Observe(user_index, id, state.gamepad);
++    if (active_devices_.Active(user_index) == id && user_index < kMaxGuestUsers) {
++      if (const DeviceInfo* info = DeviceInfoFor(id)) {
++        active_kind_[user_index].store(uint8_t(info->kind), std::memory_order_relaxed);
++      }
++    }
+     if (!any) {
+       merged = state;
+       any = true;
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3f9422d..a3b9491 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -66,11 +66,12 @@ namespace {
+ constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x4D4E4B00);
+ 
+ // Bind values are a comma-separated list of alternatives, each optionally
+-// carrying modifier prefixes: "Q,I" or "Shift+W". Modifier matching is exact,
+-// so "Up" stays silent while Shift is held and "Shift+Up" stays silent without
+-// it. That is what lets the D-pad share the arrow keys. A consequence is
+-// that binding a bare modifier name ("Shift") can never fire, since holding it
+-// makes the live mask non-zero while the bind wants zero.
++// carrying modifier prefixes: "Q,I" or "Shift+W". A bind with modifiers wants
++// exactly those ("Shift+Up" is silent without Shift, or with Ctrl too); one
++// without works whatever is held, so a bare modifier ("Shift") can be bound
++// and holding one doesn't silence the rest. (So "Up" also fires with Shift
++// held: the default D-pad on Shift+arrows and right stick on the arrows both
++// move then; a game that binds a modifier gives the arrows one meaning.)
+ constexpr uint8_t kModShift = 1u << 0;
+ constexpr uint8_t kModCtrl = 1u << 1;
+ constexpr uint8_t kModAlt = 1u << 2;
+@@ -123,8 +124,11 @@ std::string_view TrimSpaces(std::string_view s) {
+ }
+ 
+ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t live_mods) {
++  // A bind with modifiers wants exactly those; one without works whatever is
++  // held, so a bare modifier ("Shift") can be bound and holding it doesn't
++  // silence the other keys.
+   uint8_t want = TakeModifiers(token);
+-  if (want != live_mods) {
++  if (want && want != live_mods) {
+     return false;
+   }
+   rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(token);
+@@ -228,6 +232,7 @@ void MnkInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
+   info.id = kMnkDevice;
+   info.name = "Keyboard and Mouse";
+   info.synthetic = true;
++  info.kind = DeviceKind::kKeyboard;
+   out.push_back(info);
+ }
+ 
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index c7c440d..892540c 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -162,6 +162,22 @@ void SDLInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
+                      static_cast<int>(sizeof(guid_text)));
+     info.guid = guid_text;
+     info.synthetic = false;
++    switch (SDL_GetGamepadType(controller.sdl)) {
++      case SDL_GAMEPAD_TYPE_PS3:
++      case SDL_GAMEPAD_TYPE_PS4:
++      case SDL_GAMEPAD_TYPE_PS5:
++        info.kind = DeviceKind::kPlayStation;
++        break;
++      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
++      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
++      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
++      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
++        info.kind = DeviceKind::kNintendo;
++        break;
++      default:  // Xbox pads, and the ones that say nothing: the Xbox layout
++        info.kind = DeviceKind::kXbox;
++        break;
++    }
+     out.push_back(info);
+   }
+ }
+-- 
+2.56.0
+

@@ -20,6 +20,7 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 
+#include "controls.h"
 #include "aspect.h"
 #include "gpu/guest.h"
 #include "gpu/video.h"
@@ -140,6 +141,7 @@ REX_HOOK_RAW(sub_822F0EF8) {
   __imp__sub_822F0EF8(ctx, base);
   ng2::video::MarkFrameStart();
   CheatsFrame();
+  ng2::controls::Frame();
   auto now = std::chrono::steady_clock::now();
   static const bool logFps = [] {
     const char* v = std::getenv("NG2_FPS_LOG");

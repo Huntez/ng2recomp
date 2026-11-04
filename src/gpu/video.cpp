@@ -14,6 +14,7 @@
 #include "video.h"
 #include "../aspect.h"
 #include "../movie/movie.h"
+#include "prompts.h"
 
 #include <atomic>
 #include <bit>
@@ -157,6 +158,7 @@ struct HostTexture {
   uint32_t descriptor = 0;                    // in the texture heap, 0 = none
   bool float7e3 = false;  // a color target last bound as 2_10_10_10_FLOAT
   uint32_t scale = 1;     // host pixels per guest pixel (render targets, resolves)
+  bool prompts = false;   // the button atlas or its palette (prompts.cpp)
 };
 
 struct DescriptorAllocator {
@@ -2230,6 +2232,7 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   }
 
   std::vector<Upload> uploads;
+  bool isPrompts = false;
   uint32_t labelRows = 0;  // rows of the base level a menu label rewrote
   for (size_t i = 0; i < used->levels.size(); i++) {
     const LevelLayout& level = used->levels[i];
@@ -2241,6 +2244,12 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
       std::memcpy(upload.data, header.data(), header.size());
     } else if (i == 0) {
       CopyLevel(fetch, info, level, base.data(), base.size(), upload.data);
+      // The button atlas and its palette: the chosen prompts (prompts.cpp).
+      isPrompts = prompts::Apply(level.width, level.height,
+                     info.format == RenderFormat::R8_UNORM          ? prompts::Kind::kIndex8
+                     : info.format == RenderFormat::R8G8B8A8_UNORM ? prompts::Kind::kRGBA8
+                                                                    : prompts::Kind::kOther,
+                     upload.data, bytes);
       if (info.format == RenderFormat::R8_UNORM &&
           RewriteMenuLabel(level.width, level.height, upload.data, &labelRows) ==
               LabelResult::kRetry &&
@@ -2319,6 +2328,7 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   }
 
   auto host = std::make_unique<HostTexture>();
+  host->prompts = isPrompts;
   host->width = width;
   host->height = height;
   host->format = info.format;
@@ -2501,6 +2511,9 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
   // The headers are made again when ours comes or goes: always checked.
   bool header = info.format == RenderFormat::R8_UNORM &&
                 (base == g_menuHeader.base || base == g_inGameHeaderBase);
+  // The button atlas and its palette too, with the prompts shown in the hash.
+  bool promptTexture = cached.host && cached.host->prompts;
+  header |= promptTexture;
   bool stable = cached.host && !header && cached.checkedFrame != ~0ull &&
                 g_frameCount - cached.changedFrame > kTextureStableFrames;
   bool due = stable ? g_frameCount - cached.checkedFrame >= kTextureRecheckFrames
@@ -2516,6 +2529,16 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
                                      : 0);
     if (header) {
       hash += MenuHeaderGeneration();
+    }
+    if (promptTexture) {
+      // (once a frame, so the atlas and its palette are made for the same set)
+      static uint64_t generationFrame = ~0ull;
+      static uint32_t generation = 0;
+      if (generationFrame != g_frameCount) {
+        generationFrame = g_frameCount;
+        generation = prompts::Generation();
+      }
+      hash += uint64_t(generation) * 0x9E3779B97F4A7C15ull;
     }
     if (!cached.host || hash != cached.contentHash) {
       cached.changedFrame = g_frameCount;
