@@ -1,3 +1,5 @@
+![Ninja Gaiden II Recompiled](docs/images/banner.jpg)
+
 # Ninja Gaiden II Recompiled
 
 **A PC port of Ninja Gaiden II by static recompilation.**
@@ -211,6 +213,7 @@ How it works: [docs/renderer-plan.md](docs/renderer-plan.md) (the renderer),
   Berbece: the PlayStation, Nintendo and keyboard button prompts (CC0)
 - [Ninja Gaiden II Master Edition](https://github.com/alicenotmech/ng2-master-edition) by
   alicenotmech: a reference for this port's own versions of some of its options
+- Banner lettering: Chakra Petch by Cadson Demak (SIL Open Font License)
 
 *Ninja Gaiden* is a trademark of Koei Tecmo. This project is not affiliated with or endorsed by Koei
 Tecmo or Team Ninja.
