@@ -279,3 +279,11 @@ time. The port: 40 W / 57 W at 1x / 3x, 0.4 cores. Xenia Edge: 51 W / 84 W, 2.3 
 start from a folder where they were already answered, and the keys wait for the storage dialog by
 screenshot: runs on fixed timings drifted at 3x, and those froze in cutscenes (Xenia's watchdog
 showed every guest thread blocked).
+
+On the Steam Deck (11-04, LCD, Game Mode, battery, sound on, the same fight, 30 s; Steam's overlay
+logging via mangohudctl set log_session, an output_folder added to its runtime config): port 60.0 fps
+average, 1% low 55.4, 0.1% low 52.6, CPU 32%, GPU 48% (7 W), Deck 11 W from the battery; Xenia Edge
+(e9a7e47 Linux AppImage) 58.2 / 27.5 / 18.1, CPU 51%, GPU 81% (15 W), Deck 22 W. The port's window
+ran into the end of the fight (lighter last seconds). Xenia was driven by XTest keys from Python
+(CachyOS's xdotool needs a newer CPU than the Deck's) and starts with a small picture under
+--fullscreen in Game Mode until F11 is pressed twice; its storage prompt needs a real A press.

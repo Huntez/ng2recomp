@@ -30,22 +30,23 @@ played through, and there are no releases yet. Test builds are posted in issues.
 ## Performance
 
 The Steam Deck is the baseline for optimization: changes are judged by whether it holds 60 fps in the
-game's heaviest scenes. On it, fights now hold 60 fps, with occasional single dropped frames in heavy
-effects (fire, many particles).
+game's heaviest scenes.
 
-On a desktop, measured on one machine (Ryzen 7 9800X3D, Radeon RX 9070, Mesa RADV, Linux), in the
-same Chapter 1 fight, headless at 1280x720, 30 seconds each. All held 60 fps; what differs is the
-graphics card's power draw while doing it (27-33 W at idle) and the CPU time used (in cores: 1.0 is
-one core kept busy).
+Measured on a Steam Deck LCD in Game Mode, on battery, with sound, in Chapter 1's first fight
+(30 seconds each, the Deck's own performance overlay), the port at the Deck's default settings (1x)
+and Xenia Edge at its defaults (November 2026 builds):
 
-| | GPU power, 1x | GPU power, 3x | CPU cores |
-|---|---|---|---|
-| This port (November 2026) | 40 W | 57 W | 0.4 |
-| Xenia Edge (the emulator) | 51 W | 84 W | 2.3 |
+| | This port | Xenia Edge |
+|---|---|---|
+| Average fps | 60.0 | 58.2 |
+| 1% low | 55.4 | 27.5 |
+| 0.1% low | 52.6 | 18.1 |
+| CPU load | 32% | 51% |
+| GPU load | 48% | 81% |
+| Whole Deck's power draw | 11 W | 22 W |
 
-Above idle, the port's card uses about half of what the emulator's does, at 1x and at 3x; that
-headroom is what allows 4x-8x and MSAA on top. The CPU figure is where the port differs most: about a
-sixth of what the emulator uses, which is what matters on a 4-core handheld like the Steam Deck.
+Both average close to 60 fps, but the emulator's slowest frames drop to 18-28 fps, while the port's
+stay above 52. The port draws half the power, so a charge lasts about twice as long.
 
 ## Getting started
 
