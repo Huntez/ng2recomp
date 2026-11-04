@@ -12,6 +12,15 @@
 // count (0x84C55B50, from the vblank interrupt) is the word at 0x84C5342C
 // past where it started, with the PowerPC low-priority hint in the loop.
 //
+// When the game asks for fewer frames than vblanks (the word at 0x84C5342C:
+// 2 on the game over screen), the limiter reads the count (sub_822F02D8)
+// once to start, then until it has moved on by that many. On the console the
+// frame's work before it fits in a vblank, so it starts in the vblank the
+// last wait ended in and every frame takes exactly 2. Here Present can wait
+// on the host display's vsync, which isn't in step with the guest's vblanks,
+// and push the start one vblank late: that frame took 3 (27 fps, not 30).
+// A start exactly one past the last wait's end counts from that end.
+//
 // Both back off: a few pause instructions, then yields, then short sleeps (yields on
 // Windows, whose sleeps are whole milliseconds).
 
@@ -65,4 +74,23 @@ void Ng2FrameHandoffWait(PPCRegister& r11) {
 
 void Ng2VblankWait() {
   Backoff();
+}
+
+// The limiter's reads of the vblank count: its start (returning to 822F0C40)
+// and each check in its loop (to 822F0C4C).
+REX_EXTERN(__imp__sub_822F02D8);
+REX_HOOK_RAW(sub_822F02D8) {
+  constexpr uint32_t kStart = 0x822F0C40, kCheck = 0x822F0C4C;
+  static uint32_t lastEnd = 0;
+  static bool waited = false;
+  uint32_t lr = uint32_t(ctx.lr);
+  __imp__sub_822F02D8(ctx, base);
+  if (lr == kStart) {
+    if (waited && ctx.r3.u32 == lastEnd + 1) {
+      ctx.r3.u32 = lastEnd;
+    }
+  } else if (lr == kCheck) {
+    lastEnd = ctx.r3.u32;  // the last check is the one the wait ended on
+    waited = true;
+  }
 }
