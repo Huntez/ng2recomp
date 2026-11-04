@@ -54,6 +54,12 @@ void OnBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseVe
 // (0 when it's off), and a wait until the worker has replayed that many. The
 // GPU steps (native_gpu.cpp) run after the calls before them were drawn.
 uint64_t RecordedCalls();
+
 void WaitForRecordedCalls(uint64_t records);
+
+// The display's last refresh and period (steady_clock ns), from the
+// presents reaching the screen; false unless steady and recent.
+bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs);
+int64_t DisplayClockNow();
 
 }  // namespace ng2::video

@@ -187,6 +187,10 @@ constexpr Setting kSettings[] = {
      Kind::kLevel},
     {u"All Crystal Skulls", {u"On", u"Off"}, 2, "cheat_all_skulls", Kind::kOnOff},
     {u"Max HP and Ninpo", {u"On", u"Off"}, 2, "cheat_max_health_ninpo", Kind::kOnOff},
+    // The renderer's wait for the screen (gpu/video.cpp).
+    {u"Input Latency", {u"Standard", u"Low"}, 2, "input_latency", Kind::kLevel},
+    // The guest's vblanks on the display's refreshes (gpu/native_gpu.cpp).
+    {u"Frame Pacing", {u"Auto", u"Timer"}, 2, "frame_pacing", Kind::kLevel},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -220,7 +224,7 @@ struct Page {
 // setting), so a page's own layout doesn't limit what it holds: the game's
 // page objects give their builder, their Restore Defaults row and their
 // slot in the menu model.
-constexpr uint32_t kTitleRowsSize = (28 * kListSize + 0xFFF) & ~0xFFFu;
+constexpr uint32_t kTitleRowsSize = (std::size(kSettings) * kListSize + 0xFFF) & ~0xFFFu;
 constexpr PageRow Row(uint32_t setting) {
   return {setting, setting * kListSize, true, true, true};
 }
@@ -228,7 +232,7 @@ constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
      {{Row(0), Row(3), Row(1), Row(22), Row(2), Row(21), Row(23)}},
      7},
-    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(15), Row(6)}}, 4},
+    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(15), Row(6), Row(29)}}, 5},
     // (its name in the game's third category name, which holds 7 letters)
     {u"Cheats", 3, 0x13E0, 0x1300,
      {{Row(8), Row(9), Row(10), Row(11), Row(25), Row(26), Row(27)}},
@@ -236,7 +240,9 @@ constexpr Page kPages[] = {
     {u"Interface", 4, 0x26A0, 0xAA0, {{Row(20), Row(24), Row(7), Row(16), Row(17)}}, 5},
     // The Audio Settings page (5, builder sub_836D54F8, which stores its
     // page number at +12; Restore Defaults at +0x1380).
-    {u"Gameplay", 5, 0x1460, 0x1380, {{Row(12), Row(13), Row(18), Row(19), Row(14)}}, 5},
+    {u"Extras", 5, 0x1460, 0x1380,
+     {{Row(12), Row(13), Row(18), Row(19), Row(14), Row(28)}},
+     6},
 };
 static_assert(std::size(kSettings) * kListSize <= kTitleRowsSize);
 constexpr uint32_t kPageCount = std::size(kPages);
@@ -832,9 +838,10 @@ constexpr uint32_t kPadPressed = 0x83C07FF8;  // + pad * 0x44: newly pressed but
 constexpr uint32_t kConfirmButtons = 0x150;
 
 REX_EXTERN(__imp__sub_8366F4D0);
+void CheatsTitleMenu(PPCContext& ctx, uint8_t* base, void (*build)(PPCContext&, uint8_t*));
 REX_HOOK_RAW(sub_8366F4D0) {
   PutBackGame();
-  __imp__sub_8366F4D0(ctx, base);
+  CheatsTitleMenu(ctx, base, __imp__sub_8366F4D0);  // (Unlock Difficulties' paths)
   using ng2::guest::Load32;
   uint32_t count = Load32(kTitleEntryCount);
   if (count > 8) {
@@ -1343,14 +1350,21 @@ REX_HOOK_RAW(sub_823E7710) {
 // Device, 8 Test Volume, 4 Restore Defaults, 2 Confirm, 1 Back), by the
 // game's page and row: on ours, Restore Defaults and Back on every row.
 REX_EXTERN(__imp__sub_836D6898);
+bool InGameOursShown();
 REX_HOOK_RAW(sub_836D6898) {
   uint32_t flags = ctx.r3.u32;
-  if (!g_open || !flags || !PageOf(ng2::guest::Load32(kPage))) {
+  bool title = g_open && PageOf(ng2::guest::Load32(kPage));
+  // In the in-game menu the game's hints follow its own rows' slots (Save
+  // Method's: Change Storage Device): there, with ours shown, Confirm and
+  // Back as the game gives them, nothing of its own rows'.
+  bool inGame = !title && InGameOursShown() && !ng2::aspect::HudShown();
+  if ((!title && !inGame) || !flags) {
     __imp__sub_836D6898(ctx, base);
     return;
   }
   uint32_t game = ng2::guest::Load32(flags);
-  Store32(flags, 0x5);
+  uint32_t ours = title ? 0x5 : (game & 0x10) || !(game & 0x3) ? 0x1 : (game & 0x3);
+  Store32(flags, ours);
   __imp__sub_836D6898(ctx, base);
   Store32(flags, game);
 }
@@ -2173,4 +2187,8 @@ REX_HOOK_RAW(sub_836941B0) {
   if (moved) {
     Store32(row + 8, index);
   }
+}
+
+bool InGameOursShown() {
+  return g_inGameOurs;
 }

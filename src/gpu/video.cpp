@@ -116,6 +116,11 @@ REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "Video",
 // Extras' Texture LOD Bias: the game's own mip bias (-1.5 on most textures),
 // or 0 or -1 for every texture (less shimmer at higher render scales).
 REXCVAR_DEFINE_INT32(texture_lod_bias, 0, "Extras", "0: the game's, 1: 0, 2: -1");
+// Input Latency: Low waits, before drawing a frame, until the last one is
+// on screen (VK_KHR_present_wait), so no finished frame queues for the
+// display (FIFO's three images let two): about one or two refreshes less
+// between a press and its picture, with less slack for a slow frame.
+REXCVAR_DEFINE_INT32(input_latency, 0, "Video", "0: standard, 1: low (needs VK_KHR_present_wait)");
 REXCVAR_DEFINE_INT32(anisotropic_filtering, -1, "Video",
                      "Anisotropic filtering for mipmapped textures: -1 as the game asks, "
                      "0 off, 1-5 for 1x, 2x, 4x, 8x, 16x")
@@ -4020,6 +4025,28 @@ void Present(HostTexture* frontBuffer) {
     }
 
     uint32_t index = 0;
+    // (waits that keep timing out: a compositor that doesn't report the
+    // screen, as a hidden window may; Low is left off
+    // for 5 s then, and tried again)
+    static int timeouts = 0;
+    static auto pausedUntil = std::chrono::steady_clock::time_point{};
+    if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 &&
+        std::chrono::steady_clock::now() >= pausedUntil) {
+      auto start = std::chrono::steady_clock::now();
+      g_swapChain->wait();
+      bool timedOut = std::chrono::steady_clock::now() - start > std::chrono::milliseconds(90);
+      timeouts = timedOut ? timeouts + 1 : 0;
+      if (timeouts == 3) {
+        static bool logged = false;
+        if (!logged) {
+          logged = true;
+          REXLOG_WARN("video: the waits for the screen time out (a hidden window?): Input Latency Low "
+                      "paused for 5 s at a time while they do");
+        }
+        timeouts = 0;
+        pausedUntil = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      }
+    }
     if (g_swapChainValid) {
       g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &index);
     }
@@ -4266,6 +4293,100 @@ bool IsNativeRenderer() {
   return native;
 }
 
+// The display clock (Frame Pacing Auto, native_gpu.cpp) -------------------
+//
+// A thread looks every millisecond whether the next present has reached the
+// screen (VK_KHR_present_wait, without waiting: the swapchain's calls are
+// serialized) and notes when it did: a refresh of the display, to about a
+// millisecond. From those
+// the display's period (as many refreshes as our frames take) and its last
+// refresh, once steady for two seconds. It counts the frames that stayed up
+// an extra refresh too (a repeat, the drift between the guest's vblank timer
+// and the display, or a slow frame).
+namespace {
+std::atomic<int64_t> g_displayRefreshNs{0}, g_displayPeriodNs{0};
+std::atomic<bool> g_displaySteady{false}, g_displayRun{false};
+// (left to run at exit if the device isn't destroyed, as the other workers)
+std::thread* g_displayThread = nullptr;
+
+int64_t SteadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void DisplayClockThread() {
+  uint64_t next = 0;
+  int64_t last = 0, runStart = 0, logAt = 0;
+  uint64_t runUnits = 0, uneven = 0, repeats = 0, frames = 0;
+  double period = 1e9 / 60.0;
+  while (g_displayRun.load()) {
+    RenderSwapChain* swapChain = g_swapChain.get();
+    uint64_t id = swapChain ? swapChain->getPresentId() : 0;
+    if (!id) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      continue;
+    }
+    if (!next || next > id + 1) {
+      next = id;
+    }
+    if (next > id) {
+      std::this_thread::sleep_for(std::chrono::microseconds(500));
+      continue;
+    }
+    int shown = swapChain->pollPresent(next);
+    if (shown <= 0) {
+      if (shown < 0 || id - next > 4) {
+        next = id + 1;  // an earlier swapchain's (or an error), or far behind: the next one
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    next++;
+    int64_t t = SteadyNs();
+    int64_t dt = t - last;
+    if (!last || dt > 250'000'000) {
+      runStart = t, runUnits = 0, uneven = 0;
+      g_displaySteady.store(false);
+    } else if (dt > period / 4) {  // (another present shown at the same refresh: none)
+      uint64_t k = std::max<uint64_t>(1, uint64_t(double(dt) / period + 0.5));
+      double residual = double(dt) - double(k) * period;
+      uneven += std::abs(residual) > period * 0.2 ? 1 : 0;
+      repeats += k - 1, frames++;
+      runUnits += k;
+      if (runUnits >= 60) {
+        period = double(t - runStart) / double(runUnits);
+      }
+      bool steady = runUnits >= 120 && uneven * 20 < runUnits;
+      g_displayPeriodNs.store(int64_t(period));
+      g_displayRefreshNs.store(t);
+      g_displaySteady.store(steady);
+    }
+    last = t;
+    if (t - logAt > 10'000'000'000) {
+      if (logAt) {
+        REXLOG_INFO("video: display {:.3f} Hz{}, {} frames shown, {} stayed an extra refresh",
+                    1e9 / period, g_displaySteady.load() ? " (steady)" : "", frames, repeats);
+      }
+      logAt = t, frames = 0, repeats = 0;
+    }
+  }
+}
+}  // namespace
+
+bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs) {
+  int64_t last = g_displayRefreshNs.load(), period = g_displayPeriodNs.load();
+  if (!g_displaySteady.load() || !last || !period || SteadyNs() - last > 250'000'000) {
+    return false;
+  }
+  *lastNs = last, *periodNs = period;
+  return true;
+}
+
+int64_t DisplayClockNow() {
+  return SteadyNs();
+}
+
 bool CreateHostDevice() {
   std::lock_guard lock(g_mutex);
   g_resolutionScale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 8));
@@ -4295,7 +4416,18 @@ bool CreateHostDevice() {
   }
 
   g_swapChain = g_queue->createSwapChain(renderWindow, 3, BACKBUFFER_FORMAT, 1);
+  if (g_device->getCapabilities().presentWait) {
+    g_displayRun.store(true);
+    g_displayThread = new std::thread([] {
+#if defined(__linux__)
+      pthread_setname_np(pthread_self(), "Display Clock");
+#endif
+      DisplayClockThread();
+    });
+  }
   SDL_AddEventWatch(WatchTraceKey, nullptr);
+  REXLOG_INFO("video: wait for the screen (Input Latency Low): {}",
+              g_device->getCapabilities().presentWait ? "yes" : "no (VK_KHR_present_wait missing)");
   REXLOG_INFO("video: vertex shaders round toward zero: {}",
               g_device->getCapabilities().roundingModeRTZ ? "yes" : "no (the GPU can't)");
   // plume always returns an object; one that failed (no surface, no present
@@ -4360,6 +4492,12 @@ void StopDrawWorker();
 
 void DestroyHostDevice() {
   StopDrawWorker();
+  if (g_displayThread) {
+    g_displayRun.store(false);
+    g_displayThread->join();
+    delete g_displayThread;
+    g_displayThread = nullptr;
+  }
   std::lock_guard lock(g_mutex);
   if (g_queue) {
     if (g_recording) {

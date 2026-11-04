@@ -35,6 +35,7 @@
 // or in a costume they open is saved as usual): switched off, the menus
 // are as before.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
@@ -100,6 +101,16 @@ REX_HOOK_RAW(sub_83730AA8) {
   __imp__sub_83730AA8(ctx, base);
 }
 
+// The New Game path list is made with the title menu (sub_8366F4D0, at
+// 0x853A3470, after the menu's entries: Acolyte and Warrior, then Mentor
+// and Master Ninja if open, their count at +8208). It is always made with all four, and the count
+// follows the setting (CheatsFrame): the paths the profile has opened, or
+// all of them, at once either way.
+constexpr uint32_t kPathCount = 0x853A3470 + 8208;
+constexpr uint32_t kProfile = 0x84C559E0;
+bool g_allPathsAsked = false;  // while the list is made
+uint32_t g_allPaths = 0, g_openPaths = 0;
+
 // The unlock check, by caller (its return address).
 REX_EXTERN(__imp__sub_823E1098);
 REX_HOOK_RAW(sub_823E1098) {
@@ -107,12 +118,38 @@ REX_HOOK_RAW(sub_823E1098) {
   bool paths = from == 0x8366F874 || from == 0x8366F8A8;
   bool costumes = from == 0x823E1714 || from == 0x823E174C || from == 0x823E1784 ||
                   from == 0x823E17BC;
-  if ((paths && REXCVAR_GET(cheat_unlock_difficulties)) ||
+  if ((paths && g_allPathsAsked) ||
       (costumes && REXCVAR_GET(cheat_unlock_costumes))) {
     ctx.r3.u64 = 1;
     return;
   }
   __imp__sub_823E1098(ctx, base);
+}
+
+// Around the title menu's builder (recomp_settings.cpp's hook): all four
+// paths asked for, then the ones open without the cheat counted.
+void CheatsTitleMenu(PPCContext& ctx, uint8_t* base, void (*build)(PPCContext&, uint8_t*)) {
+  g_allPathsAsked = true;
+  build(ctx, base);
+  g_allPathsAsked = false;
+  g_allPaths = ng2::guest::Load32(kPathCount);
+  // The paths open without the cheat (Master Ninja only after Mentor, as
+  // the list has them).
+  uint32_t profile = ng2::guest::Load32(kProfile);
+  uint32_t open = 2;
+  if (profile && g_allPaths == 4) {
+    PPCRegister r3 = ctx.r3, r4 = ctx.r4;
+    for (uint32_t difficulty : {2u, 3u}) {
+      ctx.r3.u64 = profile + 720, ctx.r4.u64 = difficulty;
+      __imp__sub_823E1098(ctx, base);
+      if (ctx.r3.u32 == 0) {
+        break;
+      }
+      open++;
+    }
+    ctx.r3 = r3, ctx.r4 = r4;
+  }
+  g_openPaths = std::min(open, g_allPaths);
 }
 
 // Mission Mode: r11 the difficulties offered, r31 the mission screen
@@ -138,6 +175,18 @@ void Ng2MissionDifficulties(PPCRegister& r11, PPCRegister& r31) {
 // Each frame (perf_overlay.cpp's frame start): Infinite Ninpo keeps the
 // gauge full.
 void CheatsFrame() {
+  // Unlock Difficulties: the New Game paths shown (on the title menu: in
+  // play the list is gone, and it is made again with the next title menu).
+  if (ng2::aspect::HudShown()) {
+    g_allPaths = 0;
+  }
+  if (g_allPaths >= 2 && g_allPaths <= 4) {
+    uint32_t count = REXCVAR_GET(cheat_unlock_difficulties) ? g_allPaths : g_openPaths;
+    if (ng2::guest::Load32(kPathCount) != count) {
+      uint32_t value = rex::byte_swap(count);
+      std::memcpy(ng2::guest::Virtual(kPathCount), &value, 4);
+    }
+  }
   // In play only: before it the record holds something else.
   if (!REXCVAR_GET(cheat_infinite_ninpo) || !ng2::aspect::HudShown()) {
     return;

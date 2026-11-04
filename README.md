@@ -99,14 +99,17 @@ Settings** in the in-game menu (Back, under Save Method). Changes apply at once 
   no post-effects (no blur, no white flashes), smooth HUD and menus
 - **Display**: window mode (windowed, borderless, fullscreen), window size, aspect ratio (16:9,
   16:10, 21:9, 32:9, 4:3), V-Sync (Off, FIFO, Mailbox, Adaptive; a mode the driver lacks falls back
-  to FIFO)
+  to FIFO), frame pacing (Auto: the game's 60 Hz on the display's own refreshes, measured from the
+  frames reaching the screen, so none waits in a queue on a 59.94 Hz screen; Timer, for a
+  variable-refresh display: G-Sync, FreeSync)
 - **Cheats**: infinite health, infinite ninpo, unlock difficulties, unlock costumes, all weapons and
   ninpo (Level 1 or 3), all crystal skulls, max HP and ninpo
 - **Interface**: HUD (shown, fade out when not fighting, hidden), hi-res font (from the next start),
   show FPS, button prompts (Auto follows the device in use; Xbox, PlayStation, Nintendo, Keyboard),
   mouse sensitivity
-- **Gameplay**: skip intro, skip cutscenes (seen or not), skip death screen, auto chapter screen,
-  pause in background
+- **Extras**: skip intro, skip cutscenes (seen or not), skip death screen, auto chapter screen,
+  pause in background (the game pauses while its window isn't focused), input latency (Low: no
+  finished frame waits for the screen; needs VK_KHR_present_wait)
 
 In the in-game menu, a page with seven settings has no Restore Defaults row (the list has no room
 for it); the title menu's has.

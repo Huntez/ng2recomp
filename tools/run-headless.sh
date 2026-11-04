@@ -8,6 +8,7 @@
 #   NG2_SHOTS="10 30 60"  gamescope screenshots at those seconds -> <out_dir>/shot-<s>.png
 #   NG2_WRAP="gdb -batch -x cmds.gdb --args"  put in front of the binary
 #   NG2_TEST_WAYLAND=1  run on gamescope's nested Wayland socket instead of X11
+#   NG2_TEST_REFRESH=59  the headless display's refresh rate (Hz; frame pacing tests)
 #   NG2_TEST_AUDIO=disk  real audio output, written to <out_dir>/audio.raw
 #     (SDL's disk driver) instead of the null audio device
 #   NG2_TEST_AUDIO=pipewire NG2_PW_RUNTIME=<dir>  audio in real time through
@@ -46,6 +47,7 @@ wait $pid
 
 video=(SDL_VIDEODRIVER=x11 SDL_VIDEO_DRIVER=x11)
 gamescope_flags=()
+if [ -n "${NG2_TEST_REFRESH:-}" ]; then gamescope_flags+=(-r "$NG2_TEST_REFRESH"); fi
 if [ "${NG2_TEST_WAYLAND:-0}" = 1 ]; then
   # --expose-wayland points WAYLAND_DISPLAY at gamescope's own socket.
   video=(SDL_VIDEODRIVER=wayland SDL_VIDEO_DRIVER=wayland)

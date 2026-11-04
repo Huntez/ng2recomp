@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -60,6 +61,13 @@
 #include <rex/system/xthread.h>
 
 REXCVAR_DECLARE(bool, vsync);
+REXCVAR_DECLARE(int32_t, present_mode);
+// Frame Pacing: Auto puts the guest's vblanks on the display's own refreshes
+// (video.cpp's display clock: one every N of them, half a refresh after
+// one) when N refreshes come within 2% of the video mode's rate, so no
+// frame is shown twice for the drift between the two clocks; else, and with
+// Timer, they come from a timer at the video mode's rate.
+REXCVAR_DEFINE_INT32(frame_pacing, 0, "Video", "0: auto (on the display's refreshes), 1: timer");
 
 namespace ng2::gpu {
 namespace {
@@ -335,6 +343,23 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
 
   // --- Vblanks -------------------------------------------------------------------
 
+  // A sleep to a point, its last part spun (yielding): what a sleep may
+  // overshoot by (Windows' sleeps are whole milliseconds).
+  static void SleepNs(int64_t ns) {
+#if defined(_WIN32)
+    constexpr int64_t kSpin = 1'500'000;
+#else
+    constexpr int64_t kSpin = 300'000;
+#endif
+    int64_t end = ng2::video::DisplayClockNow() + ns;
+    if (ns > kSpin) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(ns - kSpin));
+    }
+    while (ng2::video::DisplayClockNow() < end) {
+      std::this_thread::yield();
+    }
+  }
+
   // The video mode's rate (1 kHz with vsync off, as the SDK's worker did).
   int VsyncThread() {
     rex::system::X_VIDEO_MODE mode;
@@ -344,7 +369,42 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     uint64_t vsyncInterval = std::max<uint64_t>(1, uint64_t(double(frequency) / hz));
     uint64_t freeInterval = std::max<uint64_t>(1, frequency / 1000);
     uint64_t last = rex::chrono::Clock::QueryGuestTickCount();
+    const int64_t guestPeriodNs = int64_t(1e9 / hz);
+    int64_t lastVblankNs = 0;
+    bool lockedLogged = false;
     while (running_) {
+      int64_t refreshNs = 0, periodNs = 0;
+      // (FIFO and Mailbox only: there the presents reach the screen on its
+      // refreshes; with V-Sync Off or Adaptive a late one shows at once)
+      int32_t presentMode = REXCVAR_GET(present_mode);
+      if (REXCVAR_GET(vsync) && REXCVAR_GET(frame_pacing) == 0 &&
+          (presentMode == 1 || presentMode == 2) &&
+          ng2::video::DisplayRefresh(&refreshNs, &periodNs)) {
+        int64_t every = std::clamp<int64_t>((guestPeriodNs + periodNs / 2) / periodNs, 1, 4);
+        int64_t step = periodNs * every;
+        if (std::abs(step - guestPeriodNs) * 50 < guestPeriodNs) {
+          if (!lockedLogged) {
+            lockedLogged = true;
+            REXLOG_INFO("gpu: vblanks on the display's refreshes ({:.3f} Hz, every {})",
+                        1e9 / double(periodNs), every);
+          }
+          // Half a refresh after one, the first at least half a step after
+          // the last vblank (no two close together when the lock starts).
+          int64_t target = refreshNs + periodNs / 2;
+          while (target < lastVblankNs + step / 2) {
+            target += step;
+          }
+          int64_t wait = target - ng2::video::DisplayClockNow();
+          if (wait > 0) {
+            SleepNs(wait);
+          }
+          lastVblankNs = ng2::video::DisplayClockNow();
+          last = rex::chrono::Clock::QueryGuestTickCount();
+          DispatchInterrupt(0, 2);
+          WakeWaits();
+          continue;
+        }
+      }
       uint64_t interval = REXCVAR_GET(vsync) ? vsyncInterval : freeInterval;
       uint64_t now = rex::chrono::Clock::QueryGuestTickCount();
       if (now - last > std::max(interval * 4, frequency / 20)) {
@@ -352,6 +412,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
       if (now - last >= interval) {
         last += interval;
+        lastVblankNs = ng2::video::DisplayClockNow();
         DispatchInterrupt(0, 2);
         WakeWaits();
         continue;
