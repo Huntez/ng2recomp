@@ -18,8 +18,10 @@
 // frame's work before it fits in a vblank, so it starts in the vblank the
 // last wait ended in and every frame takes exactly 2. Here Present can wait
 // on the host display's vsync, which isn't in step with the guest's vblanks,
-// and push the start one vblank late: that frame took 3 (27 fps, not 30).
-// A start exactly one past the last wait's end counts from that end.
+// and push the start a vblank or two late: that frame took 3 or 4 (27 fps,
+// not 30, uneven). A start up to the interval past the last wait's end
+// counts from that end, so a frame takes the interval unless its own work
+// took longer than that (where the console would also run late).
 //
 // Both back off: a few pause instructions, then yields, then short sleeps (yields on
 // Windows, whose sleeps are whole milliseconds).
@@ -33,6 +35,8 @@
 #endif
 
 #include <rex/hook.h>
+
+#include "gpu/guest.h"
 
 namespace {
 
@@ -80,13 +84,15 @@ void Ng2VblankWait() {
 // and each check in its loop (to 822F0C4C).
 REX_EXTERN(__imp__sub_822F02D8);
 REX_HOOK_RAW(sub_822F02D8) {
-  constexpr uint32_t kStart = 0x822F0C40, kCheck = 0x822F0C4C;
+  constexpr uint32_t kStart = 0x822F0C40, kCheck = 0x822F0C4C, kInterval = 0x84C5342C;
   static uint32_t lastEnd = 0;
   static bool waited = false;
   uint32_t lr = uint32_t(ctx.lr);
   __imp__sub_822F02D8(ctx, base);
   if (lr == kStart) {
-    if (waited && ctx.r3.u32 == lastEnd + 1) {
+    // Up to the interval since the last wait ended: blocked, not slow.
+    uint32_t interval = ng2::guest::Load32(kInterval);
+    if (waited && ctx.r3.u32 - lastEnd <= interval) {
       ctx.r3.u32 = lastEnd;
     }
   } else if (lr == kCheck) {
