@@ -156,7 +156,8 @@ each defaults to the game's own behaviour.
   to FIFO); Frame Pacing (Timer, the game's own 60 Hz clock, or Auto: the game's frames on the
   display's own refreshes, measured from the frames reaching the screen, so no frame is shown
   twice for the drift on a screen a little off 60 Hz, as 59.94; needs VK_KHR_present_wait, else it
-  runs as Timer; use Timer on a variable-refresh display, G-Sync or FreeSync)
+  runs as Timer). Timer is the default: use it on the Steam Deck, where Auto gave me uneven frame
+  pacing, and on a variable-refresh display, G-Sync or FreeSync
 - **Cheats**: Infinite Health; Infinite Ninpo (each cast's ninpo filled back); Unlock Costumes;
   All Weapons and Ninpo (Level 1 or 3: every melee and projectile weapon, ninpo and ammo, given at a
   new game, a load and a stage's start; what it gives stays in the save when it's turned off, as
