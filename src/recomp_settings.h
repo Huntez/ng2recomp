@@ -19,4 +19,8 @@ void SetAppContext(rex::ui::WindowedAppContext* context);
 // Exclusive fullscreen, if set, once the window is open.
 void ApplyWindowAtStart();
 
+// Each frame: F11 / Alt+Enter's fullscreen choice and a moved window's place,
+// saved.
+void WindowFrame();
+
 }  // namespace ng2::recomp_settings

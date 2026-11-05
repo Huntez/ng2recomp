@@ -7,6 +7,7 @@
 // (fences, callbacks, the flip). Otherwise they only call the original.
 
 #include <algorithm>
+#include <climits>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -179,11 +180,25 @@ REX_HOOK_RAW(sub_8375E2E0) {
   float z = float(ctx.f1.f64);
   // The game builds the rects below its stack pointer, where the call itself
   // writes: copy them first.
-  int32_t rectData[8][4];
-  count = rects ? std::min(count, 8u) : 0;
-  for (uint32_t i = 0; i < count; i++) {
-    for (uint32_t j = 0; j < 4; j++) {
-      rectData[i][j] = ng2::guest::LoadS32(rects + i * 16 + j * 4);
+  int32_t rectData[ng2::video::kMaxClearRects][4];
+  if (!rects) {
+    count = 0;
+  } else if (count > ng2::video::kMaxClearRects) {
+    // More than we keep: their bounding box (more cleared, nothing left stale).
+    int32_t box[4] = {INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN};
+    for (uint32_t i = 0; i < count; i++) {
+      box[0] = std::min(box[0], ng2::guest::LoadS32(rects + i * 16));
+      box[1] = std::min(box[1], ng2::guest::LoadS32(rects + i * 16 + 4));
+      box[2] = std::max(box[2], ng2::guest::LoadS32(rects + i * 16 + 8));
+      box[3] = std::max(box[3], ng2::guest::LoadS32(rects + i * 16 + 12));
+    }
+    std::copy(box, box + 4, rectData[0]);
+    count = 1;
+  } else {
+    for (uint32_t i = 0; i < count; i++) {
+      for (uint32_t j = 0; j < 4; j++) {
+        rectData[i][j] = ng2::guest::LoadS32(rects + i * 16 + j * 4);
+      }
     }
   }
   __imp__sub_8375E2E0(ctx, base);

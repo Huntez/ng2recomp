@@ -51,6 +51,11 @@ REXCVAR_DEFINE_INT32(windowed_width, 0, "UI/Window",
                      "The window's width when not fullscreen (0: the default size)");
 REXCVAR_DEFINE_INT32(windowed_height, 0, "UI/Window",
                      "The window's height when not fullscreen (0: the default size)");
+// (kNoPosition: none saved; the window is placed by the system)
+REXCVAR_DEFINE_INT32(windowed_x, -1000000, "UI/Window",
+                     "The window's left edge when not fullscreen (saved when it's moved)");
+REXCVAR_DEFINE_INT32(windowed_y, -1000000, "UI/Window",
+                     "The window's top edge when not fullscreen (saved when it's moved)");
 REXCVAR_DEFINE_BOOL(exclusive_fullscreen, false, "UI/Window",
                     "Fullscreen in the desktop's display mode (exclusive) rather than as a "
                     "borderless window over the desktop");
@@ -612,6 +617,27 @@ bool IsWindowSetting(std::string_view name) {
          name == "windowed_height";
 }
 
+constexpr int32_t kNoPosition = -1000000;
+
+// A saved window position still on a connected display (one unplugged since
+// isn't), else false.
+bool UsablePosition(int32_t x, int32_t y) {
+  if (x == kNoPosition || y == kNoPosition) {
+    return false;
+  }
+  int count = 0;
+  SDL_DisplayID* displays = SDL_GetDisplays(&count);
+  bool on = false;
+  for (int i = 0; displays && i < count && !on; i++) {
+    SDL_Rect bounds;
+    // (the title bar's point: the window can be grabbed back)
+    on = SDL_GetDisplayBounds(displays[i], &bounds) && x + 32 >= bounds.x &&
+         x + 32 < bounds.x + bounds.w && y + 8 >= bounds.y && y + 8 < bounds.y + bounds.h;
+  }
+  SDL_free(displays);
+  return on;
+}
+
 void ApplyWindow(bool fullscreen) {
   int count = 0;
   SDL_Window** windows = SDL_GetWindows(&count);
@@ -636,7 +662,62 @@ void ApplyWindow(bool fullscreen) {
       width = WindowSizes()[0].width, height = WindowSizes()[0].height;
     }
     SDL_SetWindowSize(window, width, height);
+    int32_t x = rex::cvar::Query<int32_t>("windowed_x"), y = rex::cvar::Query<int32_t>("windowed_y");
+    if (UsablePosition(x, y)) {
+      SDL_SetWindowPosition(window, x, y);
+    }
   }
+}
+
+// F11 and Alt+Enter: fullscreen on and off; a window moved: its place kept.
+// Seen on the UI thread (SDL's event watch), saved on the game thread
+// (WindowFrame): the settings file is written there.
+std::atomic<int32_t> g_movedX{kNoPosition}, g_movedY{kNoPosition};
+std::atomic<int64_t> g_movedAt{0};  // steady_clock ms; 0: nothing to save
+std::atomic<int> g_toggledTo{-1};   // 0/1: fullscreen chosen by key, to save
+std::atomic<bool> g_applyingWindow{false};
+
+int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// An event filter, not a watch: it runs before the runtime's own handling
+// (an SDL event watch), so Alt+Enter can be kept from also pressing A (Return
+// is bound to it). The window is changed on the UI thread, outside SDL's
+// dispatch, as the menu changes it.
+SDL_EventFilter g_previousFilter = nullptr;
+void* g_previousFilterData = nullptr;
+
+bool SDLCALL FilterWindowEvents(void*, SDL_Event* event) {
+  bool altEnter = event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_RETURN &&
+                  (event->key.mod & SDL_KMOD_ALT);
+  if ((altEnter || (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F11)) &&
+      !event->key.repeat && g_appContext) {
+    // (from the runtime's own state, which the setting follows)
+    bool fullscreen = !rex::cvar::Query<bool>("fullscreen");
+    g_movedAt = 0;  // (a move now is the switch's, not the player's)
+    g_toggledTo = fullscreen ? 1 : 0;
+    g_appContext->CallInUIThread([fullscreen] {
+      g_applyingWindow = true;
+      ApplyWindow(fullscreen);
+      g_applyingWindow = false;
+    });
+  } else if (event->type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN) {
+    g_movedAt = 0;
+  } else if (event->type == SDL_EVENT_WINDOW_MOVED && !g_applyingWindow) {
+    SDL_Window* window = SDL_GetWindowFromID(event->window.windowID);
+    if (window && !(SDL_GetWindowFlags(window) &
+                    (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED | SDL_WINDOW_MINIMIZED))) {
+      g_movedX = event->window.data1, g_movedY = event->window.data2;
+      g_movedAt = NowMs();
+    }
+  }
+  if (altEnter) {
+    return false;  // (the key-up still comes; a lone release presses nothing)
+  }
+  return g_previousFilter ? g_previousFilter(g_previousFilterData, event) : true;
 }
 
 bool g_windowChanged = false;
@@ -1488,7 +1569,34 @@ REX_HOOK_RAW(sub_836D0E90) {
   }
 }
 
+// Each frame (perf_overlay.cpp): a key's fullscreen choice, and a window
+// position once it's been still for a second, written to the settings.
+void ng2::recomp_settings::WindowFrame() {
+  bool save = false;
+  if (int to = g_toggledTo.exchange(-1); to >= 0) {
+    g_written["fullscreen"] = to ? "true" : "false";
+    save = true;
+  }
+  int64_t at = g_movedAt.load();
+  if (at && NowMs() - at > 1000 && g_movedAt.compare_exchange_strong(at, 0) &&
+      !rex::cvar::Query<bool>("fullscreen")) {
+    std::string x = std::to_string(g_movedX.load()), y = std::to_string(g_movedY.load());
+    if (GetSetting("windowed_x") != x || GetSetting("windowed_y") != y) {
+      rex::cvar::SetFlagByName("windowed_x", x);
+      rex::cvar::SetFlagByName("windowed_y", y);
+      g_written["windowed_x"] = x;
+      g_written["windowed_y"] = y;
+      save = true;
+    }
+  }
+  if (save && !g_configPath.empty()) {
+    SaveSettings();
+  }
+}
+
 void ng2::recomp_settings::ApplyWindowAtStart() {
+  SDL_GetEventFilter(&g_previousFilter, &g_previousFilterData);
+  SDL_SetEventFilter(FilterWindowEvents, nullptr);
   // vsync = false from older builds' V-Sync Off: it is also the SDK's guest
   // vblank switch (off: 1000 Hz), so it becomes present_mode 0 and vsync on.
   if (GetSetting("vsync") == "false") {
@@ -1505,7 +1613,8 @@ void ng2::recomp_settings::ApplyWindowAtStart() {
   // default size: the exclusive mode or our windowed size is set over it.
   bool fullscreen = rex::cvar::Query<bool>("fullscreen");
   if (g_appContext && (fullscreen ? rex::cvar::Query<bool>(kExclusive)
-                                  : rex::cvar::Query<int32_t>("windowed_width") > 0)) {
+                                  : rex::cvar::Query<int32_t>("windowed_width") > 0 ||
+                                        rex::cvar::Query<int32_t>("windowed_x") != kNoPosition)) {
     g_appContext->CallInUIThread([fullscreen] { ApplyWindow(fullscreen); });
   }
 }

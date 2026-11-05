@@ -32,6 +32,7 @@
 #include <cstring>
 #include <memory>
 #include <map>
+#include <set>
 #include <mutex>
 #include <array>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -868,6 +869,10 @@ const RenderFramebuffer* g_boundFramebuffer = nullptr;
 
 // Drops cached framebuffers that use a texture about to be freed.
 void ForgetTexture(const HostTexture* texture) {
+  // (the last resolve to an address, if it's this one: it's being freed)
+  for (auto it = g_lastResolve.begin(); it != g_lastResolve.end();) {
+    it = it->second == texture ? g_lastResolve.erase(it) : std::next(it);
+  }
   for (auto it = g_framebuffers.begin(); it != g_framebuffers.end();) {
     const auto& key = it->first;
     if (std::find(std::begin(key.colors), std::end(key.colors), texture) != std::end(key.colors) ||
@@ -1559,8 +1564,18 @@ HostTexture* GetSurface(uint32_t surface, bool depth) {
     desc.multisampling.sampleCount = host->samples;
     host->texture = g_device->createTexture(desc);
     if (!host->texture) {
-      // Out of video memory, most likely at a high render scale.
-      REXLOG_ERROR("video: no {}x{} render target", host->width, host->height);
+      // Out of video memory, most likely at a high render scale. (No empty
+      // entry left: the render scale's rebuild walks them. Logged once per
+      // size and scale: each draw asks again.)
+      static std::set<uint64_t> failed;
+      static uint32_t failedScale = 0;
+      if (failedScale != host->scale) {
+        failed.clear(), failedScale = host->scale;
+      }
+      if (failed.insert(uint64_t(host->width) << 32 | host->height).second) {
+        REXLOG_ERROR("video: no {}x{} render target", host->width, host->height);
+      }
+      g_surfaces.erase(key);
       return nullptr;
     }
     REXLOG_INFO("video: {} target {}x{} edram {:#x} format {} msaa {} (scale {})",
@@ -1649,7 +1664,23 @@ HostTexture* GetResolveDestination(uint32_t address, const xenos::xe_gpu_texture
     host->texture = g_device->createTexture(RenderTextureDesc::Texture2D(
         host->width, host->height, 1, format, RenderTextureFlag::RENDER_TARGET));
     if (!host->texture) {
-      REXLOG_ERROR("video: no {}x{} resolve texture", host->width, host->height);
+      // (once per size until the render scale changes: a failure each resolve
+      // would flood the log and retry the allocation thousands of times)
+      static std::set<uint64_t> failed;
+      static uint32_t failedScale = 0;
+      if (failedScale != scale) {
+        failed.clear(), failedScale = scale;
+      }
+      if (failed.insert(uint64_t(host->width) << 32 | host->height).second) {
+        REXLOG_ERROR("video: no {}x{} resolve texture", host->width, host->height);
+      }
+      g_resolvedTextures.erase(ResolvedKey(address, fetch));
+      // The previous one (at another scale) is freed: not to be read as this
+      // address's last resolve.
+      g_lastResolve.erase(address);
+      if (auto it = g_resolvedMemory.find(address); it != g_resolvedMemory.end()) {
+        it->second.stale = true;
+      }
       return nullptr;
     }
     // Depth textures read their single channel everywhere, as Xenos does.
@@ -1756,6 +1787,11 @@ void ResolveByDraw(HostTexture& source, HostTexture& dest, int32_t x1, int32_t y
       temp->format = source.format;
       temp->texture = g_device->createTexture(RenderTextureDesc::Texture2D(
           source.width, source.height, 1, source.format, RenderTextureFlag::RENDER_TARGET));
+      if (!temp->texture) {
+        REXLOG_ERROR("video: no {}x{} resolve copy", source.width, source.height);
+        g_resolveTemps.erase(&source);
+        return;
+      }
     }
     Transition(source, RenderTextureLayout::RESOLVE_SOURCE);
     Transition(*temp, RenderTextureLayout::RESOLVE_DEST);
@@ -1853,7 +1889,10 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
     return;
   }
   StageTimer timer(Stage::kSync);
-  auto& range = g_guestMemoryRanges[(uint64_t(address) << 32) | size];
+  // (inline draws' data, always copied, at addresses and sizes that vary
+  // without end: a range of their own, not kept)
+  GuestMemoryRange scratch;
+  auto& range = always ? scratch : g_guestMemoryRanges[(uint64_t(address) << 32) | size];
   if (bones) {
     range.late = true;
   }
@@ -2553,6 +2592,10 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   uint32_t levelCount = uint32_t(used->levels.size());
   host->texture = g_device->createTexture(
       RenderTextureDesc::Texture2D(width, height, levelCount, info.format));
+  if (!host->texture) {
+    REXLOG_ERROR("video: no {}x{} texture", width, height);
+    return nullptr;
+  }
   Transition(*host, RenderTextureLayout::COPY_DEST);
   for (uint32_t i = 0; i < levelCount; i++) {
     const LevelLayout& level = used->levels[i];
@@ -2758,7 +2801,7 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
       }
       hash += uint64_t(generation) * 0x9E3779B97F4A7C15ull;
     }
-    if (!cached.host || hash != cached.contentHash) {
+    if (hash != cached.contentHash || (!cached.host && cached.contentHash == 0)) {
       cached.changedFrame = g_frameCount;
       if (cached.host) {
         g_garbage[g_frame].push_back(std::move(cached.host));
@@ -2770,8 +2813,13 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
       g_profile.textureMadeBytes += guestSize + layout.mipsSize;
       cached.host =
           CreateTexture(fetch, info, layout, data, guestSize, mipData, layout.mipsSize, &retry);
-      cached.contentHash = retry ? 0 : hash;
+      // (a texture that couldn't be made keeps its hash too: not retried until
+      // its content changes)
+      cached.contentHash = retry && cached.host ? 0 : hash;
     }
+  }
+  if (!cached.host) {
+    return 0;  // (couldn't be made: drawn without it)
   }
   Transition(*cached.host, RenderTextureLayout::SHADER_READ);
   return cached.host->descriptor;
@@ -4494,6 +4542,10 @@ void CreatePipelines() {
       viewDesc.dimension = RenderTextureViewDimension::TEXTURE_2D;
     }
     g_nullTextures[i].texture = g_device->createTexture(desc);
+    if (!g_nullTextures[i].texture) {
+      REXLOG_ERROR("video: can't make a 1-pixel texture: no video memory");
+      std::_Exit(1);
+    }
     g_nullTextureViews[i] = g_nullTextures[i].texture->createTextureView(viewDesc);
     g_textureDescriptorSet->setTexture(i, g_nullTextures[i].texture.get(),
                                        RenderTextureLayout::SHADER_READ,
@@ -4953,8 +5005,22 @@ void RunClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], ui
     if (!(clearColor && together)) {
       BindFramebuffer(nullptr, depth);
     }
-    CommandList()->clearDepthStencil(clearDepth, clearStencil, z, stencil & 0xFF, rectData,
-                                     rectDataCount);
+    // The rects within the depth buffer too: it can be smaller than the
+    // color target they were clipped to, and a clear outside its
+    // attachment is invalid (a driver may fault).
+    std::vector<RenderRect> depthRects;
+    for (const RenderRect& r : clearRects) {
+      RenderRect d(std::min(r.left, int32_t(depth->width)), std::min(r.top, int32_t(depth->height)),
+                   std::min(r.right, int32_t(depth->width)), std::min(r.bottom, int32_t(depth->height)));
+      if (d.right > d.left && d.bottom > d.top) {
+        depthRects.push_back(d);
+      }
+    }
+    if (clearRects.empty() || !depthRects.empty()) {
+      CommandList()->clearDepthStencil(clearDepth, clearStencil, z, stencil & 0xFF,
+                                       depthRects.empty() ? nullptr : depthRects.data(),
+                                       uint32_t(depthRects.size()));
+    }
   }
   for (uint32_t i = 1; i < 4; i++) {
     HostTexture* other =
@@ -5185,6 +5251,10 @@ void UpdateGammaTable(uint32_t device) {
     g_gammaTable->format = RenderFormat::R16G16B16A16_UNORM;
     g_gammaTable->texture = g_device->createTexture(
         RenderTextureDesc::Texture2D(256, 1, 1, RenderFormat::R16G16B16A16_UNORM));
+    if (!g_gammaTable->texture) {
+      g_gammaTable.reset();  // (none: the picture without its gamma)
+      return;
+    }
     SetDescriptor(*g_gammaTable);
   }
   Upload upload = Allocate(256 * 8, 16);
@@ -5319,7 +5389,7 @@ struct InlineArgs {
 struct ClearArgs {
   uint32_t count, flags, color, stencil;
   float z;
-  int32_t rects[8][4];
+  int32_t rects[kMaxClearRects][4];
 };
 struct ResolveArgs {
   uint32_t flags, texture, hasRect, hasPoint, hasColor, clearStencil;
@@ -5796,7 +5866,7 @@ void OnClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], uin
   }
   FlushInline();
   ClearArgs a{};
-  a.count = std::min(rectCount, 8u);
+  a.count = std::min(rectCount, kMaxClearRects);
   a.flags = flags, a.color = color, a.stencil = stencil, a.z = z;
   if (rects) {
     std::memcpy(a.rects, rects, a.count * sizeof(a.rects[0]));

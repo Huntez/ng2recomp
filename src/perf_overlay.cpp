@@ -24,6 +24,7 @@
 #include "aspect.h"
 #include "gpu/guest.h"
 #include "gpu/video.h"
+#include "recomp_settings.h"
 
 REXCVAR_DEFINE_BOOL(show_fps, false, "Video",
                     "Show the frame rate and frame time in the top left corner");
@@ -142,6 +143,7 @@ REX_HOOK_RAW(sub_822F0EF8) {
   ng2::video::MarkFrameStart();
   CheatsFrame();
   ng2::controls::Frame();
+  ng2::recomp_settings::WindowFrame();
   auto now = std::chrono::steady_clock::now();
   static const bool logFps = [] {
     const char* v = std::getenv("NG2_FPS_LOG");
