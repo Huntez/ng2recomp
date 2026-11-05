@@ -531,9 +531,37 @@ void SaveSettings() {
       lines.insert(lines.begin() + std::ptrdiff_t(firstTable), entry);
     }
   }
-  std::ofstream out(g_configPath, std::ios::trunc);
-  for (const std::string& line : lines) {
-    out << line << '\n';
+  // Written whole beside it, then moved over it: a failed write (a full disk)
+  // leaves the old file as it was.
+  // (a symlinked ng2.toml: its target is written, the link kept)
+  std::error_code linkError;
+  std::filesystem::path target = g_configPath;
+  if (std::filesystem::is_symlink(g_configPath, linkError)) {
+    if (auto resolved = std::filesystem::canonical(g_configPath, linkError); !linkError) {
+      target = resolved;
+    }
+  }
+  std::filesystem::path temporary = target;
+  temporary += ".new";
+  {
+    std::ofstream out(temporary, std::ios::trunc);
+    for (const std::string& line : lines) {
+      out << line << '\n';
+    }
+    out.close();
+    if (!out) {
+      std::error_code ec;
+      std::filesystem::remove(temporary, ec);
+      REXLOG_ERROR("recomp settings: can't write {}", rex::path_to_utf8(temporary));
+      return;
+    }
+  }
+  std::error_code ec;
+  std::filesystem::rename(temporary, target, ec);  // (replaces it, on Windows too)
+  if (ec) {
+    std::filesystem::remove(temporary, ec);
+    REXLOG_ERROR("recomp settings: can't replace {}", rex::path_to_utf8(g_configPath));
+    return;
   }
   REXLOG_INFO("recomp settings: saved to {}", rex::path_to_utf8(g_configPath));
 }

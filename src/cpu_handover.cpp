@@ -12,6 +12,7 @@
 #if !defined(__AVX2__) && (defined(__x86_64__) || defined(_M_X64))
 
 #include <cstdint>
+#include <cwchar>
 #include <filesystem>
 #include <string>
 
@@ -95,6 +96,10 @@ struct Handover {
     if (!line.empty() && line[0] == L'"') {
       rest = line.find(L'"', 1);
       rest = rest == std::wstring::npos ? line.size() : rest + 1;
+    } else if (size_t n = std::wcslen(self);
+               line.size() >= n && _wcsnicmp(line.c_str(), self, n) == 0 &&
+               (line.size() == n || line[n] == L' ' || line[n] == L'\t')) {
+      rest = n;  // the program's own path, unquoted, spaces and all
     } else {
       rest = line.find(L' ');
       rest = rest == std::wstring::npos ? line.size() : rest;

@@ -27,6 +27,7 @@
 #include "null_audio.h"
 #include "recomp_settings.h"
 #include "script_input.h"
+#include "stderr_log.h"
 #include "windows_setup.h"
 
 class Ng2App : public rex::ReXApp {
@@ -68,6 +69,7 @@ class Ng2App : public rex::ReXApp {
   // system link socket stays off the network (no LAN play here; on Windows
   // it would bring up a firewall prompt).
   void OnPostInitLogging() override {
+    ng2::stderr_log::Start();  // the libraries' and the driver's errors into ng2.log
     for (auto [name, value] : {std::pair{"protect_zero", "false"}, {"net_bind_loopback", "true"}}) {
       const auto* info = rex::cvar::GetFlagInfo(name);
       if (info && info->source == rex::cvar::Source::kDefault) {
@@ -88,9 +90,9 @@ class Ng2App : public rex::ReXApp {
 
     // Which of the package's two builds runs (src/cpu_handover.cpp), for bug reports.
 #if defined(__AVX2__)
-    REXLOG_INFO("build: x86-64-v3 (AVX2)");
+    REXLOG_INFO("Ninja Gaiden II Recompiled {}, build: x86-64-v3 (AVX2)", NG2_VERSION);
 #else
-    REXLOG_INFO("build: x86-64-v2 (SSE4.2)");
+    REXLOG_INFO("Ninja Gaiden II Recompiled {}, build: x86-64-v2 (SSE4.2)", NG2_VERSION);
 #endif
 
     // NG2_AUDIO=0: run the audio pipeline without an output device.

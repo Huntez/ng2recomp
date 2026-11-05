@@ -1774,6 +1774,11 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
       end = blockStart;
     }
   }
+  // (the game may write it between the comparisons above: by the blocks it is
+  // unchanged after all, and the GPU's copy already matches)
+  if (begin >= end) {
+    return;
+  }
   uint32_t length = end - begin;
   range.changedFrame = g_frameCount;
   g_profile.uploadedBytes += length;
@@ -3074,7 +3079,8 @@ void ListPipeline(uint64_t hash, const PipelineKey& key) {
       !g_listedPipelines.insert(hash).second) {
     return;
   }
-  bool fresh = !std::filesystem::exists(g_pipelineListPath);
+  std::error_code ec;  // (none of these throw: a list it can't use is just not used)
+  bool fresh = !std::filesystem::exists(g_pipelineListPath, ec);
   if (FILE* f = OpenFile(g_pipelineListPath, "ab")) {
     if (fresh) {
       uint32_t header[3] = {kPipelineListMagic, kPipelineListVersion, uint32_t(sizeof(key))};
@@ -3104,18 +3110,28 @@ uint32_t AskForListedPipelines(const std::filesystem::path& path, bool seed) {
     REXLOG_WARN("video: {} is from another version; {}", rex::path_to_utf8(path),
                 seed ? "not used" : "starting a new one");
     if (!seed) {
-      std::filesystem::remove(path);
+      std::error_code ec;
+      std::filesystem::remove(path, ec);
     }
     return 0;
   }
   if (!seed) {
     // A record cut short is cut off, so later ones line up.
-    uint64_t size = std::filesystem::file_size(path);
+    std::error_code ec;
+    uint64_t size = std::filesystem::file_size(path, ec);
+    if (ec || size < sizeof(header)) {
+      std::fclose(f);
+      return 0;
+    }
     uint64_t whole =
         sizeof(header) + (size - sizeof(header)) / sizeof(PipelineKey) * sizeof(PipelineKey);
     if (whole != size) {
       std::fclose(f);
-      std::filesystem::resize_file(path, whole);
+      std::filesystem::resize_file(path, whole, ec);
+      if (ec) {
+        REXLOG_WARN("video: can't repair {}: not used", rex::path_to_utf8(path));
+        return 0;
+      }
       f = OpenFile(path, "rb");
       if (!f || std::fseek(f, sizeof(header), SEEK_SET) != 0) {
         if (f) {

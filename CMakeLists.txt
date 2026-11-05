@@ -3,7 +3,7 @@
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(ng2 LANGUAGES CXX)
+project(ng2 VERSION 0.5.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,6 +48,7 @@ set(NG2_SOURCES
     src/frame_wait.cpp
     src/dlc.cpp
     src/mods.cpp
+    src/stderr_log.cpp
     src/gameplay.cpp
     src/aspect.cpp
     src/windows_setup.cpp
@@ -62,6 +63,7 @@ endif()
 
 # xenos (GPU emulation) is the reference renderer while the native one is built.
 rexglue_setup_target(ng2 GPU_PLUGINS xenos)
+target_compile_definitions(ng2 PRIVATE NG2_VERSION="${PROJECT_VERSION}")
 
 # The SDK sets an $ORIGIN rpath on Linux but only stages its shared runtime
 # libraries on Windows and macOS.
