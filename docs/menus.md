@@ -210,9 +210,10 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   Defaults follows the page's last row, so a shorter page leaves more empty
   rows. What the cheats change is in src/cheats.cpp: the game's own
   player-only no-damage flag (0x83C786DE = 2) around its three damage
-  functions, and a ninpo cost of 0 (ninpo is a u16 at character +0x5942,
-  200 a charge, the most at +0x5940; the player's character is the first
-  word of the record at 0x84C23C70).
+  functions; Infinite Ninpo fills back what a cast spends (ninpo is a u16 at
+  character +0x5942, 200 a charge, the most at +0x5940; the player's
+  character is the first word of the record at 0x84C23C70). A ninpo cost of
+  0 (the first version) left the HUD showing a spent charge.
 - Options page objects (TU3, 11-04): built once as Options opens, back to back from 0x8532F390:
   page 1 (builder sub_836D14C0, 0x2BB0 bytes), 2 (sub_836D2078, 0x1CC0), 3 (sub_836D2B10, 0x13E0),
   4 (sub_836D43C8, 0x26A0), then Screen Settings (sub_836D3550, 0xB20: three rows of class
@@ -223,7 +224,19 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
   Defaults row is 0xE0 bytes: vtable 0x822868F8, +0x14 = 0, a sprite (sub_83704630) at +0x40.
   Extras is page 5; the three newer cheats' list rows are made in memory of ours (Cheats' page
   object has no room). The button hints under a page are the game's, by page and row (page 5's
-  first rows say "Test Volume").
+  first rows say "Test Volume"): sub_836D6898 takes them as flags (0x10 Change Storage Device,
+  8 Test Volume, 4 Restore, 2 Confirm, 1 Back), and src/recomp_settings.cpp picks ours. The
+  description line's text comes from the same selector (sub_836D6AC8, a page*8+row table at
+  0x8217FA68); the text lookup (sub_837578C8, called back at 0x836D6B68 and 0x836D6C24) is given
+  ours instead.
+- Gameplay (11-04): a sixth category. Page 11 is the screen calibration page (it draws its own
+  picture), so Gameplay is shown as the Copyright page's view (6, builder sub_836D57B8, vtable
+  0x82286EC0) and handled as page 11. Its builder also runs as Options closes: ours builds only
+  when called from 0x836CFF54. The copyright text is kept off through its slots 13-15
+  (sub_836D57C0, sub_836D5898, sub_836D5970). The page object's +8 and +12 (the page before, the
+  page) are set before its rows are added, as a list row reads them then (the highlight).
+- The in-game menu's list has 12 slots: with six categories, a page has room for six settings and
+  no Restore Defaults row.
 - The game's UI clips with D3D's scissor (draw-list helpers sub_8366EF58 /
   sub_8367C908 set D3DRS_SCISSORTESTENABLE and a widget's rect): the in-game
   camera speed sliders' fill stops at the knob through it. The renderer

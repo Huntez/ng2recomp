@@ -29,8 +29,7 @@ esac
 game=$(cd "${NG2_GAME_DIR:-$repo/game_files}" && pwd)
 image=ng2-build:jammy
 jobs=${JOBS:-$(nproc)}
-tool=${APPIMAGETOOL:-$(command -v appimagetool ||
-    echo "$HOME/ngb-recomp/packaging/appimage/.cache/appimagetool-x86_64.AppImage")}
+tool=${APPIMAGETOOL:-$(command -v appimagetool || true)}
 
 [ -f "$game/default.xex" ] && [ -f "$game/default.xexp" ] ||
     { echo "No default.xex and default.xexp in $game (NG2_GAME_DIR)." >&2; exit 1; }

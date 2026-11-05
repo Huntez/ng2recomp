@@ -11,14 +11,14 @@ body:
     id: version
     attributes:
       label: Version
-      description: The test build you are running, or the commit if you built it.
+      description: The release you are running (for example "0.1.0"), or the commit if you built it.
     validations:
       required: true
   - type: input
     id: distro
     attributes:
-      label: Distribution
-      description: For example "Arch Linux", "Fedora 43" or "Ubuntu 24.04".
+      label: System
+      description: For example "SteamOS", "Arch Linux", "Ubuntu 24.04", "Windows 11", or "Proton 10" for the Windows build on Linux.
   - type: input
     id: cpu
     attributes:
@@ -33,7 +33,7 @@ body:
     id: settings
     attributes:
       label: RECOMP SETTINGS
-      description: Render scale, anti-aliasing, bloom, window mode and V-Sync, if they differ from the defaults.
+      description: Render scale, anti-aliasing, window mode, V-Sync, Frame Pacing and Input Latency, if they differ from the defaults.
   - type: textarea
     id: what
     attributes:
@@ -51,6 +51,7 @@ body:
     attributes:
       label: Log
       description: |
-        For a crash, a freeze or a problem starting: `~/.local/share/ng2-recomp/ng2.log`.
-        For stutter: set `log_hitches = true` in `~/.config/ng2-recomp/ng2.toml`, play the part that
-        stutters, then attach the log. See CONTRIBUTING.md.
+        For a crash, a freeze or a problem starting: `ng2.log`, in `~/.local/share/ng2-recomp` (Linux),
+        `%LOCALAPPDATA%\NinjaGaiden2` (Windows) or the `userdata` folder (portable mode).
+        For stutter: set `log_hitches = true` in `ng2.toml` (`~/.config/ng2-recomp` on Linux, the same
+        folder as the log on Windows or in portable mode), play the part that stutters, then attach the log. See CONTRIBUTING.md.

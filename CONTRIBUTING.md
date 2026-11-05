@@ -10,12 +10,14 @@ generated code in `generated/default/`, or shaders and textures captured from th
 Check the [known issues](README.md#known-issues) first, then open an issue with the **Bug report**
 template. Include:
 
-- the version (or the commit, if you built it), your GPU and driver, and your RECOMP SETTINGS
-  (render scale, anti-aliasing, bloom);
+- the version (or the commit, if you built it), your system (Linux distribution, Windows, or
+  Proton), GPU and driver, and your RECOMP SETTINGS (render scale, anti-aliasing, V-Sync, Frame
+  Pacing, Input Latency);
 - where in the game it happens (chapter and place, or the menu) and what you did just before;
 - a screenshot or a short video of a graphics glitch;
-- for a **crash, freeze or a problem starting**: the log, `~/.local/share/ng2-recomp/ng2.log`;
-- for **stutter**: set `log_hitches = true` in `~/.config/ng2-recomp/ng2.toml`, play the part that
+- for a **crash, freeze or a problem starting**: the log, `ng2.log` (where it is kept is in the
+  [README](README.md#where-things-are-kept));
+- for **stutter**: set `log_hitches = true` in the settings file, `ng2.toml` (same place), play the part that
   stutters, and attach the log;
 - if it only happens in one place: a save from just before it.
 
@@ -29,7 +31,7 @@ differently from the Xbox 360 are added as options, off by default.
 
 ## Testing builds
 
-Test builds are posted in issues. When you report back, include your GPU, driver, distribution and
+Test builds are posted in issues. When you report back, include your GPU, driver, system and
 settings, and what you tried: "fixed", "not fixed" and "different" are all useful. A screenshot of the
 same spot before and after helps most.
 
@@ -50,4 +52,4 @@ Pull requests are welcome. A patch attached to an issue works too.
   the issue.
 
 The project is licensed GPL-3.0-or-later, and contributions are accepted under the same license.
-Contributors are credited in the README and in the release notes.
+Contributors are credited in the release notes.

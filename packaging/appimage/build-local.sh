@@ -17,7 +17,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 build=$repo/out/build/linux-amd64-release
 out=$(mkdir -p "${1:-$repo/out/appimage-local}" && cd "${1:-$repo/out/appimage-local}" && pwd)
-tool=${APPIMAGETOOL:-$(command -v appimagetool || echo "$HOME/ngb-recomp/packaging/appimage/.cache/appimagetool-x86_64.AppImage")}
+tool=${APPIMAGETOOL:-$(command -v appimagetool || true)}
 
 [ -x "$build/ng2" ] || { echo "No build at $build: build the release preset first." >&2; exit 1; }
 [ -x "$tool" ] || { echo "appimagetool not found (set APPIMAGETOOL)." >&2; exit 1; }

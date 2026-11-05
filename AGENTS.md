@@ -21,7 +21,10 @@ the rules that keep a test run from disturbing the machine it runs on.
   versions in `thirdparty/`, which aren't committed).
 - `packaging/`: the AppImage (`appimage/build.sh`: the portable one, built in a container;
   `appimage/build-local.sh`: the native build, for this machine only), the Windows build
-  (`windows/build.sh`) and their resources.
+  (`windows/build.sh`) and their resources. Both packages carry the game built twice, x86-64-v2
+  (`ng2`) and x86-64-v3 (`ng2-avx2`); `src/cpu_handover.cpp` starts the second where the CPU has
+  AVX2 (`NG2_NO_AVX2=1` keeps the first). `portable.txt` next to the package keeps everything in
+  `userdata/` beside it (`packaging/appimage/AppRun`, `src/windows_setup.cpp`).
 - `docs/`: `renderer-plan.md` (the renderer, with what was measured), `menus.md` (the game's menus,
   reverse-engineered), `shaders.md`, the D3D function maps (`d3d-map-*.md`), `xenia-notes.md`.
   The game is Title Update 3 since 2026-11-03 (Title Update 2 from 2026-11-02); older notes use

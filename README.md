@@ -4,30 +4,37 @@
 
 **A PC port of Ninja Gaiden II by static recompilation.**
 
-A native Linux version of *Ninja Gaiden II* (Xbox 360, 2008), made by statically recompiling the
-game's own PowerPC code to run directly on a PC, not an emulator. It is built on the
+A native Linux and Windows version of *Ninja Gaiden II* (Xbox 360, 2008), made by statically
+recompiling the game's own PowerPC code to run directly on a PC, not an emulator. It is built on the
 [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) and draws with its own Vulkan renderer, which
-takes over the game's Direct3D calls instead of emulating the Xbox 360 GPU. It adds PC options in the
-game's own menus: higher render resolutions, anti-aliasing, window modes, V-Sync modes and more.
+takes over the game's Direct3D calls instead of emulating the Xbox 360 GPU. It plays at a steady
+60 fps on modest hardware (the Steam Deck is the baseline) and adds PC options in the game's own
+menus: higher render resolutions, widescreen and ultrawide, anti-aliasing, keyboard and mouse,
+PlayStation and Nintendo button prompts, and more.
 
 **You need your own copy of the game.** This project contains none of the game's data (graphics,
-sound, movies, text): on first start it asks for your disc image or extracted game folder. It is made
-for the **World release** (title ID `544307D5`).
-
-**Status: early.** The game is playable from the start of Chapter 1 on Linux, but it has not been
-played through, and there are no releases yet. Test builds are posted in issues.
+sound, movies, text): on first start it asks for your disc image, Games on Demand package or
+extracted game, and installs it. It is made for the **World release** (title ID `544307D5`) with
+**Title Update 3**, which it asks for too.
 
 ## Features
 
-- Native Linux build (AppImage)
+- Native Linux (AppImage) and Windows (x64) builds; Steam Deck friendly
 - Its own Vulkan renderer: render resolution up to 8x, anti-aliasing (MSAA up to 8x), anisotropic
-  filtering, the game's bloom on, reduced or off
-- Window modes (windowed, borderless, fullscreen) and window size, V-Sync (Off, FIFO, Mailbox,
-  Adaptive), a frame-rate counter in the game's own font
+  filtering, texture LOD bias, the game's bloom on, reduced or off
+- 16:9, 16:10, 21:9, 32:9 and 4:3: the 3D fills the screen, the HUD goes to the screen's corners,
+  the menus and movies keep their own frame
+- Keyboard and mouse, with the keys' own pictures in the game's button prompts; Xbox,
+  PlayStation and Nintendo prompts, following the controller in use
+- Options from alicenotmech's Master Edition, in the port's own versions: skip the death screen,
+  chapter cards that go on by themselves, a HUD that fades out when not fighting (or hidden),
+  no post-effects, smoother HUD and menus, a sharper font
+- Skip intro and skip any cutscene; cheats: infinite health and ninpo, unlock difficulties and
+  costumes, all weapons and ninpo, all crystal skulls, max health and ninpo
+- Low input latency and frame pacing on the display's own refreshes (options)
 - Render pipelines made in the background and remembered between sessions, so new areas don't
-  stutter
+  stutter; the game's movies decoded on the PC (FFmpeg)
 - **RECOMP SETTINGS** on the title menu and in the in-game menu; **EXIT GAME** on the title menu
-- The game's movies decoded on the PC (FFmpeg)
 
 ## Performance
 
@@ -35,55 +42,81 @@ The Steam Deck is the baseline for optimization: changes are judged by whether i
 game's heaviest scenes.
 
 Measured on a Steam Deck LCD in Game Mode, on battery, with sound, in Chapter 1's first fight
-(30 seconds each, the Deck's own performance overlay), the port at the Deck's default settings (1x)
-and Xenia Edge at its defaults (November 2026 builds):
+(29 seconds each, the Deck's own performance overlay's frame log), the port at the Deck's default
+1x render scale and Xenia Edge at its defaults (November 2026 builds):
 
 | | This port | Xenia Edge |
 |---|---|---|
-| Average fps | 60.0 | 58.2 |
-| 1% low | 55.4 | 27.5 |
-| 0.1% low | 52.6 | 18.1 |
-| CPU load | 32% | 51% |
-| GPU load | 48% | 81% |
-| Whole Deck's power draw | 11 W | 22 W |
+| Average fps | 60.0 | 55.4 |
+| 1% low | 57.4 | 20.3 |
+| 0.1% low | 55.5 | 17.9 |
+| Slowest frame | 18 ms | 56 ms |
+| Frames over 20 ms | 0 | 380 |
+| CPU load | 26% | 50% |
+| GPU load | 52% | 84% |
+| Whole Deck's power draw | 10 W | 22 W |
 
-Both average close to 60 fps, but the emulator's slowest frames drop to 18-28 fps, while the port's
-stay above 52. The port draws half the power, so a charge lasts about twice as long.
+The port holds 60 fps with no slow frame, while the emulator averages 55 fps and drops to 18. The
+port draws less than half the power, so a charge lasts about twice as long.
 
 ## Getting started
 
-### Linux
+### What you need
 
-1. Download `NinjaGaiden2-x86_64.AppImage` from a test build and make it executable (`chmod +x`, or
-   Properties → Allow executing).
-2. Run it. On the first start it installs the game:
-   1. Your copy of the game: a disc image (`.iso`), the Games on Demand package (the file in
-      `544307D5/00007000`, next to its `.data` folder), or the `default.xex` of an extracted copy.
-      A disc image or package is copied once into the data folder.
-   2. Title Update 3 for the World release (`TU_1A461UL_000000G000000.00000000000O4`, or its
-      `default.xexp`), which the port is built for. It goes in the game folder.
-   3. Downloadable content (Mission Mode, the costume packs), if you have it: the folder with the
-      packages (the console's `544307D5/00000002`). More can go in the game folder's `dlc` folder
-      later; they are installed on the next start.
+These files, from your own console or discs (the game asks for each on its first start):
 
-Needs a 64-bit Linux with glibc 2.35 or newer (SteamOS, Ubuntu 22.04+, Debian 12, Fedora 36+), a
-GPU with Vulkan 1.3 drivers, Python 3 and `kdialog` for the first-start windows.
+- **The game**, World release (`544307D5`), in any of these forms:
+  - a disc image (`.iso`);
+  - the Games on Demand package (the file in `544307D5/00007000`, next to its `.data` folder);
+  - an extracted copy (the folder with `default.xex`).
+- **Title Update 3** for the World release: the file `TU_1A461UL_000000G000000.00000000000O4`
+  (2,486,272 bytes; on a console in `Content/0000000000000000/544307D5/000B0000`), or the
+  `default.xexp` taken from it. It is required: the port is built for it, and checks it. The
+  Japanese release's Title Update 3 is for that disc and is refused.
+- **Optional: the downloadable content** you have (Mission Mode, the costume packs): the console's
+  `544307D5/00000002` folder. It can be added later, in the game folder's `dlc` folder.
+
+And a 64-bit PC with SSE4.2 (any from about 2009 on) and a GPU with Vulkan 1.3 drivers.
+
+The first start after installing takes longer to load: the render pipelines are made then and
+kept, and later starts are quicker.
+
+### Linux and Steam Deck
+
+1. Download `NinjaGaiden2-x86_64.AppImage` from the releases page and make it executable
+   (`chmod +x`, or Properties → Allow executing).
+2. Run it. On the first start it asks whether to keep everything next to the AppImage (portable
+   mode, below), then for your copy of the game, Title Update 3 and, if you have it, the DLC folder. A disc image or package is copied once into the data folder (below).
+   More DLC can go in the game folder's `dlc` folder later; it is installed on the next start.
+3. On a Steam Deck, add the AppImage to Steam (Add a Non-Steam Game) to play it in Game Mode, and
+   choose 16:10 in RECOMP SETTINGS → Display.
+
+Needs a 64-bit Linux with glibc 2.35 or newer (SteamOS, Ubuntu 22.04+, Debian 12, Fedora 36+),
+Python 3 and `kdialog` for the first-start windows (both are on SteamOS and KDE desktops). Without
+kdialog, install it (the `kdialog` package), or set `NG2_GAME_DIR` to an extracted copy of the game
+with Title Update 3's `default.xexp` next to `default.xex` (DLC goes in its `dlc` folder).
 
 ### Windows
 
-1. Download `NinjaGaiden2-windows-x64.zip` from a test build and unpack it anywhere.
-2. Run `ng2.exe`. The first time it installs the game as on Linux: your copy of the game (disc
-   image, Games on Demand package or `default.xex`; a disc or package is copied into
-   `%LOCALAPPDATA%\NinjaGaiden2\game`), Title Update 3, then the DLC if you have it.
+1. Download `NinjaGaiden2-windows-x64.zip` from the releases page and extract it anywhere.
+2. Run `ng2.exe`. The first time it asks about portable mode (below), then for the game, Title Update 3 and the DLC as on Linux; a
+   disc image or package is copied into `%LOCALAPPDATA%\NinjaGaiden2\game`.
 
-Needs a GPU with Vulkan 1.3 drivers. The Microsoft Visual C++ runtime DLLs are included.
+Needs Windows 10 or 11 (64-bit). The Microsoft Visual C++ runtime DLLs are included.
+
+Both packages carry the game twice, for any PC with SSE4.2 and for one with AVX2 (most PCs since
+2013, the Steam Deck): the faster one is used where the CPU has it. `NG2_NO_AVX2=1` keeps the other.
 
 ### Where things are kept
 
 | | Linux | Windows |
 |---|---|---|
-| Extracted game (from a disc image), saves, log (`ng2.log`) | `~/.local/share/ng2-recomp` | `%LOCALAPPDATA%\NinjaGaiden2` |
+| Copied game (from a disc image or package), saves, log (`ng2.log`) | `~/.local/share/ng2-recomp` | `%LOCALAPPDATA%\NinjaGaiden2` |
 | Settings (`ng2.toml`), the chosen game folder, the pipeline list (`ng2-pipelines.bin`) | `~/.config/ng2-recomp` | `%LOCALAPPDATA%\NinjaGaiden2` |
+
+**Portable mode:** with a file named `portable.txt` next to the AppImage (or `ng2.exe`), all of
+these go into a `userdata` folder next to it instead. The first start offers it. The folder must
+be writable (not inside Program Files). Delete `portable.txt` to go back.
 
 `NG2_GAME_DIR=<folder>` starts with that game folder instead of the remembered one (Linux; on
 Windows pass `--game_data_root=<folder>`).
@@ -91,41 +124,54 @@ Windows pass `--game_data_root=<folder>`).
 ## Settings
 
 Everything is in the game's own menus: **RECOMP SETTINGS** on the title menu, and **Recomp
-Settings** in the in-game menu (Back, under Save Method). Changes apply at once and are saved.
+Settings** in the in-game menu (Back, under Save Method). Changes apply at once and are saved;
+each defaults to the game's own behaviour.
 
-- **Graphics**: render scale (1x–8x, with the resolution it draws at, as "2x 2240x1168"),
-  anti-aliasing (off, or 2x as on the console, 4x, 8x MSAA), texture filtering (the game's, or
-  4x–16x anisotropic), texture LOD bias (the game's, 0, -1), bloom (off, reduced, on),
-  post-effects (off: no blur, no white flashes)
-- **Display**: window mode (windowed, borderless, fullscreen), window size, aspect ratio (16:9,
-  16:10, 21:9, 32:9, 4:3), V-Sync (Off, FIFO, Mailbox, Adaptive; a mode the driver lacks falls back
-  to FIFO), frame pacing (Timer, the game's own; Auto: the game's 60 Hz on the display's own
-  refreshes, measured from the frames reaching the screen, so none waits in a queue on a 59.94 Hz
-  screen; not for a variable-refresh display: G-Sync, FreeSync)
-- **Cheats**: infinite health, infinite ninpo, unlock costumes, all weapons and ninpo (Level 1 or
-  3: given at a new game, a load or a stage's start; what it gives stays in the save, as items
-  found, when it's turned off), all crystal skulls, max HP and ninpo
-- **Interface**: HUD (shown, fade out when not fighting, hidden), hi-res font (sharper text above
-  720p; from the next start), smooth HUD and menus, show FPS, button prompts (Auto follows the
-  device in use; Xbox, PlayStation, Nintendo, Keyboard), mouse sensitivity
-- **Extras**: skip intro, skip cutscenes (seen or not), skip death screen, auto chapter screen
-- **Gameplay**: input latency (Low: no finished frame waits for the screen), unlock difficulties
+- **Graphics**: Render Scale (1x–8x, with the resolution it draws at, as "2x 2240x1168");
+  Anti-Aliasing (off, or 2x MSAA as on the console, 4x, 8x); Texture Filtering (the game's, or
+  4x–16x anisotropic); Texture LOD Bias (the game's, 0 or -1: less shimmer at higher render
+  scales); Bloom (on, reduced, off); Post-Effects (off: no blur, no white flashes)
+- **Display**: Window Mode (windowed, borderless, fullscreen) and Window Size; Aspect Ratio (16:9,
+  16:10, 21:9, 32:9, 4:3); V-Sync (Off, FIFO, Mailbox, Adaptive; a mode the driver lacks falls back
+  to FIFO); Frame Pacing (Timer, the game's own 60 Hz clock, or Auto: the game's frames on the
+  display's own refreshes, measured from the frames reaching the screen, so no frame is shown
+  twice for the drift on a screen a little off 60 Hz, as 59.94; needs VK_KHR_present_wait, else it
+  runs as Timer; use Timer on a variable-refresh display, G-Sync or FreeSync)
+- **Cheats**: Infinite Health; Infinite Ninpo (each cast's ninpo filled back); Unlock Costumes;
+  All Weapons and Ninpo (Level 1 or 3: every melee and projectile weapon, ninpo and ammo, given at a
+  new game, a load and a stage's start; what it gives stays in the save when it's turned off, as
+  items found); All Crystal Skulls; Max HP and Ninpo (the life and ninpo upgrades full while it's
+  on; the save keeps your own)
+- **Interface**: HUD (shown, fading out when not fighting, hidden); Hi-Res Font (text drawn from
+  glyphs twice the size, sharper above 720p; from the next start); Smooth HUD and Menus (the 2D
+  always filtered); Show FPS; Button Prompts (Auto follows the device in use; Xbox, PlayStation,
+  Nintendo, Keyboard); Mouse Sensitivity
+- **Extras**: Skip Intro; Skip Cutscenes (any, watched or not); Skip Death Screen (straight to the
+  game over menu); Auto Chapter Screen (chapter cards and mission briefings go on by themselves)
+- **Gameplay**: Input Latency (Low: no finished frame waits for the screen; needs
+  VK_KHR_present_wait); Unlock Difficulties (every path in New Game and Mission Mode, at once
+  either way)
 
 In the in-game menu, a page with six settings has no Restore Defaults row (the list has no room
 for it); the title menu's has.
 
 The game's own Options (camera, controller, sound, screen) are where they always were.
 
-Some settings have no menu entry yet; they go in `ng2.toml`:
+Some settings have no menu entry; they go in `ng2.toml`:
 
 - `async_pipelines = false`: make render pipelines as they're needed instead of in the background
   (a new effect can stutter, but never appears a frame late)
 - `log_hitches = true`: log every frame that takes over 25 ms with what the renderer spent it on
 - `half_pixel_offset = false`: drop the console's half-pixel shift
+- `frame_pacing_phase = 5`: where in a refresh Frame Pacing Auto starts a frame (% of it)
 
 ## Controls
 
-A controller works as on the Xbox 360. Keyboard and mouse work too:
+A controller works as on the Xbox 360; a PlayStation or Nintendo controller too, with its own
+button prompts. The keyboard and mouse can be used at any time: the game follows whichever was
+touched last, and its prompts change to match (or stay on one set: Button Prompts, in Interface).
+The mouse moves the camera only while the keyboard and mouse are in use, and the pointer hides while
+a controller is.
 
 | Key | Action | Key | Action |
 |---|---|---|---|
@@ -136,15 +182,21 @@ A controller works as on the Xbox 360. Keyboard and mouse work too:
 | Shift | block (LT) | Q, middle mouse | RT |
 | R | LB | V | RB |
 | Z / X | stick clicks | Tab / Escape | Back / Start |
-| arrows | d-pad | Return / Backspace | A / B in menus |
+| arrows | d-pad | Return / Backspace | A / B |
+| Numpad 8 4 5 6 | camera (keys) | | |
 
-The keys can be changed in `ng2.toml` (`keybind_a = "Space,C,Return"` and so on). The mouse only
-moves the camera while the keyboard is in use, and the pointer is hidden while a controller is.
+The keys can be changed in `ng2.toml` (`keybind_a = "Space,C,Return"` and so on: a list of keys
+for each button; a key in two lists presses both, as the game's two-button moves need).
 
 ## Known issues
 
-- Only Chapter 1 has been tested; later chapters may show glitches the renderer doesn't handle yet.
-- Some cutscene sounds may play a little late.
+- Some cutscenes may have slight audio delays.
+- Tested on a Linux desktop, the Steam Deck, under Proton and in a Windows 11 virtual machine; reports
+  from other systems, and from real Windows PCs especially, are welcome.
+
+When reporting a graphics glitch, pressing **F7** while it is on screen records the next frames'
+drawing to `~/ng2-trace-<n>` (Linux) or `C:\Users\<you>\ng2-trace-<n>` (Windows): attach that
+folder, zipped. For a crash or a freeze, attach the log (`ng2.log`, above).
 
 ## Building from source
 
@@ -159,6 +211,7 @@ libswresample, libswscale).
        git am ../../patches/rexglue-sdk/*.patch
        cmake --preset linux-amd64
        cmake --build out/build/linux-amd64 --config Release --target install
+       cd ../..
 
 2. XenosRecomp (the shader translator) and plume (the Vulkan layer of Unleashed Recompiled), with
    this port's patches:
@@ -166,10 +219,15 @@ libswresample, libswscale).
        git clone --recursive https://github.com/hedge-dev/XenosRecomp thirdparty/XenosRecomp
        cd thirdparty/XenosRecomp && git checkout 990d03b && git submodule update --init --recursive
        git am ../../patches/xenosrecomp/*.patch
+       cd ../..
 
        git clone https://github.com/renderbag/plume thirdparty/plume
        cd thirdparty/plume && git checkout 1192686 && git submodule update --init contrib/volk contrib/VulkanMemoryAllocator contrib/Vulkan-Headers
        git am ../../patches/plume/*.patch
+       cd ../..
+
+   (`git am` makes commits: it needs a git name and email, `git config --global user.name` and
+   `user.email`.)
 
 3. Extract the disc (or the Games on Demand package) into `game_files/` and put Title Update 3's
    `default.xexp` next to `default.xex` (see [docs/title-update.md](docs/title-update.md)):
@@ -188,7 +246,8 @@ libswresample, libswscale).
        out/build/linux-amd64-release/ng2 --game_data_root=game_files
 
 The AppImage, `packaging/appimage/build.sh`, builds the SDK and the game in an Ubuntu 22.04
-container (Docker; `packaging/appimage/Dockerfile`), so it needs only glibc 2.35 and runs on
+container (Docker; `packaging/appimage/Dockerfile`; it also needs rsync and
+[appimagetool](https://github.com/AppImage/appimagetool) on the PATH, or `APPIMAGETOOL=<path>`), so it needs only glibc 2.35 and runs on
 SteamOS and other current distributions. It bundles a small FFmpeg with the movies' codecs and
 writes `out/appimage/NinjaGaiden2-x86_64.AppImage`. `packaging/appimage/build-local.sh` packs
 the native build instead, quicker but only for the machine that built it.

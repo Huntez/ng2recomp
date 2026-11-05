@@ -3865,6 +3865,11 @@ void TraceFrame(HostTexture* frontBuffer) {
   if (g_traceRequest.exchange(false) && !g_traceFile) {
     opened = true;
     const char* home = std::getenv("HOME");
+#if defined(_WIN32)
+    if (!home) {
+      home = std::getenv("USERPROFILE");  // (C:\Users\<you>; HOME is rarely set there)
+    }
+#endif
     for (int n = 1; n < 1000 && !g_traceFile; n++) {
       g_traceDir = fmt::format("{}/ng2-trace-{}", home ? home : ".", n);
       std::error_code error;

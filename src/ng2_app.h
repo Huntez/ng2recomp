@@ -84,6 +84,13 @@ class Ng2App : public rex::ReXApp {
       config.graphics = ng2::gpu::CreateNativeGraphicsSystem();
     }
 
+    // Which of the package's two builds runs (src/cpu_handover.cpp), for bug reports.
+#if defined(__AVX2__)
+    REXLOG_INFO("build: x86-64-v3 (AVX2)");
+#else
+    REXLOG_INFO("build: x86-64-v2 (SSE4.2)");
+#endif
+
     // NG2_AUDIO=0: run the audio pipeline without an output device.
     const char* audio = std::getenv("NG2_AUDIO");
     if (audio && audio[0] == '0') {
