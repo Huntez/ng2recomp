@@ -36,6 +36,7 @@ set(NG2_SOURCES
     src/controls.cpp
     src/extras.cpp
     src/storage_prompt.cpp
+    src/cpu_handover.cpp
     src/gpu/d3d_hooks.cpp
     src/perf_overlay.cpp
     src/recomp_settings.cpp

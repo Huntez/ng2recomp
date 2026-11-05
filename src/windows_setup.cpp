@@ -740,6 +740,33 @@ bool ConfigurePaths(rex::PathConfig& paths) {
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
   fs::path data = KnownFolder(FOLDERID_LocalAppData) / "NinjaGaiden2";
   std::error_code ec;
+  // Portable mode: with portable.txt next to ng2.exe, everything (settings,
+  // saves, the log, a copied game) goes in a userdata folder next to it. The
+  // first start offers it when that folder can be written (not under
+  // Program Files).
+  wchar_t exe[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  fs::path beside = fs::path(exe).parent_path();
+  // (a Normal answer is kept as portable_asked in the usual folder)
+  bool firstStart = !fs::exists(data / "game_dir.txt", ec) && !fs::exists(data / "portable_asked", ec) &&
+                    !fs::exists(beside / "portable.txt", ec);
+  if (firstStart && !std::getenv("NG2_CONFIG")) {
+    fs::path probe = beside / "portable.probe";
+    bool writable = std::ofstream(probe).good();
+    fs::remove(probe, ec);
+    if (writable &&
+        Ask("Keep the settings, saves and the installed game in a userdata folder next to ng2.exe ("
+                + Utf8(beside) + "), instead of in your user folder?",
+            "Portable", "Normal")) {
+      std::ofstream(beside / "portable.txt");
+    } else {
+      fs::create_directories(data, ec);
+      std::ofstream(data / "portable_asked");
+    }
+  }
+  if (fs::exists(beside / "portable.txt", ec)) {
+    data = beside / "userdata";
+  }
   fs::create_directories(data / "user", ec);
 
   // Settings, saves and the log in %LOCALAPPDATA% (the program's folder may

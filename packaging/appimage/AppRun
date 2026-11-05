@@ -6,7 +6,29 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 config_dir=${XDG_CONFIG_HOME:-$HOME/.config}/ng2-recomp
 data_dir=${XDG_DATA_HOME:-$HOME/.local/share}/ng2-recomp
-mkdir -p "$config_dir" "$data_dir/user"
+# Portable mode: with portable.txt next to the AppImage, everything (settings,
+# saves, the log, a copied game) goes in a userdata folder next to it. The
+# first start offers it when that folder can be written.
+beside=${APPIMAGE:+$(dirname "$APPIMAGE")}
+if [ -n "$beside" ] && [ ! -f "$beside/portable.txt" ] && [ ! -f "$config_dir/game_dir" ] &&
+   [ ! -f "$config_dir/portable_asked" ] &&
+   [ -z "${NG2_GAME_DIR:-}" ] && [ -w "$beside" ] && command -v kdialog >/dev/null; then
+  if kdialog --title "Ninja Gaiden II" --yes-label "Portable" --no-label "Normal" --yesno \
+      "Keep the settings, saves and the installed game in a userdata folder next to the AppImage ($beside), instead of in your home folder?" 2>/dev/null; then
+    : > "$beside/portable.txt"
+  else
+    mkdir -p "$config_dir" && : > "$config_dir/portable_asked"  # (Normal: not asked again)
+  fi
+fi
+if [ -n "$beside" ] && [ -f "$beside/portable.txt" ]; then
+  config_dir=$beside/userdata
+  data_dir=$beside/userdata
+fi
+mkdir -p "$config_dir" "$data_dir/user" 2>/dev/null || {
+  msg="Can't write $data_dir. In portable mode the folder next to the AppImage must be writable (or delete portable.txt there)."
+  if command -v kdialog >/dev/null; then kdialog --title "Ninja Gaiden II" --error "$msg"; else echo "$msg" >&2; fi
+  exit 1
+}
 
 error() {
   if command -v kdialog >/dev/null; then kdialog --title "Ninja Gaiden II" --error "$1"
