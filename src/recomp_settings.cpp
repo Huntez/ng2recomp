@@ -55,6 +55,12 @@ REXCVAR_DEFINE_BOOL(exclusive_fullscreen, false, "UI/Window",
                     "Fullscreen in the desktop's display mode (exclusive) rather than as a "
                     "borderless window over the desktop");
 
+namespace {
+// (defined below, with the hooks)
+uint32_t CallGuest(PPCContext& ctx, uint8_t* base, void (*function)(PPCContext&, uint8_t*),
+                   std::initializer_list<uint32_t> args, double f1 = 0.0);
+}  // namespace
+
 namespace ng2::recomp_settings {
 namespace {
 
@@ -310,13 +316,10 @@ void PutBack(std::vector<std::pair<uint32_t, std::vector<uint8_t>>>& saved) {
 }
 std::filesystem::path g_configPath;
 rex::ui::WindowedAppContext* g_appContext = nullptr;
-struct SavedBytes {
-  uint32_t physical;
-  std::vector<uint8_t> bytes;  // the game's
-  std::vector<uint8_t> ours;   // what we wrote, to check before restoring
-};
-std::vector<SavedBytes> g_savedTexts;
 std::vector<std::pair<std::u16string_view, uint32_t>> g_textIds;  // our texts' string ids
+// While ours is shown: the Options table's ids that give our texts instead of
+// the game's (the text lookup's hook asks, RecompText), by slot; 0: the game's.
+std::array<std::atomic<uint32_t>, kSlotCount> g_overrides{};
 
 // The page object being built by the game's builder, whose rows are left out.
 uint32_t g_building = 0;
@@ -350,77 +353,34 @@ std::vector<uint8_t> Utf16BE(std::u16string_view text) {
   return bytes;
 }
 
-// The physical address of each string slot, from the table found by its
-// first two strings; empty if the table isn't loaded. The table's address
-// is kept and checked first: a scan reads all of guest memory.
-std::vector<std::pair<uint32_t, uint32_t>> FindTextSlots() {
-  constexpr uint32_t kPhysicalSize = 512u << 20;
-  static uint32_t knownTable = ~0u;
-  const uint8_t* memory = guest::Physical(0);
-  std::vector<uint8_t> first = Utf16BE(u"Game Settings");
-  first.push_back(0), first.push_back(0);
-  std::vector<uint8_t> second = Utf16BE(u"Controller Settings");
-  const uint8_t* end = memory + kPhysicalSize;
-  // Boyer-Moore: the memory is mostly zeros, which the pattern ends with
-  // (Horspool would step one byte at a time over them).
-  const std::boyer_moore_searcher searcher(first.begin(), first.end());
-  auto isTable = [&](const uint8_t* hit) {
-    return uint32_t(hit - memory) % 16 == 0 && hit + 0x20 + second.size() < end &&
-           std::memcmp(hit, first.data(), first.size()) == 0 &&
-           std::memcmp(hit + 0x20, second.data(), second.size()) == 0;
-  };
-  const uint8_t* table = nullptr;
-  if (knownTable != ~0u && isTable(memory + knownTable)) {
-    table = memory + knownTable;
+// One of our texts in guest memory (UTF-16 BE), made once and kept.
+uint32_t GuestText(std::u16string_view text) {
+  static std::map<std::u16string, uint32_t, std::less<>> made;
+  if (auto it = made.find(text); it != made.end()) {
+    return it->second;
   }
-  for (const uint8_t* at = memory; !table && at < end;) {
-    const uint8_t* hit = std::search(at, end, searcher);
-    if (hit == end) {
-      break;
-    }
-    if (isTable(hit)) {
-      table = hit;
-    }
-    at = hit + 2;
-  }
-  if (!table) {
-    return {};
-  }
-  knownTable = uint32_t(table - memory);
-  std::vector<std::pair<uint32_t, uint32_t>> slots;  // address, size
-  uint32_t address = knownTable;
-  for (uint32_t i = 0; i < kSlotCount && address + 2 <= kPhysicalSize; i++) {
-    uint32_t length = 0;
-    while (address + length + 1 < kPhysicalSize &&
-           (memory[address + length] | memory[address + length + 1])) {
-      length += 2;
-    }
-    uint32_t size = (length + 2 + 15) & ~15u;
-    slots.emplace_back(address, size);
-    address += size;
-  }
-  return slots;
-}
-
-// Writes text into a slot, keeping the game's bytes; false if it doesn't fit.
-bool WriteText(const std::pair<uint32_t, uint32_t>& slot, std::u16string_view text) {
-  auto [address, size] = slot;
   std::vector<uint8_t> bytes = Utf16BE(text);
-  if (bytes.size() + 2 > size) {
-    return false;
+  bytes.push_back(0), bytes.push_back(0);
+  uint32_t address = rex::Runtime::instance()->memory()->SystemHeapAlloc(uint32_t(bytes.size()));
+  if (address) {
+    std::memcpy(guest::Virtual(address), bytes.data(), bytes.size());
   }
-  uint8_t* at = guest::Physical(address);
-  SavedBytes saved{address, std::vector<uint8_t>(at, at + size), {}};
-  std::memset(at, 0, size);
-  std::memcpy(at, bytes.data(), bytes.size());
-  saved.ours.assign(at, at + size);
-  g_savedTexts.push_back(std::move(saved));
-  return true;
+  made.emplace(std::u16string(text), address);
+  return address;
 }
 
-// Our texts into the spare slots, longest first, each in the smallest that
-// fits.
-void PlaceTexts(const std::vector<std::pair<uint32_t, uint32_t>>& slots) {
+// Our texts given for an Options table id: the game's menus ask the text
+// lookup by id, in the game's language, so this works in every language and
+// with no room needed in the table.
+void Override(uint32_t slot, std::u16string_view text) {
+  if (slot < kSlotCount) {
+    g_overrides[slot].store(GuestText(text), std::memory_order_release);  // (its bytes first)
+  }
+}
+
+// Each of our texts a spare id of the Options table (its strings unused by
+// Options), given our text by the lookup.
+void PlaceTexts() {
   std::vector<std::u16string_view> texts{kRestoreText};
   for (const Setting& setting : kSettings) {
     texts.push_back(setting.label);
@@ -436,24 +396,17 @@ void PlaceTexts(const std::vector<std::pair<uint32_t, uint32_t>>& slots) {
       texts.insert(texts.end(), setting.choices.begin(), setting.choices.begin() + setting.count);
     }
   }
-  std::sort(texts.begin(), texts.end(),
-            [](auto a, auto b) { return a.size() > b.size() || (a.size() == b.size() && a < b); });
+  std::sort(texts.begin(), texts.end());
   texts.erase(std::unique(texts.begin(), texts.end()), texts.end());
-  std::vector<bool> used(slots.size());
+  uint32_t slot = kSpareFirst;
   for (std::u16string_view text : texts) {
-    uint32_t best = 0;
-    for (uint32_t i = kSpareFirst; i < kSpareEnd && i < slots.size(); i++) {
-      if (!used[i] && slots[i].second >= (text.size() + 1) * 2 &&
-          (!best || slots[i].second < slots[best].second)) {
-        best = i;
-      }
-    }
-    if (best && WriteText(slots[best], text)) {
-      used[best] = true;
-      g_textIds.emplace_back(text, kTable | best);
-    } else {
+    if (slot >= kSpareEnd) {
       REXLOG_WARN("recomp settings: no room for a text");
+      break;
     }
+    Override(slot, text);
+    g_textIds.emplace_back(text, kTable | slot);
+    slot++;
   }
 }
 
@@ -476,18 +429,12 @@ void Open() {
   g_open = true;
   PutBackGame();
   ng2::video::SetRecompHeader(true);
-  auto slots = FindTextSlots();
-  if (slots.empty()) {
-    REXLOG_WARN("recomp settings: Options texts not found");
-  } else if (slots.size() == kSlotCount) {
-    // The spare slots first: the table is found by its first name.
-    PlaceTexts(slots);
-    for (uint32_t i = 0; i < std::size(kCategoryNames); i++) {
-      WriteText(slots[kCategoryNames[i]], i < kPageCount ? kPages[i].name : u"");
-    }
-    WriteText(slots[kPlayTimeName], u"");
-    WriteText(slots[kNoteSlot], kAllWeaponsNote);
+  PlaceTexts();
+  for (uint32_t i = 0; i < std::size(kCategoryNames); i++) {
+    Override(kCategoryNames[i], i < kPageCount ? kPages[i].name : u"");
   }
+  Override(kPlayTimeName, u"");
+  Override(kNoteSlot, kAllWeaponsNote);
   REXLOG_INFO("recomp settings: open");
 }
 
@@ -570,14 +517,9 @@ void SaveSettings() {
 // title menu's next build, or before Options is next built or opened.
 void PutBackGame() {
   ng2::video::SetRecompHeader(false);
-  // Last written first: a slot written twice gets the game's bytes back.
-  for (auto it = g_savedTexts.rbegin(); it != g_savedTexts.rend(); ++it) {
-    uint8_t* slot = guest::Physical(it->physical);
-    if (std::memcmp(slot, it->ours.data(), it->ours.size()) == 0) {
-      std::memcpy(slot, it->bytes.data(), it->bytes.size());
-    }
+  for (auto& override : g_overrides) {
+    override.store(0, std::memory_order_relaxed);
   }
-  g_savedTexts.clear();
   g_textIds.clear();
   PutBack(g_savedGuest);
 }
@@ -823,6 +765,13 @@ void SetAppContext(rex::ui::WindowedAppContext* context) {
   g_appContext = context;
 }
 
+// The text lookup's hook (storage_prompt.cpp): our text for this id while
+// ours is shown, as a guest address; 0: the game's.
+uint32_t RecompText(uint32_t id) {
+  uint32_t slot = id - kTable;
+  return slot < kSlotCount ? g_overrides[slot].load(std::memory_order_acquire) : 0;
+}
+
 }  // namespace ng2::recomp_settings
 
 using namespace ng2::recomp_settings;
@@ -833,7 +782,7 @@ namespace {
 // replaced handler has no frame of its own), leaving the caller's registers
 // as they were.
 uint32_t CallGuest(PPCContext& ctx, uint8_t* base, void (*function)(PPCContext&, uint8_t*),
-                   std::initializer_list<uint32_t> args, double f1 = 0.0) {
+                   std::initializer_list<uint32_t> args, double f1) {
   PPCContext saved = ctx;
   ctx.r1.u64 = saved.r1.u32 - 0x200;
   uint64_t* registers[] = {&ctx.r3.u64, &ctx.r4.u64, &ctx.r5.u64,
@@ -1108,11 +1057,6 @@ bool HasOurRows(const Page& page) {
 void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object, uint32_t model) {
   using ng2::guest::Load32;
   Store32(object + kPageRows, 0);
-  uint32_t language = CallGuest(ctx, base, __imp__sub_8367F948, {}) & 0xFF;
-  uint32_t table = Load32(kStringTable);
-  auto text = [&](std::u16string_view s) {
-    return CallGuest(ctx, base, __imp__sub_823E1238, {table, language, TextId(s)});
-  };
   float y = 0.0f;
   auto place = [&](uint32_t widget) {
     CallGuest(ctx, base, __imp__sub_836CF0D0, {widget, model});

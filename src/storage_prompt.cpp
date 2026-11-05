@@ -1,27 +1,39 @@
 // ng2 - Ninja Gaiden II static recompilation
 //
-// The PC has one storage device, so the game's "Change Storage Device"
-// prompts (Load Game's button line, the Options pages' hints, NINJA CINEMA's)
-// are left out: each string the game's text lookup (sub_837578C8: language,
-// id) hands out is checked, and a "@[pad:..]Change Storage Device" in it is
-// cut out where it lies (the table's own copy, so once), the rest of the
-// string kept. Untagged labels of the same words are left alone.
+// The game's text lookup (sub_837578C8: language, id), hooked:
+// - The PC has one storage device, so the game's "Change Storage Device"
+//   prompts (Load Game's button line, the Options pages' hints, NINJA
+//   CINEMA's) are left out, in every language: for each id the English text
+//   is looked at once, and where it holds "@[pad:..] Change Storage Device",
+//   that button's segment (from its tag to the next tag) is cut out of the
+//   string handed out, where it lies (the table's own copy, so once). Untagged
+//   labels of the same words are left alone.
+// - RECOMP SETTINGS' texts are given for the ids it uses (recomp_settings.cpp),
+//   and its description line's id is replaced.
 
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 
 #include <rex/hook.h>
+#include <rex/ppc/context.h>
 
 #include "gpu/guest.h"
 
+namespace ng2::recomp_settings {
+uint32_t RecompText(uint32_t id);
+}
+
 namespace {
 
-// The prompt's text in the languages it has been seen in.
-constexpr std::u16string_view kTexts[] = {u"Change Storage Device",
-                                          u"Changer le périphérique de stockage"};
-constexpr std::u16string_view kTag = u"@[pad:";
+constexpr uint32_t kEnglish = 1;  // the lookup's languages: 0 Japanese, 1 English, ...
+constexpr std::u16string_view kPrompt = u"Change Storage Device";
+constexpr std::u16string_view kTag = u"@[";           // any tag
+constexpr std::u16string_view kButton = u"@[pad:";    // a button's
 constexpr uint32_t kMaxChars = 1024;
 
 char16_t At(const uint8_t* p) {
@@ -37,26 +49,27 @@ bool Matches(const uint8_t* p, std::u16string_view text) {
   return true;
 }
 
-// A UTF-16 BE string at a guest address: the tagged prompt cut out.
-void CutPrompt(uint32_t address) {
-  // (heap only: the image's read-only data can't be written)
-  if (address < 0x40000000u || address >= 0xF0000000u ||
-      (address >= 0x82000000u && address < 0x90000000u)) {
-    return;
-  }
-  uint8_t* s = ng2::guest::Virtual(address);
+// A UTF-16 BE string's length, or kMaxChars if it doesn't end in time.
+uint32_t Length(const uint8_t* s) {
   uint32_t length = 0;
   while (length < kMaxChars && At(s + 2 * length) != 0) {
     length++;
   }
+  return length;
+}
+
+// The button tag ("@[pad:..]") before the prompt in an English string, or
+// empty if it has none.
+std::u16string PromptTag(const uint8_t* s) {
+  uint32_t length = Length(s);
   if (length == kMaxChars) {
-    return;
+    return {};
   }
-  for (uint32_t tag = 0; tag + kTag.size() < length; tag++) {
-    if (!Matches(s + 2 * tag, kTag)) {
+  for (uint32_t tag = 0; tag + kButton.size() < length; tag++) {
+    if (!Matches(s + 2 * tag, kButton)) {
       continue;
     }
-    uint32_t close = tag + uint32_t(kTag.size());
+    uint32_t close = tag + uint32_t(kButton.size());
     while (close < length && At(s + 2 * close) != u']') {
       close++;
     }
@@ -64,20 +77,54 @@ void CutPrompt(uint32_t address) {
     while (text < length && At(s + 2 * text) == u' ') {
       text++;
     }
-    for (std::u16string_view prompt : kTexts) {
-      if (text + prompt.size() > length || !Matches(s + 2 * text, prompt)) {
-        continue;
+    if (text + kPrompt.size() <= length && Matches(s + 2 * text, kPrompt)) {
+      std::u16string found;
+      for (uint32_t i = tag; i <= close && i < length; i++) {
+        found += At(s + 2 * i);
       }
-      uint32_t end = text + uint32_t(prompt.size());
-      while (end < length && At(s + 2 * end) == u' ') {
-        end++;
-      }
-      std::memmove(s + 2 * tag, s + 2 * end, 2 * (length - end));
-      std::memset(s + 2 * (tag + length - end), 0, 2 * (end - tag));
-      return;
+      return found;
     }
   }
+  return {};
 }
+
+// That button's segment cut out of a string at a guest address: from its
+// tag to the next tag, a line break or the end.
+void CutSegment(uint32_t address, std::u16string_view tag) {
+  // (heap only: the image's read-only data can't be written)
+  if (address < 0x40000000u || address >= 0xF0000000u ||
+      (address >= 0x82000000u && address < 0x90000000u)) {
+    return;
+  }
+  uint8_t* s = ng2::guest::Virtual(address);
+  uint32_t length = Length(s);
+  if (length == kMaxChars) {
+    return;
+  }
+  for (uint32_t at = 0; at + tag.size() <= length; at++) {
+    if (!Matches(s + 2 * at, tag)) {
+      continue;
+    }
+    uint32_t end = at + uint32_t(tag.size());
+    while (end < length && At(s + 2 * end) != u'\n' &&
+           !(end + kTag.size() <= length && Matches(s + 2 * end, kTag))) {
+      end++;
+    }
+    if (end == length || At(s + 2 * end) == u'\n') {
+      // (the last segment: the spaces before it go instead)
+      while (at > 0 && At(s + 2 * (at - 1)) == u' ') {
+        at--;
+      }
+    }
+    std::memmove(s + 2 * at, s + 2 * end, 2 * (length - end));
+    std::memset(s + 2 * (at + length - end), 0, 2 * (end - at));
+    return;
+  }
+}
+
+// Per id: the prompt's button tag in its English text ("": none), found once.
+std::mutex g_tagsMutex;
+std::unordered_map<uint32_t, std::u16string> g_tags;
 
 }  // namespace
 
@@ -97,6 +144,34 @@ REX_HOOK_RAW(sub_837578C8) {
       ctx.r4.u64 = id;
     }
   }
+  uint32_t id = ctx.r4.u32;
+  // The English text first (once per id, once it's loaded), for the prompt's
+  // tag. (Map nodes stay put: the pointer outlives the lock.)
+  const std::u16string* tag = nullptr;
+  {
+    std::lock_guard lock(g_tagsMutex);
+    if (auto it = g_tags.find(id); it != g_tags.end()) {
+      tag = &it->second;
+    }
+  }
+  if (!tag) {
+    PPCContext saved = ctx;
+    ctx.r1.u64 = saved.r1.u32 - 0x200;
+    ctx.r3.u64 = kEnglish;
+    ctx.r4.u64 = id;
+    __imp__sub_837578C8(ctx, base);
+    uint32_t english = ctx.r3.u32;
+    ctx = saved;
+    if (english) {
+      std::lock_guard lock(g_tagsMutex);
+      tag = &g_tags.try_emplace(id, PromptTag(ng2::guest::Virtual(english))).first->second;
+    }
+  }
   __imp__sub_837578C8(ctx, base);
-  CutPrompt(ctx.r3.u32);
+  if (tag && !tag->empty() && ctx.r3.u32) {
+    CutSegment(ctx.r3.u32, *tag);
+  }
+  if (uint32_t ours = ng2::recomp_settings::RecompText(id)) {
+    ctx.r3.u64 = ours;  // RECOMP SETTINGS' texts, in every language
+  }
 }

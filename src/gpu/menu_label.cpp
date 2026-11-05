@@ -31,6 +31,33 @@ constexpr uint32_t kWidth = 520;
 constexpr uint32_t kBand = 90;
 constexpr uint64_t kAtlasHash = 0x3737e258b350fa36;   // 520x990, the entries' atlas
 constexpr uint64_t kLabelHash = 0xf8fb387ec4883ffc;   // 520x90, Xbox LIVE Marketplace
+// The other languages' atlases and Marketplace labels (Japanese keeps the
+// English label; Portuguese and Simplified Chinese use the English ones).
+constexpr uint64_t kOtherAtlases[] = {
+    0xd09f6e653f0c44df,  // Japanese
+    0x7ba39c742e71ab0f,  // German
+    0x0bf716435014362e,  // French
+    0xe34071b489a2d830,  // Spanish
+    0x4d6f66ffa5fd5392,  // Italian
+    0xeb91498647389ab9,  // Korean
+    0x298f406c6f391369,  // Traditional Chinese
+    0x24ae84c08b328168,  // Polish
+    0xccf0c19dcdd7dcb0,  // Russian
+};
+constexpr uint64_t kOtherLabels[] = {
+    0x4774ba1f7e83c512,  // German
+    0x9ab60305171f1595,  // French
+    0x6f37d128acb6719b,  // Spanish
+    0x214c148a5445623e,  // Italian
+    0xa75b722fe3c99c52,  // Korean
+    0x6a908aa5f96e35ce,  // Traditional Chinese
+    0x2bb41db4e7d2702a,  // Polish
+    0xef9883b77fd3105f,  // Russian
+};
+template <size_t N>
+bool OneOf(uint64_t hash, const uint64_t (&list)[N]) {
+  return std::find(std::begin(list), std::end(list), hash) != std::end(list);
+}
 constexpr std::string_view kText = "RECOMP SETTINGS";
 // The atlas's first entry, EXIT DEMO, isn't used by the retail menu: it
 // becomes the exit entry's label (src/recomp_settings.cpp).
@@ -43,7 +70,8 @@ constexpr uint8_t kClear = 255;  // outside the picture
 constexpr uint8_t kPlate = 0;    // the dark plate behind the words
 constexpr uint32_t kSpace = 16;  // columns between words
 
-std::vector<uint8_t> g_atlas;  // the atlas's pixels, once seen
+std::vector<uint8_t> g_atlas;  // the English atlas's pixels, once seen
+bool g_atlasMissing = false;   // another language's, and the English one not found
 
 struct Glyph {
   uint32_t band, begin, end;  // columns
@@ -205,6 +233,20 @@ bool Compose(std::string_view text, uint8_t* pixels) {
 // outlines brought to the header's levels and a soft glow around them.
 constexpr uint64_t kHeaderHash = 0x3e4f94c916758ea1;  // 172x58, OPTIONS
 constexpr uint32_t kHeaderWidth = 172, kHeaderHeight = 58;
+// The other languages' Options headers (Japanese and French keep the
+// English one; Korean's isn't a picture of these).
+struct OtherHeader {
+  uint32_t width;
+  uint64_t hash;
+};
+constexpr OtherHeader kOtherHeaders[] = {
+    {200, 0x90036f17f3198265},  // German
+    {200, 0x26dec7b46f1fc9a3},  // Spanish
+    {200, 0x615b10d2d40dfb86},  // Italian
+    {94, 0xb90e89d7dc897ad8},   // Traditional Chinese
+    {172, 0x880058569d76308a},  // Polish
+    {230, 0x6294a9b09f954a41},  // Russian
+};
 constexpr float kHeaderScale = 0.92f;  // header letters / atlas letters
 constexpr uint32_t kHeaderTop = 14, kHeaderMargin = 12;
 constexpr int kGlowRadius = 4;
@@ -215,6 +257,19 @@ constexpr float kGlowLevel = 70.0f;
 // left clear.
 constexpr uint64_t kInGameHeaderHash = 0xc16cba91cd852335;
 constexpr uint32_t kInGameHeaderWidth = 521;
+// The other languages' in-game headers (Portuguese and Simplified Chinese use
+// the English one).
+constexpr OtherHeader kOtherInGameHeaders[] = {
+    {600, 0x739f598f81405715},  // Japanese
+    {600, 0xa88403e6cece4b2f},  // German
+    {521, 0x106c505107bf91e2},  // French
+    {600, 0x05e5802de7f5b991},  // Spanish
+    {600, 0x200d43fdfe4ce181},  // Italian
+    {600, 0x1f011959bbf09487},  // Korean
+    {600, 0xa3210211f7dda0fa},  // Traditional Chinese
+    {600, 0x28278a87628524b5},  // Polish
+    {600, 0x477b96a506485d61},  // Russian
+};
 
 // Set by the menu, read where textures are made.
 std::atomic<bool> g_headerWanted = false;
@@ -313,25 +368,47 @@ LabelResult RewriteMenuLabel(uint32_t width, uint32_t height, uint8_t* pixels, u
     return LabelResult::kUnchanged;
   }
   uint64_t hash = XXH3_64bits(pixels, size_t(width) * height);
-  if (hash == kAtlasHash) {
-    g_atlas.assign(pixels, pixels + size_t(width) * height);
-    if (!Compose(kExitText, pixels)) {
+  bool english = hash == kAtlasHash;
+  if (english || OneOf(hash, kOtherAtlases)) {
+    if (english) {
+      g_atlas.assign(pixels, pixels + size_t(width) * height);
+    }
+    // (another language's: its own EXIT DEMO entry, in English letters)
+    if (g_atlas.empty() || !Compose(kExitText, pixels)) {
       return LabelResult::kUnchanged;
     }
     *rows = kBand;
     return LabelResult::kRewritten;
   }
-  if (hash != kLabelHash) {
+  if (hash != kLabelHash && !OneOf(hash, kOtherLabels)) {
     return LabelResult::kUnchanged;
   }
   if (g_atlas.empty()) {
-    return LabelResult::kRetry;
+    return g_atlasMissing ? LabelResult::kUnchanged : LabelResult::kRetry;
   }
   if (!Compose(kText, pixels)) {
     return LabelResult::kUnchanged;
   }
   *rows = kBand;
   return LabelResult::kRewritten;
+}
+
+bool NeedsEnglishAtlas(uint32_t width, uint32_t height, const uint8_t* pixels) {
+  return width == kWidth && height == kBand * std::size(kWords) && g_atlas.empty() &&
+         !g_atlasMissing && OneOf(XXH3_64bits(pixels, size_t(width) * height), kOtherAtlases);
+}
+
+bool SetEnglishAtlas(const uint8_t* pixels) {
+  size_t size = size_t(kWidth) * kBand * std::size(kWords);
+  if (XXH3_64bits(pixels, size) != kAtlasHash) {
+    return false;
+  }
+  g_atlas.assign(pixels, pixels + size);
+  return true;
+}
+
+void EnglishAtlasMissing() {
+  g_atlasMissing = true;
 }
 
 void SetRecompHeader(bool on) {
@@ -353,21 +430,30 @@ uint32_t MenuHeaderGeneration() {
 }
 
 bool IsMenuHeaderSize(uint32_t width, uint32_t height) {
-  return height == kHeaderHeight && (width == kHeaderWidth || width == kInGameHeaderWidth);
+  auto widthOf = [&](const OtherHeader& h) { return h.width == width; };
+  return height == kHeaderHeight &&
+         (width == kHeaderWidth || width == kInGameHeaderWidth ||
+          std::any_of(std::begin(kOtherHeaders), std::end(kOtherHeaders), widthOf) ||
+          std::any_of(std::begin(kOtherInGameHeaders), std::end(kOtherInGameHeaders), widthOf));
 }
 
 bool ReplaceMenuHeader(uint32_t width, uint32_t height, const uint8_t* pixels,
                        std::vector<uint8_t>& out, uint32_t& outWidth, MenuHeaderKind& kind) {
   kind = MenuHeaderKind::kNone;
-  if (height != kHeaderHeight || (width != kHeaderWidth && width != kInGameHeaderWidth)) {
+  if (!IsMenuHeaderSize(width, height)) {
     return false;
   }
   uint64_t hash = XXH3_64bits(pixels, size_t(width) * height);
-  if (hash == kHeaderHash) {
+  bool other = std::any_of(std::begin(kOtherHeaders), std::end(kOtherHeaders),
+                           [&](const OtherHeader& h) { return h.width == width && h.hash == hash; });
+  if (hash == kHeaderHash || other) {
     kind = MenuHeaderKind::kOptions;
     return g_headerWanted && !g_atlas.empty() && MakeHeader(out, outWidth);
   }
-  if (hash != kInGameHeaderHash) {
+  bool otherInGame =
+      std::any_of(std::begin(kOtherInGameHeaders), std::end(kOtherInGameHeaders),
+                  [&](const OtherHeader& h) { return h.width == width && h.hash == hash; });
+  if (hash != kInGameHeaderHash && !otherInGame) {
     return false;
   }
   kind = MenuHeaderKind::kInGame;

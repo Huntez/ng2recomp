@@ -17,6 +17,16 @@ enum class LabelResult { kUnchanged, kRewritten, kRetry };
 // rows: how many rows from the top were rewritten, for the mips.
 LabelResult RewriteMenuLabel(uint32_t width, uint32_t height, uint8_t* pixels, uint32_t* rows);
 
+// In the other languages the menu's own atlas and labels are the language's,
+// but the English atlas is loaded with them (one package for every language),
+// and its letters make RECOMP SETTINGS and EXIT GAME there too: true when this
+// is another language's atlas and the English one isn't known yet, then
+// SetEnglishAtlas with the English atlas's pixels (false: not it).
+// EnglishAtlasMissing: it wasn't found, so nothing waits for it.
+bool NeedsEnglishAtlas(uint32_t width, uint32_t height, const uint8_t* pixels);
+bool SetEnglishAtlas(const uint8_t* pixels);
+void EnglishAtlasMissing();
+
 // The Options screen's "OPTIONS" header (a 172x58 8-bit picture) reads
 // "RECOMP SETTINGS" while ours is open: a wider picture made from the
 // atlas's letters in the header's look. ReplaceMenuHeader gives it for the

@@ -254,3 +254,28 @@ opening pages of ours in the game's own Options menu (as the NGB recomp does).
 - src/gpu/menu_label.cpp: the Marketplace label picture (520x90, hash
   f8fb387ec4883ffc) is rebuilt as RECOMP SETTINGS from the entries' atlas
   (520x990, hash 3737e258b350fa36), letters cut at bright-pixel valleys.
+
+## Other languages (11-05)
+
+The game has ten text languages; its text lookup sub_837578C8(language, id)
+numbers them 0 Japanese, 1 English, 2 French, 3 German, 4 Italian, 5 Spanish,
+6 Traditional Chinese, 7 Korean, 8 Polish, 9 Russian (sub_8367F948 gives the
+current one; the console's user_language 9 and 10, Portuguese and Simplified
+Chinese, fall back to English).
+- RECOMP SETTINGS' texts: our strings are made once in guest memory, and the
+  lookup's hook (src/storage_prompt.cpp) hands them out for the Options
+  table's ids ours uses (spare ids from 0x20063, the categories, the play time
+  name, the note slot), in every language and with no room needed.
+- "Change Storage Device": per id, the English text is looked up once; where
+  it has "@[pad:..] Change Storage Device", that button's segment (tag to next
+  tag) is cut from whichever language's string is handed out.
+- The title menu's entries are pictures in every language: one 520x990 atlas
+  and a 520x90 Marketplace label per language, all in Main_Menu.spr, which is
+  loaded whole, so the English atlas is in memory whatever the language
+  (0x1037A000 with this game's packages). Another language's atlas has the
+  English one found by the hash of its first 4 KB as stored, decoded alike,
+  and its letters make RECOMP SETTINGS and EXIT GAME (src/gpu/menu_label.cpp
+  lists each language's atlas, label and Options header hashes). The in-game
+  list's header differs per language too (600x58 in most; its hashes are
+  listed as well). Korean's
+  Options header isn't one of these pictures and stays Korean.

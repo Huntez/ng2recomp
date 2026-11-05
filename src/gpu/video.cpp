@@ -261,8 +261,22 @@ struct Profile {
   uint64_t nanoseconds[size_t(Stage::kCount)] = {};
   uint64_t comparedBytes = 0, uploadedBytes = 0, frames = 0;
   uint64_t textureLookups = 0, hashedBytes = 0, texturesMade = 0, textureMadeBytes = 0;
+  // GPU time (timestamps): whole frames, their resolves and their present pass.
+  uint64_t gpuNs = 0, gpuResolveNs = 0, gpuPresentNs = 0, gpuFrames = 0;
   std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 } g_profile;
+
+// With NG2_PROFILE=1: GPU timestamps in each frame's command list, read once
+// its slot comes round again (its fence passed). Marks: the frame's start,
+// each resolve's start and end, the present pass's start, the frame's end.
+enum class GpuMark : uint8_t { kFrameStart, kResolveStart, kResolveEnd, kPresentStart, kFrameEnd };
+constexpr uint32_t kGpuMarks = 512;
+struct GpuTiming {
+  std::unique_ptr<RenderQueryPool> pool;
+  uint32_t count = 0;  // marks written this frame
+  std::vector<GpuMark> kinds;
+};
+GpuTiming g_gpuTiming[NUM_FRAMES];
 
 // log_hitches (or NG2_HITCHES=1): a frame that took over 25 ms, and well
 // over the one before, is logged with what the renderer spent its time on
@@ -497,6 +511,12 @@ void ReportProfile() {
               g_profile.uploadedBytes / 1048576.0, g_profile.textureLookups,
               g_profile.hashedBytes / 1048576.0, g_profile.texturesMade,
               g_profile.textureMadeBytes / 1048576.0);
+  if (g_profile.gpuFrames) {
+    double frames = double(g_profile.gpuFrames);
+    REXLOG_INFO("video: GPU {:.2f} ms a frame: resolves {:.2f}, present {:.2f} ({} frames timed)",
+                g_profile.gpuNs / 1e6 / frames, g_profile.gpuResolveNs / 1e6 / frames,
+                g_profile.gpuPresentNs / 1e6 / frames, g_profile.gpuFrames);
+  }
   g_profile = Profile{};
   g_profile.last = now;
 }
@@ -1274,8 +1294,12 @@ class QueuedCommandList final : public RenderCommandList {
   void buildTopLevelAS(const RenderAccelerationStructure*, RenderBufferReference, RenderBufferReference,
                        const RenderTopLevelASBuildInfo&) override { Unused("buildTopLevelAS"); }
   void discardTexture(const RenderTexture*) override { Unused("discardTexture"); }
-  void resetQueryPool(const RenderQueryPool*, uint32_t, uint32_t) override { Unused("resetQueryPool"); }
-  void writeTimestamp(const RenderQueryPool*, uint32_t) override { Unused("writeTimestamp"); }
+  void resetQueryPool(const RenderQueryPool* pool, uint32_t first, uint32_t count) override {
+    Op([=](RenderCommandList* l) { l->resetQueryPool(pool, first, count); });
+  }
+  void writeTimestamp(const RenderQueryPool* pool, uint32_t index) override {
+    Op([=](RenderCommandList* l) { l->writeTimestamp(pool, index); });
+  }
 };
 QueuedCommandList g_queuedCommandList;
 
@@ -1327,6 +1351,69 @@ void WaitForGPU() {
 
 RenderCommandList* CommandList();
 
+// GPU timing (NG2_PROFILE): a mark's index in this frame's pool, or none.
+uint32_t AllocGpuMark(GpuMark kind) {
+  GpuTiming& t = g_gpuTiming[g_frame];
+  if (!g_profile.enabled || !t.pool || t.count >= kGpuMarks) {
+    return UINT32_MAX;
+  }
+  t.kinds.push_back(kind);
+  return t.count++;
+}
+void WriteGpuMark(RenderCommandList* list, uint32_t frame, uint32_t index) {
+  if (index != UINT32_MAX) {
+    list->writeTimestamp(g_gpuTiming[frame].pool.get(), index);
+  }
+}
+void MarkGpu(GpuMark kind) {
+  uint32_t index = AllocGpuMark(kind);
+  if (index != UINT32_MAX) {
+    WriteGpuMark(CommandList(), g_frame, index);
+  }
+}
+
+// The slot's last frame's marks (its fence passed), into the profile.
+void ReadGpuTiming(uint32_t frame) {
+  GpuTiming& t = g_gpuTiming[frame];
+  if (!t.pool || t.count < 2) {
+    t.count = 0;
+    t.kinds.clear();
+    return;
+  }
+  t.pool->queryResults(t.count);  // (the written ones: the rest would fail the read)
+  const uint64_t* ns = t.pool->getResults();
+  uint64_t start = ns[0], resolveStart = 0, presentStart = 0, resolves = 0;
+  for (uint32_t i = 0; i < t.count; i++) {
+    switch (t.kinds[i]) {
+      case GpuMark::kResolveStart: resolveStart = ns[i]; break;
+      case GpuMark::kResolveEnd: resolves += ns[i] - resolveStart; break;
+      case GpuMark::kPresentStart: presentStart = ns[i]; break;
+      case GpuMark::kFrameEnd:
+        g_profile.gpuNs += ns[i] - start;
+        g_profile.gpuPresentNs += presentStart ? ns[i] - presentStart : 0;
+        g_profile.gpuResolveNs += resolves;
+        g_profile.gpuFrames++;
+        break;
+      default: break;
+    }
+  }
+  t.count = 0;
+  t.kinds.clear();
+}
+
+// The frame's pool reset and its start marked (once recording).
+void BeginGpuTiming(uint32_t frame) {
+  if (!g_profile.enabled) {
+    return;
+  }
+  GpuTiming& t = g_gpuTiming[frame];
+  if (!t.pool) {
+    t.pool = g_device->createQueryPool(kGpuMarks);
+  }
+  CommandList()->resetQueryPool(t.pool.get(), 0, kGpuMarks);
+  MarkGpu(GpuMark::kFrameStart);
+}
+
 // The frame's start (its slot's GPU work waited for, its upload memory and
 // freed textures reset) before anything is allocated or freed in it: a draw
 // first after a present would otherwise put a texture the previous frame
@@ -1346,6 +1433,7 @@ RenderCommandList* CommandList() {
       g_swapChainValid = g_swapChain->resize();
     }
     WaitForFrame(g_frame);
+    ReadGpuTiming(g_frame);
     g_boundFramebuffer = nullptr;
     g_uploads[g_frame].Reset();
     for (auto& texture : g_garbage[g_frame]) {
@@ -1363,6 +1451,7 @@ RenderCommandList* CommandList() {
       g_commandLists[g_frame]->begin();
     }
     g_recording = true;
+    BeginGpuTiming(g_frame);
   }
   return RenderThreadEnabled() ? static_cast<RenderCommandList*>(&g_queuedCommandList)
                                : g_commandLists[g_frame].get();
@@ -2297,6 +2386,42 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
                      : info.format == RenderFormat::R8G8B8A8_UNORM ? prompts::Kind::kRGBA8
                                                                     : prompts::Kind::kOther,
                      upload.data, bytes);
+      // Another language's title atlas: the English one (loaded with it, one
+      // package for every language) found in memory by its first 4 KB as
+      // stored, and decoded alike, for its letters (menu_label.cpp).
+      if (info.format == RenderFormat::R8_UNORM &&
+          NeedsEnglishAtlas(level.width, level.height, upload.data)) {
+        constexpr uint64_t kEnglishAtlasStart = 0x67d8418c93aeec2bull;
+        constexpr uint32_t kUsual = 0x1037A000;  // where it is with this game's packages
+        constexpr uint32_t kPhysicalSize = 512u << 20;
+        bool found = false;
+        auto tryAt = [&](uint32_t at) {
+          if (at + baseSize > kPhysicalSize ||
+              XXH3_64bits(guest::Physical(at), 4096) != kEnglishAtlasStart) {
+            return false;
+          }
+          std::vector<uint8_t> english(guest::Physical(at), guest::Physical(at) + baseSize);
+          EndianSwap(english.data(), english.size(), fetch.endianness);
+          std::vector<uint8_t> pixels(size_t(level.width) * level.height);
+          CopyLevel(fetch, info, level, english.data(), english.size(), pixels.data());
+          return SetEnglishAtlas(pixels.data());
+        };
+        found = tryAt(kUsual);
+        // Near this atlas first (the same package), then everywhere.
+        uint32_t here = uint32_t(fetch.base_address) << 12;
+        uint32_t nearFrom = here > (16u << 20) ? here - (16u << 20) : 0;
+        uint32_t nearTo = std::min(here + (16u << 20), kPhysicalSize);
+        for (uint32_t at = nearFrom & ~4095u; !found && at + 4096 <= nearTo; at += 4096) {
+          found = at != kUsual && tryAt(at);
+        }
+        for (uint32_t at = 0; !found && at + 4096 <= kPhysicalSize; at += 4096) {
+          found = at != kUsual && (at < nearFrom || at >= nearTo) && tryAt(at);
+        }
+        if (!found) {
+          REXLOG_WARN("video: the title menu's English letters weren't found: its labels stay");
+          EnglishAtlasMissing();
+        }
+      }
       if (info.format == RenderFormat::R8_UNORM &&
           RewriteMenuLabel(level.width, level.height, upload.data, &labelRows) ==
               LabelResult::kRetry &&
@@ -4064,8 +4189,12 @@ void Present(HostTexture* frontBuffer) {
 
   // The frame's pad read (NG2_LATENCY_LOG), to its present.
   int64_t inputNs = g_handedInputNs.exchange(0);
+  // GPU timing: the present pass's start and the frame's end (written below,
+  // with the real list).
+  uint32_t presentMark = AllocGpuMark(GpuMark::kPresentStart);
+  uint32_t endMark = AllocGpuMark(GpuMark::kFrameEnd);  // (each written once: see the resize path)
   // The swapchain's part, with the frame's real command list.
-  OnRenderThread([=](RenderCommandList* list) {
+  OnRenderThread([=](RenderCommandList* list) mutable {
     static int32_t loggedMode = -1;
     bool supported = g_swapChain->setPresentMode(RenderPresentMode(std::clamp(mode, 0, 3)));
     if (mode != loggedMode) {
@@ -4076,6 +4205,9 @@ void Present(HostTexture* frontBuffer) {
     if (!g_swapChainValid) {
       // Finish what was recorded, then rebuild the swapchain: here without
       // the thread, else by the game thread once the GPU is idle.
+      WriteGpuMark(list, frame, presentMark);
+      WriteGpuMark(list, frame, endMark);
+      presentMark = endMark = UINT32_MAX;  // (without the thread the list goes on below)
       list->end();
       g_queue->executeCommandLists(list, g_commandFences[frame].get());
       if (RenderThreadEnabled()) {
@@ -4131,6 +4263,7 @@ void Present(HostTexture* frontBuffer) {
         desc.colorAttachmentsCount = 1;
         framebuffer = g_device->createFramebuffer(desc);
       }
+      WriteGpuMark(list, frame, presentMark);
       list->barriers(RenderBarrierStage::GRAPHICS,
                      RenderTextureBarrier(target, RenderTextureLayout::COLOR_WRITE));
       list->setFramebuffer(framebuffer.get());
@@ -4162,6 +4295,7 @@ void Present(HostTexture* frontBuffer) {
       list->barriers(RenderBarrierStage::GRAPHICS,
                      RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
     }
+    WriteGpuMark(list, frame, endMark);
 
     list->end();
     if (g_swapChainValid) {
@@ -4677,6 +4811,11 @@ void DestroyHostDevice() {
     g_acquireSemaphores[i].reset();
   }
   g_renderSemaphores.clear();
+  for (GpuTiming& t : g_gpuTiming) {  // (before the device: they belong to it)
+    t.pool.reset();
+    t.count = 0;
+    t.kinds.clear();
+  }
   g_queue.reset();
   g_device.reset();
   g_interface.reset();
@@ -4787,6 +4926,10 @@ void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t d
   }
   FlushPendingDraw();
   BeginFrame();
+  struct ResolveSpan {
+    ResolveSpan() { MarkGpu(GpuMark::kResolveStart); }
+    ~ResolveSpan() { MarkGpu(GpuMark::kResolveEnd); }
+  } resolveSpan;
   if (destTexture) {
     // (texture objects hold CPU virtual addresses; the memo's fetch constants physical)
     ForgetFrameTextures(PhysicalAddress(uint32_t(ReadTextureFetch(destTexture).base_address) << 12));
