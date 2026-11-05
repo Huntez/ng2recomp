@@ -228,6 +228,13 @@ When reporting a graphics glitch, pressing **F7** while it is on screen records 
 drawing to `~/ng2-trace-<n>` (Linux) or `C:\Users\<you>\ng2-trace-<n>` (Windows): attach that
 folder, zipped. For a crash or a freeze, attach the log (`ng2.log`, above).
 
+## To do
+
+- Mouse support in the menus
+- A native audio engine
+- More gameplay settings
+- More visual settings
+
 ## Building from source
 
 The build needs the game's code, so it starts from your own disc image. Requirements: clang 20+,
