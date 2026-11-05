@@ -114,8 +114,6 @@ constexpr uint32_t kPostPasses = 0x84C55758;
 
 // Cheats.
 constexpr uint32_t kSave = 0x83BD2488;         // the save's state, while playing
-// and its two copies (sub_82458130 copies a new game's save into both)
-constexpr uint32_t kSaveCopies[] = {0x83BD248C, 0x83BD2490};
 constexpr uint32_t kEquipped = 0x85660E3E;     // the player's item in hand
 constexpr uint32_t kInventory = 0x30, kSlots = 128;
 
@@ -139,9 +137,30 @@ constexpr Item kLevel3[] = {
     {0x94, 100, 0x10}, {0xA0, 1, 0}, {0x05, 1, 0},
 };
 
-// Fills the inventory; stageStart: at a stage's start (else a new game's
-// save or a save loaded).
-void GiveAllWeaponsTo(uint32_t save, int32_t level, bool stageStart) {
+// The item's own slot (even used up: but for item 0, whose id an empty slot
+// also has), and the first empty one (count 0, as the game's).
+void FindSlots(uint32_t slots, uint16_t id, uint32_t* found, uint32_t* free) {
+  *found = *free = 0;
+  for (uint32_t s = 0; s < kSlots; s++) {
+    uint32_t slot = slots + 4 * s;
+    uint8_t count = *ng2::guest::Virtual(slot + 2);
+    if (Load16(slot) == id && (count > 0 || id != 0) && !*found) {
+      *found = slot;
+    } else if (count == 0 && !*free) {
+      *free = slot;
+    }
+  }
+}
+
+// Fills the live save's inventory; stageStart: at a stage's start (else a
+// new game's save or a save loaded). What it gives stays, as items found:
+// switched off, it gives no more.
+void GiveAllWeapons(bool stageStart) {
+  int32_t level = REXCVAR_GET(cheat_all_weapons);
+  uint32_t save = Load32(kSave);
+  if (level <= 0 || (save >> 16) != 0x859E) {
+    return;
+  }
   const Item* items = level == 1 ? kLevel1 : kLevel3;
   size_t count = level == 1 ? std::size(kLevel1) : std::size(kLevel3);
   uint32_t slots = save + kInventory;
@@ -150,30 +169,18 @@ void GiveAllWeaponsTo(uint32_t save, int32_t level, bool stageStart) {
     if (item.count == 0) {
       continue;
     }
+    uint32_t found, free;
+    FindSlots(slots, item.id, &found, &free);
     if (item.flags & 0x40) {
-      if (!stageStart || Load16(kEquipped) == item.id) {
-        continue;
-      }
-      for (uint32_t s = 0; s < kSlots; s++) {
-        uint32_t slot = slots + 4 * s;
-        if (Load16(slot) == item.id) {
-          Store16(slot, 0xFFFF), Store8(slot + 2, 0), Store8(slot + 3, 0);
-        }
+      // (Level 3: the plain Dragon Sword goes, for the True one, unless in
+      // hand)
+      if (stageStart && found && Load16(kEquipped) != item.id) {
+        Store16(found, 0xFFFF), Store8(found + 2, 0), Store8(found + 3, 0);
       }
       continue;
     }
     bool ammo = item.flags & 0x10;
     uint8_t flags = item.flags & 0xF;
-    // Its own slot (even emptied), else the first free one.
-    uint32_t free = 0, found = 0;
-    for (uint32_t s = 0; s < kSlots && !found; s++) {
-      uint32_t slot = slots + 4 * s;
-      if (Load16(slot) == item.id) {
-        found = slot;
-      } else if (Load16(slot) == 0xFFFF && !free) {  // the game's empty slot
-        free = slot;
-      }
-    }
     if (found) {
       uint8_t* bytes = ng2::guest::Virtual(found);
       bytes[2] = std::max(bytes[2], item.count);
@@ -182,21 +189,6 @@ void GiveAllWeaponsTo(uint32_t save, int32_t level, bool stageStart) {
       }
     } else if (free) {
       Store16(free, item.id), Store8(free + 2, item.count), Store8(free + 3, flags);
-    }
-  }
-}
-
-void GiveAllWeapons(bool stageStart) {
-  int32_t level = REXCVAR_GET(cheat_all_weapons);
-  uint32_t save = Load32(kSave);
-  if (level <= 0 || (save >> 16) != 0x859E) {
-    return;
-  }
-  GiveAllWeaponsTo(save, level, stageStart);
-  for (uint32_t copy : kSaveCopies) {
-    uint32_t at = Load32(copy);
-    if (at && at != save && at >= 0x40000000u && at < 0xA0000000u) {
-      GiveAllWeaponsTo(at, level, stageStart);
     }
   }
 }

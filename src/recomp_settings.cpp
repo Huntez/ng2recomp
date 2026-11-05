@@ -109,6 +109,10 @@ constexpr uint32_t kTable = 0x20000;
 // The categories' names, by category: ours first, the others blanked.
 constexpr uint32_t kCategoryNames[] = {0x00, 0x01, 0x97, 0x03, 0x02, 0x04, 0x05, 0x61};
 constexpr uint32_t kPlayTimeName = 0x2F;
+// A description of the game's we don't show (its Restore Defaults' long
+// one, 53 letters): All Weapons and Ninpo's warning, written over it.
+constexpr uint32_t kNoteSlot = 0x39;
+constexpr std::u16string_view kAllWeaponsNote = u"Weapons given stay in your saves, even turned off.";
 // The Music Test's track names: room for our texts.
 constexpr uint32_t kSpareFirst = 0x63, kSpareEnd = 0x97;
 constexpr uint32_t kSlotCount = 0x98;  // past the last index used
@@ -479,6 +483,7 @@ void Open() {
       WriteText(slots[kCategoryNames[i]], i < kPageCount ? kPages[i].name : u"");
     }
     WriteText(slots[kPlayTimeName], u"");
+    WriteText(slots[kNoteSlot], kAllWeaponsNote);
   }
   REXLOG_INFO("recomp settings: open");
 }
@@ -1479,7 +1484,11 @@ REX_HOOK_RAW(sub_836D6AC8) {
   }
   constexpr uint32_t kRestoreDescription = kTable | 0x9A, kEmpty = kTable | 0x34;
   uint32_t row = Load32(model + 8 * (Load32(model + 8) + 2));
-  SetDescriptionText(row == page->count ? kRestoreDescription : kEmpty);
+  bool allWeapons = row < page->count &&
+                    std::string_view(kSettings[page->rows[row].setting].name) == "cheat_all_weapons";
+  SetDescriptionText(row == page->count ? kRestoreDescription
+                     : allWeapons        ? (kTable | kNoteSlot)
+                                         : kEmpty);
   uint32_t shown = Load32(model);
   if (shown == 1) {
     Store32(model, 2);

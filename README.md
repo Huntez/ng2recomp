@@ -103,7 +103,8 @@ Settings** in the in-game menu (Back, under Save Method). Changes apply at once 
   refreshes, measured from the frames reaching the screen, so none waits in a queue on a 59.94 Hz
   screen; not for a variable-refresh display: G-Sync, FreeSync)
 - **Cheats**: infinite health, infinite ninpo, unlock costumes, all weapons and ninpo (Level 1 or
-  3), all crystal skulls, max HP and ninpo
+  3: given at a new game, a load or a stage's start; what it gives stays in the save, as items
+  found, when it's turned off), all crystal skulls, max HP and ninpo
 - **Interface**: HUD (shown, fade out when not fighting, hidden), hi-res font (sharper text above
   720p; from the next start), smooth HUD and menus, show FPS, button prompts (Auto follows the
   device in use; Xbox, PlayStation, Nintendo, Keyboard), mouse sensitivity
