@@ -83,18 +83,19 @@ with. This is the step that makes emulators stutter the first time an effect app
 
 ### What you need
 
-These files, from your own console or discs (the game asks for each on its first start):
+These files, from your own console or discs. The game asks for each on its first start.
 
-- **The game**, World release (`544307D5`), in any of these forms:
-  - a disc image (`.iso`);
-  - the Games on Demand package (the file in `544307D5/00007000`, next to its `.data` folder);
-  - an extracted copy (the folder with `default.xex`).
-- **Title Update 3** for the World release: the file `TU_1A461UL_000000G000000.00000000000O4`
-  (2,486,272 bytes; on a console in `Content/0000000000000000/544307D5/000B0000`), or the
-  `default.xexp` taken from it. It is required: the port is built for it, and checks it. The
-  Japanese release's Title Update 3 is for that disc and is refused.
-- **Optional: the downloadable content** you have (Mission Mode, the costume packs): the console's
-  `544307D5/00000002` folder. It can be added later, in the game folder's `dlc` folder.
+| What | File | |
+|---|---|---|
+| The game (World release, `544307D5`) as a disc image | `*.iso` | one of these three |
+| or as the Games on Demand package | the file in `544307D5/00007000` (named like `C1200E9B558D04454FA6`), with its `.data` folder next to it | |
+| or extracted | the folder with `default.xex` and the `.ng2` archives | |
+| Title Update 3 | `TU_1A461UL_000000G000000.00000000000O4` (2,486,272 bytes; on a console in `Content/0000000000000000/544307D5/000B0000`), or the `default.xexp` taken from it | required |
+| Downloadable content (Mission Mode, the costume packs) | the console's `544307D5/00000002` folder, with the packages in it | optional |
+
+Title Update 3 is required because the port is built for it and checks it. The Japanese release's
+Title Update 3 is for that disc and is refused. The DLC can also be added later, in the game
+folder's `dlc` folder.
 
 And a 64-bit PC with SSE4.2 (any from about 2009 on) and a GPU with Vulkan 1.3 drivers.
 
@@ -253,6 +254,7 @@ folder, zipped. For a crash or a freeze, attach the log (`ng2.log`, above).
 - A native audio engine
 - More gameplay settings
 - More visual settings
+- Rebindable controls in RECOMP SETTINGS (for now the keys are set in `ng2.toml`)
 
 ## Building from source
 
