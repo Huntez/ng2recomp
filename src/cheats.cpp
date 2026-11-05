@@ -171,7 +171,9 @@ void Ng2MissionDifficulties(PPCRegister& r11, PPCRegister& r31) {
 void CheatsFrame() {
   // Unlock Difficulties: the New Game paths shown (on the title menu: in
   // play the list is gone, and it is made again with the next title menu).
-  if (ng2::aspect::HudShown()) {
+  // Stopped once play starts (the HUD drawn, or its functions run with the HUD
+  // hidden).
+  if (ng2::aspect::HudShown() || HudInPlay()) {
     g_allPaths = 0;
   }
   if (g_allPaths >= 2 && g_allPaths <= 4) {

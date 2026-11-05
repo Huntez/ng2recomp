@@ -32,6 +32,7 @@ extracted game, and installs it. It is made for the **World release** (title ID 
 - Skip intro and skip any cutscene; cheats: infinite health and ninpo, unlock difficulties and
   costumes, all weapons and ninpo, all crystal skulls, max health and ninpo
 - Low input latency and frame pacing on the display's own refreshes (options)
+- Mods: game files replaced by files in a mods folder, nothing of the game's changed
 - Render pipelines made in the background and remembered between sessions, so new areas don't
   stutter; the game's movies decoded on the PC (FFmpeg)
 - **RECOMP SETTINGS** on the title menu and in the in-game menu; **EXIT GAME** on the title menu
@@ -164,6 +165,35 @@ Some settings have no menu entry; they go in `ng2.toml`:
 - `log_hitches = true`: log every frame that takes over 25 ms with what the renderer spent it on
 - `half_pixel_offset = false`: drop the console's half-pixel shift
 - `frame_pacing_phase = 5`: where in a refresh Frame Pacing Auto starts a frame (% of it)
+
+## Mods
+
+Mods replace the game's files: models, motions, effects, stages, text, sounds. They go in a `mods`
+folder in the data folder (`~/.local/share/ng2-recomp/mods`, `%LOCALAPPDATA%\NinjaGaiden2\mods`,
+or `userdata/mods` in portable mode), one folder per mod:
+
+    mods/
+      Ryu's New Look/
+        mod.toml
+        files/
+          char/ryu_b/ryu_b.gmd
+
+A file in `files/` replaces the game's file with the same path (`files/char/ryu_b/ryu_b.gmd` is
+Ryu's in-game model, `char\ryu_b\ryu_b.gmd`). The game loads it in place of the one in its
+archives, so a mod never changes the game folder: delete the mod's folder and the game is as it
+was. `mod.toml` is optional:
+
+    name = "Ryu's New Look"
+    version = "1.0"
+    enabled = true          # false turns the mod off
+
+    # One of the game's own files loaded in place of another (here his costume C model):
+    [replace]
+    'char/ryu_b/ryu_b.gmd' = 'char/ryu_c/ryu_c.gmd'
+
+Mods are read at start, in their folders' name order: when two replace the same file, the first
+one's is used. The log (`ng2.log`) lists each mod and the files it brings. To find which file to
+replace, set `log_file_loads = true` in `ng2.toml`: the log then names every file the game loads.
 
 ## Controls
 

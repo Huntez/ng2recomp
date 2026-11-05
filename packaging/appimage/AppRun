@@ -73,6 +73,12 @@ extract() {
 game=${NG2_GAME_DIR:-}
 if [ -z "$game" ] && [ -f "$config_dir/game_dir" ]; then
   game=$(cat "$config_dir/game_dir")
+  # The copy in the data folder, where the remembered folder is gone (a
+  # portable folder moved, a drive mounted elsewhere).
+  if [ ! -f "$game/default.xex" ] && [ -f "$data_dir/game/default.xex" ]; then
+    game=$data_dir/game
+    printf '%s\n' "$game" > "$config_dir/game_dir"
+  fi
 fi
 if [ -z "$game" ] || [ ! -f "$game/default.xex" ]; then
   command -v kdialog >/dev/null ||

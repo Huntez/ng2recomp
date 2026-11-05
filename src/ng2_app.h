@@ -9,6 +9,7 @@
 #include <utility>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/input/input_system.h>
 #include <rex/rex_app.h>
 #include <rex/system.h>
@@ -19,6 +20,7 @@
 #include "aspect.h"
 #include "dlc.h"
 #include "gameplay.h"
+#include "mods.h"
 #include "gpu/native_gpu.h"
 #include "gpu/video.h"
 #include "movie/movie.h"
@@ -115,7 +117,7 @@ class Ng2App : public rex::ReXApp {
     // next to default.xex the game's data wouldn't fit that code.
     std::error_code ec;
     if (std::filesystem::file_size(game_data_root() / "default.xexp", ec) != kTitleUpdate3Size) {
-      REXLOG_ERROR("No Title Update 3 default.xexp in {}", game_data_root().string());
+      REXLOG_ERROR("No Title Update 3 default.xexp in {}", rex::path_to_utf8(game_data_root()));
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
                                 "Title Update 3 is missing: its default.xexp must be next to "
                                 "default.xex in the game folder.");
@@ -123,7 +125,12 @@ class Ng2App : public rex::ReXApp {
     }
     ng2::movie::SetGameDataRoot(game_data_root());
     if (ng2::video::IsNativeRenderer() && !ng2::video::CreateHostDevice()) {
+      // (half made, nothing could draw: stopped here rather than at the first draw)
       REXLOG_ERROR("native renderer: cannot create the Vulkan device");
+      rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error,
+                                "Vulkan can't be started on this GPU (the log, ng2.log, says why). "
+                                "The game needs a GPU with Vulkan 1.3 drivers.");
+      std::_Exit(1);
     }
     ng2::recomp_settings::ApplyWindowAtStart();
   }
@@ -152,6 +159,10 @@ class Ng2App : public rex::ReXApp {
     } else {
       ng2::aspect::SetConstantWritable(true);
     }
+    // Mods: the folder next to the saves' (the data folder, or userdata/ in
+    // portable mode).
+    const std::filesystem::path data = user_data_root().parent_path();
+    ng2::mods::Activate(data / "mods", game_data_root(), data / "mods-cache");
     const char* path = std::getenv("NG2_DUMP_IMAGE");
     if (!path || !*path) {
       return;

@@ -324,3 +324,28 @@ address = 0x837569C4
 name = "Ng2MaxNinpo"
 registers = ["r10"]
 after_instruction = true
+
+# Mods (src/mods.cpp): the loader's request for a file, at the test of its
+# load-loose byte (r3 the file id, r10 the byte).
+[[midasm_hook]]
+address = 0x823D6228
+name = "Ng2ModFileRequest"
+registers = ["r3", "r10"]
+
+# The loose load just before its CreateFile (r3 the path).
+[[midasm_hook]]
+address = 0x823D6A64
+name = "Ng2ModOpenPath"
+registers = ["r3"]
+
+# A file's size before its rounding to 2 KB (r11 the size, r31 the id).
+[[midasm_hook]]
+address = 0x823D6478
+name = "Ng2ModFileSize"
+registers = ["r11", "r31"]
+
+# load_img.bin loaded and its offsets made pointers.
+[[midasm_hook]]
+address = 0x8366C208
+name = "Ng2ModFileTable"
+registers = ["r1"]

@@ -1325,6 +1325,18 @@ void WaitForGPU() {
   }
 }
 
+RenderCommandList* CommandList();
+
+// The frame's start (its slot's GPU work waited for, its upload memory and
+// freed textures reset) before anything is allocated or freed in it: a draw
+// first after a present would otherwise put a texture the previous frame
+// still uses in this slot's list, freed at once by the start that follows.
+void BeginFrame() {
+  if (!g_recording) {
+    CommandList();
+  }
+}
+
 RenderCommandList* CommandList() {
   if (!g_recording) {
     if (g_resizeRequested.load()) {
@@ -3045,6 +3057,17 @@ void TakeMadePipelines() {
   }
 }
 
+// fopen by a path, which on Windows may hold any character (path::string()
+// there is the ANSI code page, and throws for a name it can't hold).
+FILE* OpenFile(const std::filesystem::path& path, const char* mode) {
+#if defined(_WIN32)
+  std::wstring wide(mode, mode + std::strlen(mode));
+  return _wfopen(path.c_str(), wide.c_str());
+#else
+  return std::fopen(path.c_str(), mode);
+#endif
+}
+
 // A new pipeline into the list file (not the debug shader's).
 void ListPipeline(uint64_t hash, const PipelineKey& key) {
   if (g_pipelineListPath.empty() || key.pixelShader == 0 ||
@@ -3052,7 +3075,7 @@ void ListPipeline(uint64_t hash, const PipelineKey& key) {
     return;
   }
   bool fresh = !std::filesystem::exists(g_pipelineListPath);
-  if (FILE* f = std::fopen(g_pipelineListPath.string().c_str(), "ab")) {
+  if (FILE* f = OpenFile(g_pipelineListPath, "ab")) {
     if (fresh) {
       uint32_t header[3] = {kPipelineListMagic, kPipelineListVersion, uint32_t(sizeof(key))};
       std::fwrite(header, sizeof(header), 1, f);
@@ -3070,7 +3093,7 @@ RenderShader* HostShader(const ShaderCacheEntry* entry);
 // playing the game at the default 2x antialiasing) is only read, its
 // multisampled pipelines moved to the antialiasing in use.
 uint32_t AskForListedPipelines(const std::filesystem::path& path, bool seed) {
-  FILE* f = std::fopen(path.string().c_str(), "rb");
+  FILE* f = OpenFile(path, "rb");
   if (!f) {
     return 0;
   }
@@ -3078,7 +3101,7 @@ uint32_t AskForListedPipelines(const std::filesystem::path& path, bool seed) {
   if (std::fread(header, sizeof(header), 1, f) != 1 || header[0] != kPipelineListMagic ||
       header[1] != kPipelineListVersion || header[2] != sizeof(PipelineKey)) {
     std::fclose(f);
-    REXLOG_WARN("video: {} is from another version; {}", path.string(),
+    REXLOG_WARN("video: {} is from another version; {}", rex::path_to_utf8(path),
                 seed ? "not used" : "starting a new one");
     if (!seed) {
       std::filesystem::remove(path);
@@ -3093,7 +3116,7 @@ uint32_t AskForListedPipelines(const std::filesystem::path& path, bool seed) {
     if (whole != size) {
       std::fclose(f);
       std::filesystem::resize_file(path, whole);
-      f = std::fopen(path.string().c_str(), "rb");
+      f = OpenFile(path, "rb");
       if (!f || std::fseek(f, sizeof(header), SEEK_SET) != 0) {
         if (f) {
           std::fclose(f);
@@ -3340,6 +3363,7 @@ void FlushPendingDraw() {
 void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t count,
           bool indexed, uint32_t startIndex, const InlineData* inlineData = nullptr) {
   StageTimer timer(Stage::kDraw);
+  BeginFrame();
   auto findShader = [](uint32_t object) -> GuestShader* {
     auto it = g_guestShaders.find(object);
     return it != g_guestShaders.end() ? it->second.get() : nullptr;
@@ -4651,6 +4675,7 @@ void RunClear(uint32_t device, uint32_t rectCount, const int32_t (*rects)[4], ui
     return;
   }
   FlushPendingDraw();
+  BeginFrame();
   HostTexture* target = GetSurface(guest::Load32(device + guest::device::kRenderTargets), false);
   HostTexture* depth = GetSurface(guest::Load32(device + guest::device::kDepthStencil), true);
   // 360 flags: 0x1-0x8 render targets 0-3, 0x10 Z, 0x20 stencil.
@@ -4745,6 +4770,7 @@ void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t d
     return;
   }
   FlushPendingDraw();
+  BeginFrame();
   if (destTexture) {
     // (texture objects hold CPU virtual addresses; the memo's fetch constants physical)
     ForgetFrameTextures(PhysicalAddress(uint32_t(ReadTextureFetch(destTexture).base_address) << 12));
@@ -4999,6 +5025,7 @@ void RunSwap(uint32_t device, uint32_t frontBuffer) {
     return;
   }
   FlushPendingDraw();
+  BeginFrame();
   UpdateGammaTable(device);
   HostTexture* front = nullptr;
   if (frontBuffer) {

@@ -802,6 +802,12 @@ bool ConfigurePaths(rex::PathConfig& paths) {
     if (std::getline(in, line)) {
       paths.game_data_root = fs::path(std::u8string(line.begin(), line.end()));
       from_setup = true;
+      // The copy in the data folder, where the remembered folder is gone (a
+      // portable folder moved, a drive given another letter).
+      if (!IsGameFolder(paths.game_data_root) && IsGameFolder(data / "game")) {
+        paths.game_data_root = data / "game";
+        std::ofstream(remembered, std::ios::trunc) << Utf8(paths.game_data_root) << '\n';
+      }
     }
   }
   if (!IsGameFolder(paths.game_data_root)) {

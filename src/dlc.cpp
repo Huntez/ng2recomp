@@ -93,15 +93,15 @@ void InstallPackages(rex::system::KernelState* kernel_state, const fs::path& gam
     }
     auto result = content->InstallContent(entry.path());
     if (result != X_ERROR_SUCCESS) {
-      REXLOG_ERROR("DLC: cannot install {} ({:08X})", entry.path().string(), result);
+      REXLOG_ERROR("DLC: cannot install {} ({:08X})", rex::path_to_utf8(entry.path()), result);
       fs::remove(marker, ec);  // tried again next time, over the partial copy
       continue;
     }
     std::ofstream out(marker);
     if (!(out << stamp << '\n')) {
-      REXLOG_WARN("DLC: cannot write {}; it will be installed again", marker.string());
+      REXLOG_WARN("DLC: cannot write {}; it will be installed again", rex::path_to_utf8(marker));
     }
-    REXLOG_INFO("DLC: installed {}", entry.path().filename().string());
+    REXLOG_INFO("DLC: installed {}", rex::path_to_utf8(entry.path().filename()));
   }
 }
 

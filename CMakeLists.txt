@@ -47,6 +47,7 @@ set(NG2_SOURCES
     src/cheats.cpp
     src/frame_wait.cpp
     src/dlc.cpp
+    src/mods.cpp
     src/gameplay.cpp
     src/aspect.cpp
     src/windows_setup.cpp

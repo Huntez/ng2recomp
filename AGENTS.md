@@ -10,7 +10,8 @@ the rules that keep a test run from disturbing the machine it runs on.
   (`recomp_settings.cpp`: RECOMP SETTINGS on the title menu and in the in-game menu, the title
   menu's entries; `gpu/menu_label.cpp`: the pictures of their labels and the Options header), the
   frame-rate counter (`perf_overlay.cpp`), movies on the host (`src/movie/`), the scripted
-  controller for tests (`script_input.h`).
+  controller for tests (`script_input.h`), mods (`mods.cpp`: game files replaced through the
+  game's own loose-file loading; how it works is in its header comment).
 - `generated/default/`: the recompiled game code, generated at build time from the player's
   `default.xex`. **Never commit it**, nor the game's data (`game_files/`, `*.iso`, `*.xex`, saves,
   captures of the game's pictures).

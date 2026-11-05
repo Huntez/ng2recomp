@@ -33,6 +33,7 @@
 
 #include <fmt/format.h>
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc/func.h>
@@ -290,6 +291,8 @@ bool g_open = false;
 // The settings changed while open, as set (fullscreen is applied later, on
 // the UI thread): saved on closing.
 std::map<std::string, std::string, std::less<>> g_written;
+bool g_inGameOurs = false;  // our settings are in the in-game menu's list
+bool g_unsaved = false;     // in game: a change made this press, saved at its end
 // Guest memory ours replaces: the game's values in the menu model for our
 // pages (put back on closing), and the widgets our list widgets are made
 // over (put back before the page is next built: the closing screen still
@@ -532,7 +535,7 @@ void SaveSettings() {
   for (const std::string& line : lines) {
     out << line << '\n';
   }
-  REXLOG_INFO("recomp settings: saved to {}", g_configPath.string());
+  REXLOG_INFO("recomp settings: saved to {}", rex::path_to_utf8(g_configPath));
 }
 
 // The game's texts and menu values back, once nothing draws ours: on the
@@ -693,6 +696,11 @@ void SetSetting(const char* name, const std::string& text) {
     return;
   }
   g_written[name] = text;
+  // In game, each press's changes are saved at its end (the input handler):
+  // the menu can close without Back (Start, the window closed).
+  if (g_inGameOurs) {
+    g_unsaved = true;
+  }
   if (IsWindowSetting(name)) {
     g_windowChanged = true;  // applied once the row's settings are all set
     return;
@@ -1601,7 +1609,6 @@ uint32_t g_categoryRows[kPageCount] = {}, g_restoreRow = 0, g_emptyRows[kEmptyRo
 uint32_t g_category = 0;       // the category shown
 bool g_inPage = false;         // the cursor is in its settings (else on the categories)
 uint32_t g_gameRows[kGameRows] = {};
-bool g_inGameOurs = false;      // our settings are in the list
 uint32_t g_suppress = 0;        // directions (bit per sub_823E3828 direction) and Confirm (bit 4)
 
 uint32_t ArenaAlloc(uint32_t size) {
@@ -2214,6 +2221,10 @@ REX_HOOK_RAW(sub_823E8720) {
     if (g_windowChanged) {
       ScheduleWindow();
     }
+    if (g_unsaved && !g_configPath.empty()) {
+      SaveSettings();  // (once a press; g_written keeps them for Back's save too)
+    }
+    g_unsaved = false;
     NotifyCursor(ctx, base, cursor);
     PushValues(ctx, base);
     return;

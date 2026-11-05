@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 
 extern "C" {
@@ -380,10 +381,12 @@ std::unique_ptr<HostMovie> HostMovie::Open(const std::filesystem::path& path, bo
   std::unique_ptr<HostMovie> movie(new HostMovie());
   State& s = *movie->state_;
   s.loop = loop;
-  s.name = path.filename().string();
-  if (int error = avformat_open_input(&s.format, path.string().c_str(), nullptr, nullptr);
-      error < 0) {
-    REXLOG_ERROR("movie: cannot open {}: {}", path.string(), AvError(error));
+  // UTF-8, as FFmpeg takes file names on Windows too (path::string() there is
+  // the ANSI code page, and throws for a name it can't hold).
+  const std::string file = rex::path_to_utf8(path);
+  s.name = rex::path_to_utf8(path.filename());
+  if (int error = avformat_open_input(&s.format, file.c_str(), nullptr, nullptr); error < 0) {
+    REXLOG_ERROR("movie: cannot open {}: {}", file, AvError(error));
     return nullptr;
   }
   avformat_find_stream_info(s.format, nullptr);
@@ -400,7 +403,7 @@ std::unique_ptr<HostMovie> HostMovie::Open(const std::filesystem::path& path, bo
     s.constantRate = av_cmp_q(rate, s.format->streams[s.videoStream]->r_frame_rate) == 0;
   }
   if (audio && AudioEnabled() &&
-      avformat_open_input(&s.audioFormat, path.string().c_str(), nullptr, nullptr) >= 0 &&
+      avformat_open_input(&s.audioFormat, file.c_str(), nullptr, nullptr) >= 0 &&
       avformat_find_stream_info(s.audioFormat, nullptr) >= 0) {
     s.audioStream = av_find_best_stream(s.audioFormat, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
     if (s.audioStream >= 0 && (s.audio = s.OpenDecoder(s.audioFormat, s.audioStream)) &&

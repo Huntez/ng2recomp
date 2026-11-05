@@ -177,7 +177,7 @@ void GiveAllWeapons(bool stageStart) {
       // (Level 3: the plain Dragon Sword goes, for the True one, unless in
       // hand)
       if (stageStart && found && Load16(kEquipped) != item.id) {
-        Store16(found, 0xFFFF), Store8(found + 2, 0), Store8(found + 3, 0);
+        Store16(found, 0), Store8(found + 2, 0), Store8(found + 3, 0);  // (empty, as the game's)
       }
       continue;
     }
@@ -468,11 +468,14 @@ void Ng2SkullCountR11(PPCRegister& r11) {
 // so the item is kept); ninpo +0xC28 current, +0xC2A most). With the cheat
 // on, the save's own most values are put back after it, and the currents
 // kept within them (a save point's refill stays full).
+// The save is kept as long as the character was made with the cheat on, even
+// if it was turned off since (else its full bars would go into the save).
 constexpr uint32_t kSaveHealth = 0xC04, kSaveSegment = 0xC08, kSaveNinpo = 0xC28;
+std::atomic<bool> g_maxMade{false};
 REX_EXTERN(__imp__sub_83755D20);
 REX_HOOK_RAW(sub_83755D20) {
   uint32_t save = ctx.r3.u32;
-  if (!REXCVAR_GET(cheat_max_health_ninpo) || (save >> 16) != 0x859E) {
+  if (!g_maxMade.load() || (save >> 16) != 0x859E) {  // (the character's own maxima otherwise)
     __imp__sub_83755D20(ctx, base);
     return;
   }
@@ -491,6 +494,7 @@ REX_HOOK_RAW(sub_83755D20) {
 // Max HP and Ninpo: the upgrades as a stage's character is made from the
 // save (just loaded).
 void Ng2MaxHealth(PPCRegister& r10) {
+  g_maxMade.store(REXCVAR_GET(cheat_max_health_ninpo));
   if (REXCVAR_GET(cheat_max_health_ninpo)) {
     r10.u64 = 3600;
   }
