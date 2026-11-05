@@ -7,6 +7,5 @@
 namespace ng2::gameplay {
 
 bool SkipIntro();
-bool PauseInBackground();
 
 }  // namespace ng2::gameplay

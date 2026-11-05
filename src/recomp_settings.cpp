@@ -168,7 +168,6 @@ constexpr Setting kSettings[] = {
     {u"Unlock Costumes", {u"On", u"Off"}, 2, "cheat_unlock_costumes", Kind::kOnOff},
     {u"Skip Intro", {u"On", u"Off"}, 2, "skip_intro", Kind::kOnOff},
     {u"Skip Cutscenes", {u"On", u"Off"}, 2, "skip_cutscenes", Kind::kOnOff},
-    {u"Pause in Background", {u"On", u"Off"}, 2, "pause_in_background", Kind::kOnOff},
     {u"Aspect Ratio", {u"16:9", u"16:10", u"21:9", u"32:9", u"4:3"}, 5, "aspect_ratio", Kind::kAspect},
     // The prompts follow the device in use (gpu/prompts.cpp).
     {u"Button Prompts", {u"Auto", u"Xbox", u"PlayStation", u"Nintendo", u"Keyboard"}, 5,
@@ -219,34 +218,60 @@ struct Page {
   uint32_t restore;  // the Restore Defaults row's widget
   std::array<PageRow, 8> rows;
   uint32_t count;
+  bool ourRestore = false;  // its Restore Defaults row made by us (the page has none)
+  // The page the screen shows (its builder's, the menu model's page, its
+  // cursor and values), when not the one the Options loop runs (page): 0, the
+  // same.
+  uint32_t view = 0;
 };
+constexpr uint32_t ViewOf(const Page& page) {
+  return page.view ? page.view : page.page;
+}
 // Every row is an arrow list made in our own memory (g_titleRows, one per
 // setting), so a page's own layout doesn't limit what it holds: the game's
 // page objects give their builder, their Restore Defaults row and their
 // slot in the menu model.
-constexpr uint32_t kTitleRowsSize = (std::size(kSettings) * kListSize + 0xFFF) & ~0xFFFu;
+// (and a Restore Defaults row after them, for a page without one)
+constexpr uint32_t kRestoreSize = 0xE0;
+constexpr uint32_t kOurRestore = (uint32_t(std::size(kSettings)) * kListSize + 15) & ~15u;
+constexpr uint32_t kTitleRowsSize = (kOurRestore + kRestoreSize + 0xFFF) & ~0xFFFu;
 constexpr PageRow Row(uint32_t setting) {
   return {setting, setting * kListSize, true, true, true};
 }
 constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
-     {{Row(0), Row(3), Row(1), Row(22), Row(2), Row(21), Row(23)}},
-     7},
-    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(15), Row(6), Row(29)}}, 5},
+     {{Row(0), Row(3), Row(1), Row(21), Row(2), Row(20)}},
+     6},
+    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28)}}, 5},
     // (its name in the game's third category name, which holds 7 letters)
     {u"Cheats", 3, 0x13E0, 0x1300,
-     {{Row(8), Row(9), Row(10), Row(11), Row(25), Row(26), Row(27)}},
-     7},
-    {u"Interface", 4, 0x26A0, 0xAA0, {{Row(20), Row(24), Row(7), Row(16), Row(17)}}, 5},
+     {{Row(8), Row(9), Row(11), Row(24), Row(25), Row(26)}},
+     6},
+    {u"Interface", 4, 0x26A0, 0xAA0,
+     {{Row(19), Row(23), Row(22), Row(7), Row(15), Row(16)}},
+     6},
     // The Audio Settings page (5, builder sub_836D54F8, which stores its
     // page number at +12; Restore Defaults at +0x1380).
-    {u"Extras", 5, 0x1460, 0x1380,
-     {{Row(12), Row(13), Row(18), Row(19), Row(14), Row(28)}},
-     6},
+    {u"Extras", 5, 0x1460, 0x1380, {{Row(12), Row(13), Row(17), Row(18)}}, 4},
+    // Shown on the Copyright Information page (6: what the category list
+    // shows for its sixth category; builder sub_836D57B8), run as page 11
+    // (the Options loop runs page 6 inline, 11 through sub_823E7C40); no
+    // Restore Defaults of its own: ours.
+    {u"Gameplay", 11, 0x400, kOurRestore, {{Row(27), Row(10)}}, 2, true, 6},
 };
-static_assert(std::size(kSettings) * kListSize <= kTitleRowsSize);
+static_assert(kOurRestore + kRestoreSize <= kTitleRowsSize);
 constexpr uint32_t kPageCount = std::size(kPages);
 constexpr std::u16string_view kRestoreText = u"Restore Defaults";
+
+// The page the screen shows for one the Options loop runs.
+uint32_t ShownPage(uint32_t page) {
+  for (const Page& p : kPages) {
+    if (p.page == page) {
+      return ViewOf(p);
+    }
+  }
+  return page;
+}
 
 const Page* PageOf(uint32_t page) {
   for (const Page& p : kPages) {
@@ -1019,8 +1044,18 @@ bool MakeTitleRowsOnce(PPCContext& ctx, uint8_t* base) {
   return g_titleRows != 0;
 }
 
+// A Restore Defaults row in our memory, as the pages' constructors make
+// theirs (sub_836A5558): its class, and a sprite at +0x40.
+constexpr uint32_t kRestoreVtable = 0x822868F8;
+void MakeRestore(PPCContext& ctx, uint8_t* base, uint32_t widget) {
+  std::memset(ng2::guest::Virtual(widget), 0, kRestoreSize);
+  Store32(widget, kRestoreVtable);
+  Store32(widget + 0x40 + 0x74, 0);
+  CallGuest(ctx, base, __imp__sub_83704630, {widget + 0x40});
+}
+
 bool HasOurRows(const Page& page) {
-  bool ours = false;
+  bool ours = page.ourRestore;
   for (uint32_t i = 0; i < page.count; i++) {
     ours |= page.rows[i].ours;
   }
@@ -1077,12 +1112,15 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
     y += float(CallGuestFloat(ctx, base, row.list ? __imp__sub_836CF198 : __imp__sub_836CF3B0,
                               {widget}));
   }
-  uint32_t restore = object + page.restore;
+  uint32_t restore = (page.ourRestore ? g_titleRows : object) + page.restore;
+  if (page.ourRestore) {
+    MakeRestore(ctx, base, restore);
+  }
   place(restore);
   CallGuest(ctx, base, __imp__sub_836D03E8, {object, TextId(kRestoreText), restore});
   // The rows' values in the model, as the handler will keep them; the
   // game's are put back on closing.
-  uint32_t slots = kModelValues + 0x40 * page.page;
+  uint32_t slots = kModelValues + 0x40 * ViewOf(page);
   uint8_t* bytes = ng2::guest::Virtual(slots);
   g_savedGuest.emplace_back(slots, std::vector<uint8_t>(bytes, bytes + 0x40));
   for (uint32_t i = 0; i < 8; i++) {
@@ -1096,7 +1134,14 @@ void BuildPage(PPCContext& ctx, uint8_t* base, const Page& page, uint32_t object
 // then ours.
 void Build(PPCContext& ctx, uint8_t* base, void (*builder)(PPCContext&, uint8_t*), uint32_t number) {
   uint32_t object = ctx.r3.u32, model = ctx.r4.u32;
-  const Page* page = PageOf(number);
+  const Page* page = nullptr;
+  for (const Page& p : kPages) {
+    page = ViewOf(p) == number ? &p : page;
+  }
+  if (!page) {
+    builder(ctx, base);
+    return;
+  }
   if (!g_open) {
     PutBackGame();
   }
@@ -1115,6 +1160,13 @@ void Build(PPCContext& ctx, uint8_t* base, void (*builder)(PPCContext&, uint8_t*
   g_buildingSize = page->size;
   builder(ctx, base);
   g_building = 0;
+  if (page->view) {
+    // Its page and the one before, as the settings pages' builders store
+    // them (+12, +8; the Copyright Information page's doesn't): each row
+    // appended takes them, for its cursor and value in the menu model.
+    Store32(object + 8, page->view - 1);
+    Store32(object + 12, page->view);
+  }
   if (HasOurRows(*page) && !MakeTitleRowsOnce(ctx, base)) {
     REXLOG_WARN("recomp settings: no memory for the {} page's rows", ng2::guest::Load32(kPage));
     return;
@@ -1146,7 +1198,7 @@ void RefreshWindowSizes(PPCContext& ctx, uint8_t* base) {
 // Back returns to the category list.
 void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
   using ng2::guest::Load32;
-  uint32_t number = Load32(kPage);
+  uint32_t number = ViewOf(page);  // (the page shown)
   uint32_t rowCount = page.count + 1;
   uint32_t cursorAddress = kCursors + 4 * number;
   uint32_t cursor = std::min(Load32(cursorAddress), rowCount - 1);
@@ -1210,7 +1262,7 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
     ScheduleWindow();
   }
   CallGuest(ctx, base, __imp__sub_836A4B90,
-            {kMenuModel, Load32(kLastPage), number, kCursors, StoreValues(ctx, &page), 8});
+            {kMenuModel, ShownPage(Load32(kLastPage)), number, kCursors, StoreValues(ctx, &page), 8});
 }
 
 }  // namespace
@@ -1219,7 +1271,7 @@ void RunPage(PPCContext& ctx, uint8_t* base, const Page& page) {
 // game's as they were.
 REX_EXTERN(__imp__sub_823E59A0);
 REX_HOOK_RAW(sub_823E59A0) {
-  constexpr uint32_t kSaved = kPageCount + 1;
+  constexpr uint32_t kSaved = 12;  // (pages up to 11)
   uint32_t saved[kSaved];
   for (uint32_t i = 0; i < kSaved; i++) {
     saved[i] = ng2::guest::Load32(kCursors + 4 * i);
@@ -1279,7 +1331,7 @@ REX_HOOK_RAW(sub_823E5D88) {
     Store32(kCursors, moved);
   }
   CallGuest(ctx, base, __imp__sub_836A4B90,
-            {kMenuModel, Load32(kLastPage), page, kCursors, StoreValues(ctx, nullptr), 8});
+            {kMenuModel, ShownPage(Load32(kLastPage)), ShownPage(page), kCursors, StoreValues(ctx, nullptr), 8});
 }
 
 // The pages' builders.
@@ -1298,6 +1350,42 @@ REX_HOOK_RAW(sub_836D2B10) {
 REX_EXTERN(__imp__sub_836D43C8);
 REX_HOOK_RAW(sub_836D43C8) {
   Build(ctx, base, __imp__sub_836D43C8, 4);  // page 4's
+}
+REX_EXTERN(__imp__sub_836D57B8);
+REX_HOOK_RAW(sub_836D57B8) {
+  // (also its vtable's slot 12, which the page's teardown calls: only the
+  // build, from sub_836CFF00, makes our rows)
+  constexpr uint32_t kFromBuild = 0x836CFF54;
+  if (uint32_t(ctx.lr) != kFromBuild) {
+    __imp__sub_836D57B8(ctx, base);
+    return;
+  }
+  Build(ctx, base, __imp__sub_836D57B8, 6);  // Copyright Information
+}
+// The Copyright Information page's own methods (its vtable 0x82286EC0,
+// slots 13-15: its text, drawn and scrolled): while it shows ours, those of
+// a plain page (0x82286F78's: 1, nothing, 0).
+REX_EXTERN(__imp__sub_836D57C0);
+REX_HOOK_RAW(sub_836D57C0) {
+  if (g_open) {
+    ctx.r3.u64 = 1;
+    return;
+  }
+  __imp__sub_836D57C0(ctx, base);
+}
+REX_EXTERN(__imp__sub_836D5898);
+REX_HOOK_RAW(sub_836D5898) {
+  if (!g_open) {
+    __imp__sub_836D5898(ctx, base);
+  }
+}
+REX_EXTERN(__imp__sub_836D5970);
+REX_HOOK_RAW(sub_836D5970) {
+  if (g_open) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_836D5970(ctx, base);
 }
 REX_EXTERN(__imp__sub_836D54F8);
 REX_HOOK_RAW(sub_836D54F8) {
@@ -1344,6 +1432,10 @@ REX_HOOK_RAW(sub_823E5FE0) {
 REX_EXTERN(__imp__sub_823E7710);
 REX_HOOK_RAW(sub_823E7710) {
   Handle(ctx, base, __imp__sub_823E7710);
+}
+REX_EXTERN(__imp__sub_823E7C40);
+REX_HOOK_RAW(sub_823E7C40) {
+  Handle(ctx, base, __imp__sub_823E7C40);  // Screen Settings (page 11)
 }
 
 // The button hints under a page (sub_836D6898(&flags): 0x10 Change Storage

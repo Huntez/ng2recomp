@@ -17,10 +17,6 @@
 //
 // Skip Intro: the boot movie (NinjaVI.wmv, the first movie played) isn't
 // opened by the host movie player (src/movie), so it ends at once.
-//
-// Pause in Background: on losing focus the game is sent the notification
-// the Guide sends when it opens (XN_SYS_UI = 1), which pauses it, and 0 on
-// regaining focus (ng2_app.h).
 
 #include "gameplay.h"
 
@@ -37,8 +33,6 @@
 REXCVAR_DEFINE_BOOL(skip_intro, false, "Gameplay", "Skip the opening movie at launch");
 REXCVAR_DEFINE_BOOL(skip_cutscenes, false, "Gameplay",
                     "Any cutscene can be skipped, seen or not");
-REXCVAR_DEFINE_BOOL(pause_in_background, false, "Gameplay",
-                    "Pause the game while its window isn't focused");
 
 namespace {
 
@@ -103,10 +97,6 @@ namespace ng2::gameplay {
 
 bool SkipIntro() {
   return REXCVAR_GET(skip_intro);
-}
-
-bool PauseInBackground() {
-  return REXCVAR_GET(pause_in_background);
 }
 
 }  // namespace ng2::gameplay

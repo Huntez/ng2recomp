@@ -32,8 +32,6 @@ class Ng2App : public rex::ReXApp {
   // Title Update 3's default.xexp, for the World disc (the installers also
   // check its SHA-1: the Japanese release's TU3 has the same size).
   static constexpr uintmax_t kTitleUpdate3Size = 2416640;
-  static constexpr uint32_t kSystemUiNotification = 0x9;  // XN_SYS_UI
-  bool paused_in_background_ = false;
 
   using rex::ReXApp::ReXApp;
 
@@ -126,20 +124,6 @@ class Ng2App : public rex::ReXApp {
   void OnShutdown() override {
     if (ng2::video::IsNativeRenderer()) {
       ng2::video::DestroyHostDevice();
-    }
-  }
-
-  // Pause in Background: the Guide's notification (XN_SYS_UI) pauses the
-  // game while the window isn't focused.
-  void OnWindowFocusChanged(bool focused) override {
-    auto* kernel = runtime() ? runtime()->kernel_state() : nullptr;
-    if (!kernel) {
-      return;
-    }
-    bool pause = !focused && ng2::gameplay::PauseInBackground();
-    if (pause != paused_in_background_) {
-      paused_in_background_ = pause;
-      kernel->BroadcastNotification(kSystemUiNotification, pause ? 1 : 0);
     }
   }
 

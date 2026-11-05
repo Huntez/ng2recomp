@@ -9,6 +9,7 @@
 #   NG2_WRAP="gdb -batch -x cmds.gdb --args"  put in front of the binary
 #   NG2_TEST_WAYLAND=1  run on gamescope's nested Wayland socket instead of X11
 #   NG2_TEST_REFRESH=59  the headless display's refresh rate (Hz; frame pacing tests)
+#   NG2_TEST_SIZE=2560x1440  the headless display's size (1280x720)
 #   NG2_TEST_AUDIO=disk  real audio output, written to <out_dir>/audio.raw
 #     (SDL's disk driver) instead of the null audio device
 #   NG2_TEST_AUDIO=pipewire NG2_PW_RUNTIME=<dir>  audio in real time through
@@ -47,6 +48,8 @@ wait $pid
 
 video=(SDL_VIDEODRIVER=x11 SDL_VIDEO_DRIVER=x11)
 gamescope_flags=()
+size=${NG2_TEST_SIZE:-1280x720}
+test_w=${size%x*} test_h=${size#*x}
 if [ -n "${NG2_TEST_REFRESH:-}" ]; then gamescope_flags+=(-r "$NG2_TEST_REFRESH"); fi
 if [ "${NG2_TEST_WAYLAND:-0}" = 1 ]; then
   # --expose-wayland points WAYLAND_DISPLAY at gamescope's own socket.
@@ -72,7 +75,7 @@ exec env -u WAYLAND_DISPLAY -u DISPLAY HOME="$out/home" NG2_CONFIG="$out/ng2.tom
   SDL_JOYSTICK_IGNORE_DEVICES=0x2dc8/0x310a \
   XDG_DATA_HOME="$out/xdg/data" XDG_CONFIG_HOME="$out/xdg/config" XDG_CACHE_HOME="$out/xdg/cache" \
   timeout --kill-after=10 "$secs" \
-  gamescope --backend headless "${gamescope_flags[@]}" -W 1280 -H 720 -w 1280 -h 720 -- \
+  gamescope --backend headless "${gamescope_flags[@]}" -W "$test_w" -H "$test_h" -w "$test_w" -h "$test_h" -- \
   bash -c "$inner" inner "${NG2_SHOTS:-}" "$out" "$secs" \
   ${NG2_WRAP:-} "$bin" --game_data_root="$root/game_files" --user_data_root="$out/user" \
   --input_backend=none --log_file="$out/ng2.log" "$@"
