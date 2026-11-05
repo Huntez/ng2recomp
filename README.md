@@ -60,6 +60,24 @@ Measured on a Steam Deck LCD in Game Mode, on battery, with sound, in Chapter 1'
 The port holds 60 fps with no slow frame, while the emulator averages 55 fps and drops to 18. The
 port draws less than half the power, so a charge lasts about twice as long.
 
+## Shaders
+
+The game's shaders are translated once, when the port is built, not while you play. All 663 of them
+are in the game's executable: the build converts each into a Vulkan shader (SPIR-V) and packs them
+into the program, so none is compiled at run time.
+
+What a GPU still has to make is pipelines: a shader together with the draw settings it is used
+with. This is the step that makes emulators stutter the first time an effect appears. Here:
+
+- At start, the port makes the pipelines of a list recorded by playing through the game (333 of
+  them), in the background as the game starts.
+- A pipeline that wasn't on that list is made in the background when the game first needs it; the
+  game doesn't wait, and the effect it belongs to can be missing for a frame or so
+  (`async_pipelines = false` in `ng2.toml` waits instead). It is added to your own list
+  (`ng2-pipelines.bin`) and made at every later start.
+- The GPU driver keeps the finished pipelines in its own cache, so later starts are quicker than the
+  first one after installing.
+
 ## Getting started
 
 ### What you need
