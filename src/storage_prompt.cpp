@@ -7,6 +7,7 @@
 // cut out where it lies (the table's own copy, so once), the rest of the
 // string kept. Untagged labels of the same words are left alone.
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string_view>
@@ -80,8 +81,22 @@ void CutPrompt(uint32_t address) {
 
 }  // namespace
 
+// RECOMP SETTINGS' description line (recomp_settings.cpp): the text id the
+// hints' selector asks for instead of its page's (its two description
+// lookups, by return address); 0: the game's. (The game's thread only.)
+std::atomic<uint32_t> g_descriptionText{0};
+void SetDescriptionText(uint32_t id) {
+  g_descriptionText.store(id, std::memory_order_relaxed);
+}
+
 REX_EXTERN(__imp__sub_837578C8);
 REX_HOOK_RAW(sub_837578C8) {
+  uint32_t from = uint32_t(ctx.lr);
+  if (from == 0x836D6B68 || from == 0x836D6C24) {
+    if (uint32_t id = g_descriptionText.load(std::memory_order_relaxed)) {
+      ctx.r4.u64 = id;
+    }
+  }
   __imp__sub_837578C8(ctx, base);
   CutPrompt(ctx.r3.u32);
 }

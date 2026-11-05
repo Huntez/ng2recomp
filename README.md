@@ -109,7 +109,7 @@ Settings** in the in-game menu (Back, under Save Method). Changes apply at once 
   mouse sensitivity
 - **Extras**: skip intro, skip cutscenes (seen or not), skip death screen, auto chapter screen,
   pause in background (the game pauses while its window isn't focused), input latency (Low: no
-  finished frame waits for the screen; needs VK_KHR_present_wait)
+  finished frame waits for the screen)
 
 In the in-game menu, a page with seven settings has no Restore Defaults row (the list has no room
 for it); the title menu's has.

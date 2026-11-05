@@ -1369,19 +1369,32 @@ REX_HOOK_RAW(sub_836D6898) {
   Store32(flags, game);
 }
 
-// The hints' selector (sub_836D6AC8(view, model)) gives the Game Settings
-// page's rows 5 and 6 Change Storage Device before the flags above: on ours
-// it sees that page as another, which has none.
+// The hints' and description's selector (sub_836D6AC8(view, model)): the
+// description is the game's for its page and row (a table of text ids by
+// page * 8 + row), and the Game Settings page's rows 5 and 6 get Change
+// Storage Device before the hints above. On ours: no description but on
+// Restore Defaults ("Restore settings to their defaults."), through the
+// text lookup's hook (storage_prompt.cpp), and that page seen as another.
+void SetDescriptionText(uint32_t id);  // storage_prompt.cpp; 0: the game's
 REX_EXTERN(__imp__sub_836D6AC8);
 REX_HOOK_RAW(sub_836D6AC8) {
+  using ng2::guest::Load32;
   uint32_t model = ctx.r4.u32;
-  if (!g_open || !model || !PageOf(ng2::guest::Load32(kPage)) || ng2::guest::Load32(model) != 1) {
+  const Page* page = g_open && model ? PageOf(Load32(kPage)) : nullptr;
+  if (!page) {
     __imp__sub_836D6AC8(ctx, base);
     return;
   }
-  Store32(model, 2);
+  constexpr uint32_t kRestoreDescription = kTable | 0x9A, kEmpty = kTable | 0x34;
+  uint32_t row = Load32(model + 8 * (Load32(model + 8) + 2));
+  SetDescriptionText(row == page->count ? kRestoreDescription : kEmpty);
+  uint32_t shown = Load32(model);
+  if (shown == 1) {
+    Store32(model, 2);
+  }
   __imp__sub_836D6AC8(ctx, base);
-  Store32(model, 1);
+  Store32(model, shown);
+  SetDescriptionText(0);
 }
 
 // The Game Settings page's play time, formatted each frame into a shared

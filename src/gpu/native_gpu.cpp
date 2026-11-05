@@ -63,11 +63,14 @@
 REXCVAR_DECLARE(bool, vsync);
 REXCVAR_DECLARE(int32_t, present_mode);
 // Frame Pacing: Auto puts the guest's vblanks on the display's own refreshes
-// (video.cpp's display clock: one every N of them, half a refresh after
-// one) when N refreshes come within 2% of the video mode's rate, so no
+// (video.cpp's display clock: one every N of them, just after one) when N refreshes come within 2% of the video mode's rate, so no
 // frame is shown twice for the drift between the two clocks; else, and with
 // Timer, they come from a timer at the video mode's rate.
 REXCVAR_DEFINE_INT32(frame_pacing, 0, "Video", "0: auto (on the display's refreshes), 1: timer");
+// Where in a refresh a locked vblank falls (% of it after the refresh): just
+// after it, the frame has nearly the whole refresh to be drawn and shown at
+// the next one (at 50, half: a slower frame misses it, waits a refresh).
+REXCVAR_DEFINE_INT32(frame_pacing_phase, 5, "Video", "Auto frame pacing: % of a refresh after it");
 
 namespace ng2::gpu {
 namespace {
@@ -388,9 +391,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
             REXLOG_INFO("gpu: vblanks on the display's refreshes ({:.3f} Hz, every {})",
                         1e9 / double(periodNs), every);
           }
-          // Half a refresh after one, the first at least half a step after
-          // the last vblank (no two close together when the lock starts).
-          int64_t target = refreshNs + periodNs / 2;
+          // frame_pacing_phase after one, the first at least half a step
+          // after the last vblank (no two close together when the lock starts).
+          int64_t phase = std::clamp<int32_t>(REXCVAR_GET(frame_pacing_phase), 0, 50);
+          int64_t target = refreshNs + periodNs * phase / 100;
           while (target < lastVblankNs + step / 2) {
             target += step;
           }
