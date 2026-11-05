@@ -38,6 +38,8 @@
 // full when a stage's character is made from the save.
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 
@@ -239,8 +241,14 @@ void UpdateHudFade() {
 }
 
 // A HUD part: drawn, hidden, or drawn with the fade's alpha.
+std::atomic<int64_t> g_hudCalledMs{0};
+
 void HudPart(PPCContext& ctx, uint8_t* base, void (*draw)(PPCContext&, uint8_t*), bool fades,
              bool update = false) {
+  g_hudCalledMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count(),
+                      std::memory_order_relaxed);
   int32_t mode = REXCVAR_GET(hud_mode);
   if (mode == 2) {
     return;
@@ -264,6 +272,15 @@ bool HiResFont() {
 }
 
 }  // namespace
+
+// The game asked for its HUD in the last frames (drawn or not: the HUD option
+// hidden), so it is in play.
+bool HudInPlay() {
+  int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+  return now - g_hudCalledMs.load(std::memory_order_relaxed) < 100;
+}
 
 // The pad state, before the four pads are merged: r5 the first pad's words.
 void Ng2ExtrasPad(PPCRegister& r5) {
@@ -442,6 +459,33 @@ void Ng2SkullCountR10(PPCRegister& r10) {
 }
 void Ng2SkullCountR11(PPCRegister& r11) {
   Ng2SkullCount(r11);
+}
+
+// Max HP and Ninpo leaves the save alone: the game copies the character
+// back into the save (sub_83755D20(save): health at +0xC04 current and
+// +0xC06 most, then eight segments of current and most from +0xC08 (only the
+// first used: a Life of the Gods raises its most, which a full bar refuses,
+// so the item is kept); ninpo +0xC28 current, +0xC2A most). With the cheat
+// on, the save's own most values are put back after it, and the currents
+// kept within them (a save point's refill stays full).
+constexpr uint32_t kSaveHealth = 0xC04, kSaveSegment = 0xC08, kSaveNinpo = 0xC28;
+REX_EXTERN(__imp__sub_83755D20);
+REX_HOOK_RAW(sub_83755D20) {
+  uint32_t save = ctx.r3.u32;
+  if (!REXCVAR_GET(cheat_max_health_ninpo) || (save >> 16) != 0x859E) {
+    __imp__sub_83755D20(ctx, base);
+    return;
+  }
+  constexpr uint32_t kFrom = kSaveHealth, kTo = 0xC2C;  // health and ninpo
+  uint8_t before[kTo - kFrom];
+  std::memcpy(before, ng2::guest::Virtual(save + kFrom), sizeof(before));
+  __imp__sub_83755D20(ctx, base);
+  uint16_t health = Load16(save + kSaveHealth), segment = Load16(save + kSaveSegment);
+  uint16_t ninpo = Load16(save + kSaveNinpo);
+  std::memcpy(ng2::guest::Virtual(save + kFrom), before, sizeof(before));
+  Store16(save + kSaveHealth, std::min(health, Load16(save + kSaveHealth + 2)));
+  Store16(save + kSaveSegment, std::min(segment, Load16(save + kSaveSegment + 2)));
+  Store16(save + kSaveNinpo, std::min(ninpo, Load16(save + kSaveNinpo + 2)));
 }
 
 // Max HP and Ninpo: the upgrades as a stage's character is made from the

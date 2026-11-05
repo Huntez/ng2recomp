@@ -10,13 +10,12 @@
 // and in sub_82412508 the record's +10 being 0). It is set to 2 for those
 // calls only, so enemies still take theirs.
 //
-// Infinite Ninpo: a character's ninpo is a u16 at +0x5942 (200 a charge).
-// A ninpo's cost is its item's property 0x19 (sub_83730AA8), read only to
-// check a cast can be made (cost <= ninpo, sub_82412A00) and to spend it
-// (sub_8372D360, which spends nothing at a cost of 0): it costs 0. The HUD's
-// gauge still showed a cast's drain, so the player's ninpo is also kept at
-// its most (+0x5940) each frame in play (CheatsFrame, from the frame's
-// start): the gauge stays full.
+// Infinite Ninpo: a character's ninpo is a u16 at +0x5942 (200 a charge),
+// its most at +0x5940. A cast spends as usual, and the player's ninpo is
+// filled back to its most each frame in play (CheatsFrame, from the frame's
+// start). (A cost of 0 instead left the HUD
+// showing a charge spent: its gauge plays a cast's drain itself and only
+// shows the charges again when it sees the ninpo go up.)
 //
 // Unlock Difficulties: sub_823E1098(clears, d) says difficulty d is open
 // (some difficulty at or above d - 1 cleared). The New Game path list
@@ -41,6 +40,7 @@
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
+#include <rex/logging.h>
 
 #include "aspect.h"
 #include "gpu/guest.h"
@@ -92,20 +92,14 @@ REX_HOOK_RAW(sub_824131E0) {
 constexpr uint32_t kPlayerRecord = 0x84C3DC60;
 constexpr uint32_t kNinpo = 0x5942, kNinpoMost = 0x5940;
 
-REX_EXTERN(__imp__sub_83730AA8);
-REX_HOOK_RAW(sub_83730AA8) {
-  if (REXCVAR_GET(cheat_infinite_ninpo)) {
-    ctx.r3.u64 = 0;
-    return;
-  }
-  __imp__sub_83730AA8(ctx, base);
-}
+void FillPlayerNinpo();
+bool HudInPlay();  // extras.cpp
 
 // The New Game path list is made with the title menu (sub_8366F4D0, at
 // 0x853A3470, after the menu's entries: Acolyte and Warrior, then Mentor
-// and Master Ninja if open, their count at +8208). It is always made with all four, and the count
-// follows the setting (CheatsFrame): the paths the profile has opened, or
-// all of them, at once either way.
+// and Master Ninja if open, their count at +8208). It is always made with
+// all four, and the count follows the setting (CheatsFrame): the paths the
+// profile has opened, or all of them, at once either way.
 constexpr uint32_t kPathCount = 0x853A3470 + 8208;
 constexpr uint32_t kProfile = 0x84C559E0;
 bool g_allPathsAsked = false;  // while the list is made
@@ -188,9 +182,13 @@ void CheatsFrame() {
     }
   }
   // In play only: before it the record holds something else.
-  if (!REXCVAR_GET(cheat_infinite_ninpo) || !ng2::aspect::HudShown()) {
-    return;
+  if (REXCVAR_GET(cheat_infinite_ninpo) && (ng2::aspect::HudShown() || HudInPlay())) {
+    FillPlayerNinpo();
   }
+}
+
+// The player's ninpo to its most (a cast's spend, a frame in play).
+void FillPlayerNinpo() {
   uint32_t player = ng2::guest::Load32(kPlayerRecord);
   if (player < 0x40000000u || player >= 0xA0000000u ||
       ng2::guest::Virtual(kPlayerRecord)[10] != 0 ||
