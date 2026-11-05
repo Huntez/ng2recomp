@@ -303,7 +303,8 @@ libswresample, libswscale).
        out/build/linux-amd64-release/ng2 --game_data_root=game_files
 
 The AppImage, `packaging/appimage/build.sh`, builds the SDK and the game in an Ubuntu 22.04
-container (Docker; `packaging/appimage/Dockerfile`; it also needs rsync and
+container (Docker; `packaging/appimage/Dockerfile`; it also needs rsync,
+zsync (`zsyncmake`, for the `.zsync` updaters use) and
 [appimagetool](https://github.com/AppImage/appimagetool) on the PATH, or `APPIMAGETOOL=<path>`), so it needs only glibc 2.35 and runs on
 SteamOS and other current distributions. It bundles a small FFmpeg with the movies' codecs and
 writes `out/appimage/NinjaGaiden2-x86_64.AppImage`. `packaging/appimage/build-local.sh` packs

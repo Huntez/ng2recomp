@@ -34,6 +34,8 @@ tool=${APPIMAGETOOL:-$(command -v appimagetool || true)}
 [ -f "$game/default.xex" ] && [ -f "$game/default.xexp" ] ||
     { echo "No default.xex and default.xexp in $game (NG2_GAME_DIR)." >&2; exit 1; }
 [ -x "$tool" ] || { echo "appimagetool not found (set APPIMAGETOOL)." >&2; exit 1; }
+# (appimagetool skips the .zsync without a word when zsyncmake is missing: checked before the build)
+command -v zsyncmake >/dev/null || { echo "zsyncmake is needed for the .zsync file (zsync package)" >&2; exit 1; }
 
 docker build -q -t "$image" "$here" >/dev/null
 
@@ -128,7 +130,7 @@ done | sort -uV | tail -1
 
 # Update information for AppImageUpdate and the like: the newest release on GitHub, by the .zsync
 # made beside the AppImage (zsyncmake, in the current folder), which goes up with each release.
-command -v zsyncmake >/dev/null || { echo "zsyncmake is needed for the .zsync file (zsync package)" >&2; exit 1; }
+rm -f "$dest/NinjaGaiden2-x86_64.AppImage" "$dest/NinjaGaiden2-x86_64.AppImage.zsync"  # (never a stale pair)
 (cd "$dest" && ARCH=x86_64 "$tool" --appimage-extract-and-run --no-appstream \
     -u "gh-releases-zsync|gamboozino|ng2recomp|latest|NinjaGaiden2-x86_64.AppImage.zsync" "$app" \
     "$dest/NinjaGaiden2-x86_64.AppImage" >"$out/appimagetool.log" 2>&1) ||
