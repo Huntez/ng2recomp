@@ -122,18 +122,21 @@ cp "$deps/ffmpeg/LICENSE.txt" "$pkg/licenses/LICENSE-FFmpeg.txt"
 cat > "$pkg/README.txt" <<'TXT'
 Ninja Gaiden II - static recompilation for Windows (Vulkan)
 
-Run ng2.exe. The first time it installs the game:
+Run ng2.exe. The first time it asks about portable mode (below), then installs the game:
   1. Your copy of the game: a disc image (.iso), the Games on Demand package (the file in
      544307D5\00007000, next to its .data folder), or default.xex in an extracted copy.
      A disc image or package is copied into %LOCALAPPDATA%\NinjaGaiden2\game (about 7 GB).
   2. Title Update 3 for the World release: its package (TU_1A461UL_000000G000000.00000000000O4)
      or default.xexp.
-  3. Downloadable content, if you have it: the folder with the packages (544307D5\00000002).
+  3. Downloadable content, optional: the folder with the packages (544307D5\00000002).
      More can be added later in the "dlc" folder inside the game folder.
 
-Needs a GPU with Vulkan 1.3 drivers. The Microsoft Visual C++ runtime DLLs are included.
+Needs a CPU with SSE4.2 and a GPU with Vulkan 1.3 drivers. The Microsoft Visual C++ runtime DLLs
+are included. ng2.exe starts ng2-avx2.exe, the faster build, where the CPU has AVX2.
 
-Settings, saves and the log are in %LOCALAPPDATA%\NinjaGaiden2. No game data is included.
+Settings, saves and the log are in %LOCALAPPDATA%\NinjaGaiden2. Portable mode: with a file named
+portable.txt next to ng2.exe, they go in a "userdata" folder next to it instead (the folder must be
+writable, so not inside Program Files). No game data is included.
 TXT
 rm -f "$out/NinjaGaiden2-windows-x64.zip"
 (cd "$out" && bsdtar -a -cf NinjaGaiden2-windows-x64.zip NinjaGaiden2)
