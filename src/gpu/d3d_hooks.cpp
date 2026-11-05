@@ -274,12 +274,31 @@ REX_HOOK_RAW(sub_83767A10) {
 }
 
 // Swap: the frame is done.
+//
+// sub_8376E028, a D3D loop the game runs on another thread while it waits
+// (the Game Over screen: there the game makes a frame every 2 vblanks), swaps
+// the last front buffer again each time round (returning to 8376E0C4). On the
+// console that shows the same picture; here each is a present of its own, on
+// a clock of its own between the game's frames: frame times of 3 ms, then 30,
+// and with V-Sync On refreshes taken from the game's frames (#13). Those are
+// left to the guest while the game is presenting its own frames, and only
+// reach the screen after a wait of over 100 ms without one.
 REX_EXTERN(__imp__sub_8376AA48);
 REX_HOOK_RAW(sub_8376AA48) {
+  constexpr uint32_t kKeepAlive = 0x8376E0C4;
+  static std::atomic<int64_t> lastGameSwapNs{0};
   g_counters.swaps++;
   uint32_t device = ctx.r3.u32, frontBuffer = ctx.r4.u32;
+  int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+  bool repeat = uint32_t(ctx.lr) == kKeepAlive &&
+                now - lastGameSwapNs.load(std::memory_order_relaxed) < 100'000'000;
+  if (uint32_t(ctx.lr) != kKeepAlive) {
+    lastGameSwapNs.store(now, std::memory_order_relaxed);
+  }
   __imp__sub_8376AA48(ctx, base);
-  if (ng2::video::IsNativeRenderer()) {
+  if (ng2::video::IsNativeRenderer() && !repeat) {
     ng2::video::OnSwap(device, frontBuffer);
   }
   if (StatsEnabled()) {

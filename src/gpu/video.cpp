@@ -3466,6 +3466,7 @@ struct InlineData {
   uint32_t indexAddress = 0;   // guest virtual, 0 if not indexed
   uint32_t indexCount = 0;
   bool wideIndices = false;
+  bool quadList = false;        // indexed quads (made triangles)
 };
 struct PendingDraw {
   DrawRecord record;
@@ -3512,6 +3513,46 @@ void SwapIndices(uint8_t* out, const uint8_t* in, uint32_t count) {
   for (uint32_t i = 0; i < count; i++) {
     reinterpret_cast<T*>(out)[i] = rex::byte_swap(reinterpret_cast<const T*>(in)[i]);
   }
+}
+
+// An indexed quad list's indices (big-endian, count of them), as a triangle
+// list's: two triangles a quad, as the non-indexed quads below. Returns the
+// index count drawn (a partial quad at the end is dropped).
+template <typename T>
+uint32_t SwapQuadIndices(uint8_t* out, const uint8_t* in, uint32_t count) {
+  uint32_t quads = count / 4;
+  auto* source = reinterpret_cast<const T*>(in);
+  auto* dest = reinterpret_cast<T*>(out);
+  for (uint32_t q = 0; q < quads; q++) {
+    T v[4];
+    for (uint32_t i = 0; i < 4; i++) {
+      v[i] = rex::byte_swap(source[q * 4 + i]);
+    }
+    T* o = dest + q * 6;
+    o[0] = v[0]; o[1] = v[1]; o[2] = v[2];
+    o[3] = v[0]; o[4] = v[2]; o[5] = v[3];
+  }
+  return quads * 6;
+}
+
+// Indices as the host draws them: swapped, and quads made triangles. Returns
+// the index count.
+uint32_t ConvertIndices(uint8_t* out, const uint8_t* in, uint32_t count, bool wide, bool quads) {
+  if (quads) {
+    return wide ? SwapQuadIndices<uint32_t>(out, in, count)
+                : SwapQuadIndices<uint16_t>(out, in, count);
+  }
+  if (wide) {
+    SwapIndices<uint32_t>(out, in, count);
+  } else {
+    SwapIndices<uint16_t>(out, in, count);
+  }
+  return count;
+}
+
+// Room for ConvertIndices' output.
+uint64_t ConvertedIndexBytes(uint32_t count, bool wide, bool quads) {
+  return uint64_t(quads ? count / 4 * 6 : count) * (wide ? 4 : 2);
 }
 
 void FlushPendingDraw() {
@@ -3578,15 +3619,14 @@ void FlushPendingDraw() {
   }
   if (data.indexAddress) {
     uint32_t indexSize = data.wideIndices ? 4 : 2;
-    Upload indices = Allocate(uint64_t(data.indexCount) * indexSize, 16);
+    bool quads = data.quadList;
+    Upload indices =
+        Allocate(std::max<uint64_t>(ConvertedIndexBytes(data.indexCount, data.wideIndices, quads), 4), 16);
     const uint8_t* source = guest::Virtual(data.indexAddress);
-    if (data.wideIndices) {
-      SwapIndices<uint32_t>(indices.data, source, data.indexCount);
-    } else {
-      SwapIndices<uint16_t>(indices.data, source, data.indexCount);
-    }
+    uint32_t drawn = ConvertIndices(indices.data, source, data.indexCount, data.wideIndices, quads);
+    pending.record.drawCount = drawn;
     pending.record.indexView = RenderIndexBufferView(
-        RenderBufferReference(indices.buffer, indices.offset), data.indexCount * indexSize,
+        RenderBufferReference(indices.buffer, indices.offset), drawn * indexSize,
         data.wideIndices ? RenderFormat::R32_UINT : RenderFormat::R16_UINT);
     pending.record.indexed = true;
   }
@@ -3884,15 +3924,12 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     bool wide = guest::Load32(indexBuffer) & 0x80000000;
     uint32_t address = PhysicalAddress(guest::Load32(indexBuffer + 24));
     uint32_t indexSize = wide ? 4 : 2;
-    Upload indices = Allocate(uint64_t(count) * indexSize, 16);
+    bool quads = primitiveType == xenos::PrimitiveType::kQuadList;
+    Upload indices = Allocate(std::max<uint64_t>(ConvertedIndexBytes(count, wide, quads), 4), 16);
     const uint8_t* source = guest::Physical(address + startIndex * indexSize);
-    if (wide) {
-      SwapIndices<uint32_t>(indices.data, source, count);
-    } else {
-      SwapIndices<uint16_t>(indices.data, source, count);
-    }
+    drawCount = ConvertIndices(indices.data, source, count, wide, quads);
     indexView = RenderIndexBufferView(RenderBufferReference(indices.buffer, indices.offset),
-                                      count * indexSize,
+                                      drawCount * indexSize,
                                       wide ? RenderFormat::R32_UINT : RenderFormat::R16_UINT);
   } else if (primitiveType == xenos::PrimitiveType::kQuadList) {
     // Quads become two triangles each.
@@ -5209,6 +5246,7 @@ void RunBeginIndexedVertices(uint32_t device, uint32_t primitive, uint32_t baseV
   data.stride = stride;
   data.indexAddress = indexData;
   data.indexCount = indexCount;
+  data.quadList = xenos::PrimitiveType(primitive) == xenos::PrimitiveType::kQuadList;
   data.wideIndices = wideIndices;
   Draw(device, primitive, baseVertex, indexCount, true, 0, &data);
 }
