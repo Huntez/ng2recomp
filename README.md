@@ -15,7 +15,8 @@ PlayStation and Nintendo button prompts, and more.
 **You need your own copy of the game.** This project contains none of the game's data (graphics,
 sound, movies, text): on first start it asks for your disc image, Games on Demand package or
 extracted game, and installs it. It is made for the **World release** (title ID `544307D5`) with
-**Title Update 3**, which it asks for too.
+**Title Update 3**, which it asks for too. The downloadable content (Mission Mode, the costume packs)
+is supported and optional: it can be added on the first start or later.
 
 ## Features
 
