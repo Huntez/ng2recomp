@@ -320,6 +320,10 @@ How it works: [docs/renderer-plan.md](docs/renderer-plan.md) (the renderer),
 [CONTRIBUTING.md](CONTRIBUTING.md); the layout, tools and test rules, also for coding agents:
 [AGENTS.md](AGENTS.md).
 
+## Support
+
+If you'd like to support the project: [ko-fi.com/gamboozino](https://ko-fi.com/gamboozino)
+
 ## Credits
 
 - [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) by Tom Clay: the recompiler and Xbox 360
