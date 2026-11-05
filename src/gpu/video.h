@@ -61,5 +61,9 @@ void WaitForRecordedCalls(uint64_t records);
 // presents reaching the screen; false unless steady and recent.
 bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs);
 int64_t DisplayClockNow();
+// NG2_LATENCY_LOG: the main thread read the pad; the render thread took the
+// frame (the handoff).
+void NoteInputRead();
+void NoteFrameTaken();
 
 }  // namespace ng2::video

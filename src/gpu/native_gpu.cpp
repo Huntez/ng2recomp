@@ -66,7 +66,7 @@ REXCVAR_DECLARE(int32_t, present_mode);
 // (video.cpp's display clock: one every N of them, just after one) when N refreshes come within 2% of the video mode's rate, so no
 // frame is shown twice for the drift between the two clocks; else, and with
 // Timer, they come from a timer at the video mode's rate.
-REXCVAR_DEFINE_INT32(frame_pacing, 0, "Video", "0: auto (on the display's refreshes), 1: timer");
+REXCVAR_DEFINE_INT32(frame_pacing, 1, "Video", "0: auto (on the display's refreshes), 1: timer (the game's)");
 // Where in a refresh a locked vblank falls (% of it after the refresh): just
 // after it, the frame has nearly the whole refresh to be drawn and shown at
 // the next one (at 50, half: a slower frame misses it, waits a refresh).

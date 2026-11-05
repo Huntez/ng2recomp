@@ -31,6 +31,7 @@
 #include <rex/hook.h>
 
 #include "gpu/guest.h"
+#include "gpu/video.h"
 #include "movie/movie.h"
 
 REXCVAR_DEFINE_BOOL(skip_intro, false, "Gameplay", "Skip the opening movie at launch");
@@ -115,6 +116,7 @@ REX_EXTERN(__imp__sub_822F2E38);
 REX_HOOK_RAW(sub_822F2E38) {
   PutBack();
   __imp__sub_822F2E38(ctx, base);
+  ng2::video::NoteInputRead();
   if (!REXCVAR_GET(skip_cutscenes) || !SkipPressed()) {
     return;
   }

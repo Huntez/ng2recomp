@@ -37,6 +37,7 @@
 #include <rex/hook.h>
 
 #include "gpu/guest.h"
+#include "gpu/video.h"
 
 namespace {
 
@@ -73,6 +74,8 @@ void Backoff() {
 void Ng2FrameHandoffWait(PPCRegister& r11) {
   if (r11.u32 != 0) {
     Backoff();
+  } else {
+    ng2::video::NoteFrameTaken();  // (NG2_LATENCY_LOG)
   }
 }
 

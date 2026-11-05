@@ -200,6 +200,25 @@ std::unique_ptr<RenderCommandSemaphore> g_acquireSemaphores[NUM_FRAMES];
 std::vector<std::unique_ptr<RenderCommandSemaphore>> g_renderSemaphores;
 bool g_commandListPending[NUM_FRAMES];
 std::unique_ptr<RenderSwapChain> g_swapChain;
+
+// NG2_LATENCY_LOG=1, from the pad to the screen: the time each frame read
+// the pad (the main thread's input update), carried to the frame's present
+// (the frame the render thread took, at the main thread's handoff) and to
+// the refresh it reached the screen at (the display clock), each 10 s.
+std::atomic<int64_t> g_inputNs{0}, g_handedInputNs{0};
+struct TaggedPresent {
+  uint64_t id = 0;
+  int64_t inputNs = 0, presentNs = 0;
+};
+std::mutex g_taggedMutex;
+TaggedPresent g_tagged[64];
+
+int64_t SteadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 std::vector<std::unique_ptr<RenderFramebuffer>> g_swapChainFramebuffers;
 bool g_swapChainValid = false;
 uint32_t g_frame = 0;
@@ -3998,6 +4017,8 @@ void Present(HostTexture* frontBuffer) {
   g_recording = false;
   (void)commandList;
 
+  // The frame's pad read (NG2_LATENCY_LOG), to its present.
+  int64_t inputNs = g_handedInputNs.exchange(0);
   // The swapchain's part, with the frame's real command list.
   OnRenderThread([=](RenderCommandList* list) {
     static int32_t loggedMode = -1;
@@ -4107,6 +4128,12 @@ void Present(HostTexture* frontBuffer) {
       FrameSubmitted();
       g_swapChainValid = g_swapChain->present(index, signalSemaphores, 1);
       ReportLatency();
+      if (inputNs) {
+        if (uint64_t id = g_swapChain->getPresentId()) {
+          std::lock_guard lock(g_taggedMutex);
+          g_tagged[id % 64] = {id, inputNs, SteadyNs()};
+        }
+      }
     } else {
       g_queue->executeCommandLists(list, g_commandFences[frame].get());
       FrameSubmitted();
@@ -4309,10 +4336,32 @@ std::atomic<bool> g_displaySteady{false}, g_displayRun{false};
 // (left to run at exit if the device isn't destroyed, as the other workers)
 std::thread* g_displayThread = nullptr;
 
-int64_t SteadyNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
+
+bool LatencyLogOn() {
+  static const bool on = [] {
+    const char* v = std::getenv("NG2_LATENCY_LOG");
+    return v && v[0] == '1';
+  }();
+  return on;
+}
+
+// (the display clock's thread)
+void NoteInputToScreen(int64_t inputNs, int64_t presentNs, int64_t shownNs) {
+  static double toPresent = 0, toScreen = 0, worst = 0, best = 1e9;
+  static uint64_t count = 0;
+  static int64_t logAt = 0;
+  double screen = double(shownNs - inputNs) / 1e6;
+  toPresent += double(presentNs - inputNs) / 1e6, toScreen += screen, count++;
+  worst = std::max(worst, screen), best = std::min(best, screen);
+  if (!logAt) {
+    logAt = shownNs;
+  }
+  if (shownNs - logAt > 10'000'000'000 && count) {
+    REXLOG_INFO("latency pad to present {:.1f} ms, pad to screen {:.1f} ms (best {:.1f}, worst "
+                "{:.1f}; {} frames)",
+                toPresent / double(count), toScreen / double(count), best, worst, count);
+    toPresent = toScreen = worst = 0, best = 1e9, count = 0, logAt = shownNs;
+  }
 }
 
 void DisplayClockThread() {
@@ -4342,8 +4391,16 @@ void DisplayClockThread() {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
       continue;
     }
-    next++;
     int64_t t = SteadyNs();
+    {
+      std::lock_guard lock(g_taggedMutex);
+      TaggedPresent& tag = g_tagged[next % 64];
+      if (tag.id == next && tag.inputNs) {
+        NoteInputToScreen(tag.inputNs, tag.presentNs, t);
+        tag.id = 0;
+      }
+    }
+    next++;
     int64_t dt = t - last;
     if (!last || dt > 250'000'000) {
       runStart = t, runUnits = 0, uneven = 0;
@@ -4373,6 +4430,18 @@ void DisplayClockThread() {
   }
 }
 }  // namespace
+
+void NoteInputRead() {
+  if (LatencyLogOn()) {
+    g_inputNs.store(SteadyNs());
+  }
+}
+
+void NoteFrameTaken() {
+  if (LatencyLogOn()) {
+    g_handedInputNs.store(g_inputNs.load());
+  }
+}
 
 bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs) {
   int64_t last = g_displayRefreshNs.load(), period = g_displayPeriodNs.load();

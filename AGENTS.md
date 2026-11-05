@@ -67,6 +67,9 @@ devices, and none of the player's settings or saves.
   time ("threads, ms of CPU each second"; "(renderer)" is the game's render thread, "Render
   Commands" ours). `NG2_HITCHES=1` (or `log_hitches`): slow frames with what they were spent on.
   `NG2_FPS_LOG=1`: the game's frame rate once a second.
+- `NG2_LATENCY_LOG=1`: every 10 s, from the game reading the pad to that frame's present and to its
+  reaching the screen (the display clock, VK_KHR_present_wait). `NG2_TEST_REFRESH=59` (run-headless.sh)
+  sets the headless display's rate.
 - `NG2_RENDER_THREAD=0`: Vulkan commands, submits and presents on the game's render thread again
   instead of the "Render Commands" thread (for comparisons).
 - `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).

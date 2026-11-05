@@ -21,7 +21,7 @@
 // a lock-on, an enemy within 15 units, or the HUD back after a pause) and
 // falls three seconds after.
 //
-// No Post-Effects: the post passes' mask (0x84C55758, read by sub_83648E50)
+// Post-Effects off: the post passes' mask (0x84C55758, read by sub_83648E50)
 // loses the blur bits (0x400, 0x10000; 0x1000 unless 0x4000 is also set),
 // and the white flash (sub_836FB7A8 from sub_8269CF98) isn't started.
 //
@@ -52,7 +52,7 @@ REXCVAR_DEFINE_BOOL(skip_death_screen, false, "Extras",
 REXCVAR_DEFINE_BOOL(auto_chapter_screen, false, "Extras",
                     "Chapter cards and mission briefings go on by themselves");
 REXCVAR_DEFINE_INT32(hud_mode, 0, "Extras", "0: shown, 1: fades out when not fighting, 2: hidden");
-REXCVAR_DEFINE_BOOL(no_post_effects, false, "Extras", "No blur and no white flashes");
+REXCVAR_DEFINE_BOOL(post_effects, true, "Extras", "The blur and white flashes (off: none)");
 REXCVAR_DEFINE_BOOL(smooth_hud, false, "Extras", "The HUD's and menus' pictures always filtered");
 REXCVAR_DEFINE_BOOL(hires_font, false, "Extras",
                     "Text drawn from glyphs twice the size (from the next start)");
@@ -109,7 +109,7 @@ constexpr uint32_t kCharacterHealth = 0x591E, kCharacterX = 0x270, kCharacterZ =
 constexpr float kNear = 15.0f;
 constexpr int kHoldFrames = 180;
 
-// No Post-Effects.
+// Post-Effects off.
 constexpr uint32_t kPostPasses = 0x84C55758;
 
 // Cheats.
@@ -332,31 +332,31 @@ NG2_HUD_PART(sub_836A65F0, true, false)
 NG2_HUD_PART(sub_836C2318, true, false)
 #undef NG2_HUD_PART
 
-// No Post-Effects: the blur passes asked for, by two functions and inline
+// Post-Effects off: the blur passes asked for, by two functions and inline
 // (true: skipped).
 REX_EXTERN(__imp__sub_8364B758);
 REX_HOOK_RAW(sub_8364B758) {
-  if (!REXCVAR_GET(no_post_effects)) {
+  if (!!REXCVAR_GET(post_effects)) {
     __imp__sub_8364B758(ctx, base);
   }
 }
 REX_EXTERN(__imp__sub_8363CD80);
 REX_HOOK_RAW(sub_8363CD80) {
-  if (!REXCVAR_GET(no_post_effects)) {
+  if (!!REXCVAR_GET(post_effects)) {
     __imp__sub_8363CD80(ctx, base);
   }
 }
 bool Ng2PostBlur() {
-  return REXCVAR_GET(no_post_effects);
+  return !REXCVAR_GET(post_effects);
 }
 // The mask as the post passes read it.
 void Ng2PostPasses(PPCRegister& r26) {
-  if (REXCVAR_GET(no_post_effects) && !(r26.u32 & 0x4000)) {
+  if (!REXCVAR_GET(post_effects) && !(r26.u32 & 0x4000)) {
     r26.u64 = r26.u32 & ~0x1000u;
   }
 }
 bool Ng2WhiteFlash() {
-  return REXCVAR_GET(no_post_effects);
+  return !REXCVAR_GET(post_effects);
 }
 
 // Smooth HUD and Menus (true: the branch around the filtered path isn't

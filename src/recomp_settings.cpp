@@ -179,7 +179,7 @@ constexpr Setting kSettings[] = {
     {u"Skip Death Screen", {u"On", u"Off"}, 2, "skip_death_screen", Kind::kOnOff},
     {u"Auto Chapter Screen", {u"On", u"Off"}, 2, "auto_chapter_screen", Kind::kOnOff},
     {u"HUD", {u"Shown", u"Fade Out", u"Hidden"}, 3, "hud_mode", Kind::kLevel},
-    {u"No Post-Effects", {u"On", u"Off"}, 2, "no_post_effects", Kind::kOnOff},
+    {u"Post-Effects", {u"On", u"Off"}, 2, "post_effects", Kind::kOnOff},
     {u"Texture LOD Bias", {u"Game", u"0.0", u"-1.0"}, 3, "texture_lod_bias", Kind::kLevel},
     {u"Smooth HUD and Menus", {u"On", u"Off"}, 2, "smooth_hud", Kind::kOnOff},
     {u"Hi-Res Font", {u"On", u"Off"}, 2, "hires_font", Kind::kOnOff},

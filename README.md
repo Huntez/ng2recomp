@@ -96,12 +96,12 @@ Settings** in the in-game menu (Back, under Save Method). Changes apply at once 
 - **Graphics**: render scale (1x–8x, with the resolution it draws at, as "2x 2240x1168"),
   anti-aliasing (off, or 2x as on the console, 4x, 8x MSAA), texture filtering (the game's, or
   4x–16x anisotropic), texture LOD bias (the game's, 0, -1), bloom (off, reduced, on),
-  no post-effects (no blur, no white flashes), smooth HUD and menus
+  post-effects (off: no blur, no white flashes), smooth HUD and menus
 - **Display**: window mode (windowed, borderless, fullscreen), window size, aspect ratio (16:9,
   16:10, 21:9, 32:9, 4:3), V-Sync (Off, FIFO, Mailbox, Adaptive; a mode the driver lacks falls back
-  to FIFO), frame pacing (Auto: the game's 60 Hz on the display's own refreshes, measured from the
-  frames reaching the screen, so none waits in a queue on a 59.94 Hz screen; Timer, for a
-  variable-refresh display: G-Sync, FreeSync)
+  to FIFO), frame pacing (Timer, the game's own; Auto: the game's 60 Hz on the display's own
+  refreshes, measured from the frames reaching the screen, so none waits in a queue on a 59.94 Hz
+  screen; not for a variable-refresh display: G-Sync, FreeSync)
 - **Cheats**: infinite health, infinite ninpo, unlock difficulties, unlock costumes, all weapons and
   ninpo (Level 1 or 3), all crystal skulls, max HP and ninpo
 - **Interface**: HUD (shown, fade out when not fighting, hidden), hi-res font (from the next start),
