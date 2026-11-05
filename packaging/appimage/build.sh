@@ -126,7 +126,11 @@ for bin in "$app"/usr/bin/ng2 "$app"/usr/bin/ng2-avx2 "$app"/usr/bin/*.so "$app"
 done | sort -uV | tail -1
 '
 
-ARCH=x86_64 "$tool" --appimage-extract-and-run --no-appstream "$app" \
-    "$dest/NinjaGaiden2-x86_64.AppImage" >"$out/appimagetool.log" 2>&1 ||
+# Update information for AppImageUpdate and the like: the newest release on GitHub, by the .zsync
+# made beside the AppImage (zsyncmake, in the current folder), which goes up with each release.
+command -v zsyncmake >/dev/null || { echo "zsyncmake is needed for the .zsync file (zsync package)" >&2; exit 1; }
+(cd "$dest" && ARCH=x86_64 "$tool" --appimage-extract-and-run --no-appstream \
+    -u "gh-releases-zsync|gamboozino|ng2recomp|latest|NinjaGaiden2-x86_64.AppImage.zsync" "$app" \
+    "$dest/NinjaGaiden2-x86_64.AppImage" >"$out/appimagetool.log" 2>&1) ||
     { tail -20 "$out/appimagetool.log"; exit 1; }
-ls -la "$dest/NinjaGaiden2-x86_64.AppImage"
+ls -la "$dest/NinjaGaiden2-x86_64.AppImage" "$dest/NinjaGaiden2-x86_64.AppImage.zsync"
