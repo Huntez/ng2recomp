@@ -263,18 +263,25 @@ struct Profile {
   uint64_t textureLookups = 0, hashedBytes = 0, texturesMade = 0, textureMadeBytes = 0;
   // GPU time (timestamps): whole frames, their resolves and their present pass.
   uint64_t gpuNs = 0, gpuResolveNs = 0, gpuPresentNs = 0, gpuFrames = 0;
+  uint64_t barriers = 0, passes = 0;  // recorded (the CPU's count), and passes started
+  // GPU time by render pass target ("1120x584 fmt 3 x2, 2 colors, depth"): from a
+  // pass's start mark to the next mark.
+  std::map<std::string, uint64_t> gpuPassNs;
   std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 } g_profile;
 
 // With NG2_PROFILE=1: GPU timestamps in each frame's command list, read once
 // its slot comes round again (its fence passed). Marks: the frame's start,
 // each resolve's start and end, the present pass's start, the frame's end.
-enum class GpuMark : uint8_t { kFrameStart, kResolveStart, kResolveEnd, kPresentStart, kFrameEnd };
+enum class GpuMark : uint8_t {
+  kFrameStart, kResolveStart, kResolveEnd, kPresentStart, kFrameEnd, kPass
+};
 constexpr uint32_t kGpuMarks = 512;
 struct GpuTiming {
   std::unique_ptr<RenderQueryPool> pool;
   uint32_t count = 0;  // marks written this frame
   std::vector<GpuMark> kinds;
+  std::vector<std::string> passLabels;  // per kPass mark, in order
 };
 GpuTiming g_gpuTiming[NUM_FRAMES];
 
@@ -513,9 +520,22 @@ void ReportProfile() {
               g_profile.textureMadeBytes / 1048576.0);
   if (g_profile.gpuFrames) {
     double frames = double(g_profile.gpuFrames);
-    REXLOG_INFO("video: GPU {:.2f} ms a frame: resolves {:.2f}, present {:.2f} ({} frames timed)",
+    REXLOG_INFO("video: GPU {:.2f} ms a frame: resolves {:.2f}, present {:.2f} ({} frames timed); "
+                "{:.0f} passes, {:.0f} barriers a frame",
                 g_profile.gpuNs / 1e6 / frames, g_profile.gpuResolveNs / 1e6 / frames,
-                g_profile.gpuPresentNs / 1e6 / frames, g_profile.gpuFrames);
+                g_profile.gpuPresentNs / 1e6 / frames, g_profile.gpuFrames,
+                g_profile.passes / double(std::max<uint64_t>(g_profile.frames, 1)),
+                g_profile.barriers / double(std::max<uint64_t>(g_profile.frames, 1)));
+    std::vector<std::pair<uint64_t, std::string>> passes;
+    for (auto& [label, ns] : g_profile.gpuPassNs) {
+      passes.emplace_back(ns, label);
+    }
+    std::sort(passes.rbegin(), passes.rend());
+    std::string top;
+    for (size_t i = 0; i < passes.size() && i < 6; i++) {
+      top += fmt::format("{}{} {:.2f}", i ? "; " : "", passes[i].second, passes[i].first / 1e6 / frames);
+    }
+    REXLOG_INFO("video: GPU ms a frame by pass target: {}", top);
   }
   g_profile = Profile{};
   g_profile.last = now;
@@ -1354,7 +1374,10 @@ RenderCommandList* CommandList();
 // GPU timing (NG2_PROFILE): a mark's index in this frame's pool, or none.
 uint32_t AllocGpuMark(GpuMark kind) {
   GpuTiming& t = g_gpuTiming[g_frame];
-  if (!g_profile.enabled || !t.pool || t.count >= kGpuMarks) {
+  // (the last two kept for the frame's present and end marks)
+  uint32_t limit = kind == GpuMark::kPresentStart || kind == GpuMark::kFrameEnd ? kGpuMarks
+                                                                                  : kGpuMarks - 2;
+  if (!g_profile.enabled || !t.pool || t.count >= limit) {
     return UINT32_MAX;
   }
   t.kinds.push_back(kind);
@@ -1383,7 +1406,12 @@ void ReadGpuTiming(uint32_t frame) {
   t.pool->queryResults(t.count);  // (the written ones: the rest would fail the read)
   const uint64_t* ns = t.pool->getResults();
   uint64_t start = ns[0], resolveStart = 0, presentStart = 0, resolves = 0;
+  size_t pass = 0;
   for (uint32_t i = 0; i < t.count; i++) {
+    if (t.kinds[i] == GpuMark::kPass && pass < t.passLabels.size()) {
+      uint64_t next = i + 1 < t.count ? ns[i + 1] : ns[i];
+      g_profile.gpuPassNs[t.passLabels[pass++]] += next > ns[i] ? next - ns[i] : 0;
+    }
     switch (t.kinds[i]) {
       case GpuMark::kResolveStart: resolveStart = ns[i]; break;
       case GpuMark::kResolveEnd: resolves += ns[i] - resolveStart; break;
@@ -1399,6 +1427,7 @@ void ReadGpuTiming(uint32_t frame) {
   }
   t.count = 0;
   t.kinds.clear();
+  t.passLabels.clear();
 }
 
 // The frame's pool reset and its start marked (once recording).
@@ -1459,6 +1488,7 @@ RenderCommandList* CommandList() {
 
 void Transition(HostTexture& texture, RenderTextureLayout layout) {
   if (texture.layout != layout) {
+    g_profile.barriers++;
     CommandList()->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
                             RenderTextureBarrier(texture.texture.get(), layout));
     texture.layout = layout;
@@ -1569,6 +1599,16 @@ void BindFramebuffer(HostTexture* const* colors, uint32_t colorCount, HostTextur
     Transition(*depth, RenderTextureLayout::DEPTH_WRITE);
   }
   if (g_boundFramebuffer != framebuffer.get()) {
+    g_profile.passes++;
+    if (uint32_t mark = AllocGpuMark(GpuMark::kPass); mark != UINT32_MAX) {
+      const HostTexture* first = colorCount ? colors[0] : depth;
+      g_gpuTiming[g_frame].passLabels.push_back(
+          first ? fmt::format("{}x{} fmt {} x{}, {} colors{}", first->width, first->height,
+                              int(first->format), int(first->samples), colorCount,
+                              depth ? ", depth" : "")
+                : std::string("none"));
+      WriteGpuMark(CommandList(), g_frame, mark);
+    }
     CommandList()->setFramebuffer(framebuffer.get());
     g_boundFramebuffer = framebuffer.get();
   }
@@ -1777,9 +1817,15 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
     chunk.buffer = g_device->createBuffer(RenderBufferDesc::UploadBuffer(
         chunk.size,
         RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE | RenderBufferFlag::INDEX));
+    if (!chunk.buffer) {
+      REXLOG_ERROR("video: out of upload memory ({} MB)", chunk.size >> 20);
+      std::_Exit(1);
+    }
     chunk.data = static_cast<uint8_t*>(chunk.buffer->map());
     chunk.address = chunk.buffer->getDeviceAddress();
     allocator.chunks.push_back(std::move(chunk));
+    REXLOG_INFO("video: upload chunk {} of frame slot {} ({} MB)", allocator.chunks.size(),
+                g_frame, allocator.chunks.back().size >> 20);
   }
   auto& chunk = allocator.chunks[allocator.chunk];
   Upload upload{chunk.buffer.get(), allocator.offset, chunk.data + allocator.offset,
@@ -4068,18 +4114,20 @@ void TraceFrame(HostTexture* frontBuffer) {
     uint64_t size = uint64_t(rowWidth) * frontBuffer->height * texel;
     if (!picture.buffer || picture.size < size) {
       picture.buffer = g_device->createBuffer(RenderBufferDesc::ReadbackBuffer(size));
-      picture.size = size;
+      picture.size = picture.buffer ? size : 0;
     }
-    picture.path = fmt::format("{}/frame-{}.ppm", g_traceDir, g_frameCount);
-    picture.width = frontBuffer->width, picture.height = frontBuffer->height;
-    picture.rowWidth = rowWidth, picture.format = frontBuffer->format;
-    Transition(*frontBuffer, RenderTextureLayout::COPY_SOURCE);
-    CommandList()->copyTextureRegion(
-        RenderTextureCopyLocation::PlacedFootprint(picture.buffer.get(), frontBuffer->format,
-                                                   frontBuffer->width, frontBuffer->height, 1,
-                                                   rowWidth),
-        RenderTextureCopyLocation::Subresource(frontBuffer->texture.get()));
-    picture.pending = true;
+    if (picture.buffer) {  // (none if it couldn't be made: no picture this time)
+      picture.path = fmt::format("{}/frame-{}.ppm", g_traceDir, g_frameCount);
+      picture.width = frontBuffer->width, picture.height = frontBuffer->height;
+      picture.rowWidth = rowWidth, picture.format = frontBuffer->format;
+      Transition(*frontBuffer, RenderTextureLayout::COPY_SOURCE);
+      CommandList()->copyTextureRegion(
+          RenderTextureCopyLocation::PlacedFootprint(picture.buffer.get(), frontBuffer->format,
+                                                     frontBuffer->width, frontBuffer->height, 1,
+                                                     rowWidth),
+          RenderTextureCopyLocation::Subresource(frontBuffer->texture.get()));
+      picture.pending = true;
+    }
   }
   // The frame starting now is traced: the count drops at the presents that end traced frames.
   if (!opened && --g_traceLeft <= 0) {
@@ -4483,6 +4531,10 @@ void CreatePipelines() {
 
   g_guestMemory = g_device->createBuffer(RenderBufferDesc::DefaultBuffer(
       GUEST_MEMORY_SIZE, RenderBufferFlag::CONSTANT | RenderBufferFlag::STORAGE));
+  if (!g_guestMemory) {
+    REXLOG_ERROR("video: no room on the GPU for the game's memory ({} MB)", GUEST_MEMORY_SIZE >> 20);
+    std::_Exit(1);
+  }
   g_guestMemoryAddress = g_guestMemory->getDeviceAddress();
   g_guestMemoryShadow = static_cast<uint8_t*>(std::calloc(GUEST_MEMORY_SIZE, 1));
 }
