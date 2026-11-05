@@ -331,6 +331,8 @@ How it works: [docs/renderer-plan.md](docs/renderer-plan.md) (the renderer),
   Berbece: the PlayStation, Nintendo and keyboard button prompts (CC0)
 - [Ninja Gaiden II Master Edition](https://github.com/alicenotmech/ng2-master-edition) by
   alicenotmech: a reference for this port's own versions of some of its options
+- [Xenia Edge](https://github.com/has207/xenia-edge) by has207: a reference for how the game
+  should look and behave, and its GPU traces for comparing frames with the native renderer
 - Banner lettering: Chakra Petch by Cadson Demak (SIL Open Font License)
 
 *Ninja Gaiden* is a trademark of Koei Tecmo. This project is not affiliated with or endorsed by Koei
