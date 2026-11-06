@@ -2253,12 +2253,13 @@ RenderShader* HostShader(const ShaderCacheEntry* entry) {
       ZSTD_decompress(g_spirvCache.get(), g_spirvCacheDecompressedSize, g_compressedSpirvCache,
                       g_spirvCacheCompressedSize);
     }
-    // The shaders that hide cut-off parts interpolate the part id themselves
-    // where the GPU has fragment shader barycentrics (NG2_BARYCENTRIC=0: the
-    // snapped hardware interpolation instead, to compare).
+    // With NG2_BARYCENTRIC=1 the shaders that hide cut-off parts interpolate
+    // the part id themselves where the GPU has fragment shader barycentrics
+    // (else the snapped hardware interpolation). Opt-in for now: under Proton
+    // the Windows build stops at start with it (native Linux runs it).
     static const bool barycentric = [] {
       const char* v = std::getenv("NG2_BARYCENTRIC");
-      bool on = g_device->getCapabilities().fragmentShaderBarycentric && !(v && v[0] == '0');
+      bool on = g_device->getCapabilities().fragmentShaderBarycentric && v && v[0] == '1';
       REXLOG_INFO("video: part ids interpolated {}", on ? "from barycentrics" : "by the hardware");
       return on;
     }();
