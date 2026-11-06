@@ -1391,9 +1391,27 @@ void WriteTextureDescriptor(uint32_t index, RenderTexture* texture, RenderTextur
 
 // Frame -----------------------------------------------------------------------
 
+// Under gamescope with the display holding a screen image longer than usual
+// (the Quick Access Menu open over the game), the game gets a frame ahead of
+// the display and then waits for it every frame: that wait beats against the
+// game's own 60 Hz clock and the frames come in pairs, 6 then 28 ms apart.
+// After 20 frames in a row each held up over 4 ms here, the vblank timer
+// skips a step (DrainRequested, native_gpu.cpp): one frame stays up two
+// refreshes and the queue is a frame shorter.
+std::atomic<bool> g_drainRequest{false};
+void NoteFrameWait(int64_t ns) {
+  static uint32_t held = 0;
+  held = ns > 4'000'000 ? held + 1 : 0;
+  if (held >= 20) {
+    held = 0;
+    g_drainRequest.store(true, std::memory_order_relaxed);
+  }
+}
+
 void WaitForFrame(uint32_t frame) {
   if (g_commandListPending[frame]) {
     StageTimer timer(Stage::kWait);
+    int64_t waitStart = SteadyNs();
     if (RenderThreadEnabled()) {
       // Its submit first (only then has the fence been handed to the GPU).
       g_renderThread.Send();
@@ -1404,6 +1422,9 @@ void WaitForFrame(uint32_t frame) {
     }
     g_queue->waitForCommandFence(g_commandFences[frame].get());
     g_commandListPending[frame] = false;
+    if (UnderGamescope()) {
+      NoteFrameWait(SteadyNs() - waitStart);
+    }
   }
 }
 
@@ -1912,10 +1933,6 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
   return upload;
 }
 
-// (Every barrier on g_guestMemory names both stages, GRAPHICS and COPY: plume
-// takes a barrier's source stages from the last one recorded on the buffer,
-// and with two lists recorded out of execution order, from two threads with
-// the render thread, that one may be the other list's.)
 // A copy into g_guestMemory. Recorded in the frame's command list it ends the
 // render pass (Vulkan allows no copy inside one) and takes two barriers, and
 // a frame makes dozens: on AMD's Windows driver that was most of the main
@@ -1926,20 +1943,26 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
 // within a frame) stays in order. The data is the same either way: it is
 // copied into the upload at this point (or at the frame's end for the late
 // ranges), and the prologue runs after the previous frame's commands.
-// NG2_PROLOGUE (a test switch): 2, the default, submits the prologue on its
-// own just before the frame; 1 puts it in the frame's submit, which on the
-// Steam Deck under gamescope with Mailbox made every other frame a refresh
-// late; 0 records every copy in order, as before.
+// Where the prologue is used (PrologueMode, set when the device is made): on
+// AMD's Windows driver only, where the cuts were the cost (#2). Elsewhere
+// every copy stays in order, as in 0.5.4: on the Steam Deck under gamescope
+// the prologue made frames come in pairs (6 then 28 ms apart).
+// NG2_PROLOGUE=0, 1 or 2 picks it anywhere: 0 in order; 1 the prologue in the
+// frame's submit; 2 the prologue submitted on its own just before the frame.
+int g_prologueMode = 0;
 int PrologueMode() {
-  static const int mode = [] {
-    const char* v = std::getenv("NG2_PROLOGUE");
-    return v ? std::atoi(v) : 2;
-  }();
-  return mode;
+  return g_prologueMode;
+}
+// A barrier's stages on g_guestMemory: as given without the prologue; with it
+// both, GRAPHICS and COPY, since plume takes a barrier's source stages from
+// the last one recorded on the buffer, and the two lists are recorded out of
+// execution order (from two threads with the render thread).
+RenderBarrierStages GuestMemoryStages(RenderBarrierStages stages) {
+  return g_prologueMode ? RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY : stages;
 }
 
 void RecordGuestMemoryCopy(uint32_t address, const Upload& upload, uint32_t size, bool inOrder) {
-  if (!inOrder && PrologueMode() != 0) {
+  if (!inOrder) {
     auto* prologue = g_prologueLists[g_frame].get();
     if (!g_prologueOpen[g_frame]) {
       g_prologueOpen[g_frame] = true;
@@ -1954,11 +1977,11 @@ void RecordGuestMemoryCopy(uint32_t address, const Upload& upload, uint32_t size
   }
   g_profile.inOrderCopies++;
   auto* commandList = CommandList();
-  commandList->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+  commandList->barriers(GuestMemoryStages(RenderBarrierStage::COPY),
                         RenderBufferBarrier(g_guestMemory.get(), RenderBufferAccess::WRITE));
   commandList->copyBufferRegion(RenderBufferReference(g_guestMemory.get(), address),
                                 RenderBufferReference(upload.buffer, upload.offset), size);
-  commandList->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+  commandList->barriers(GuestMemoryStages(RenderBarrierStage::GRAPHICS),
                         RenderBufferBarrier(g_guestMemory.get(),
                                             RenderBufferAccess::READ | RenderBufferAccess::WRITE));
 }
@@ -1989,9 +2012,12 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
     return;
   }
   StageTimer timer(Stage::kSync);
-  bool inOrder = g_frameMemExport || ReadThisFrame(address, size);
-  if (g_frameReadKeys.insert((uint64_t(address) << 32) | size).second) {
-    g_frameReads.push_back({address, size});
+  bool inOrder = true;
+  if (g_prologueMode) {
+    inOrder = g_frameMemExport || ReadThisFrame(address, size);
+    if (g_frameReadKeys.insert((uint64_t(address) << 32) | size).second) {
+      g_frameReads.push_back({address, size});
+    }
   }
   // (inline draws' data, always copied, at addresses and sizes that vary
   // without end: a range of their own, not kept)
@@ -3609,7 +3635,7 @@ void SubmitDraw(DrawRecord& record) {
   }
   // Memory export results feed later draws.
   if (record.memExport) {
-    commandList->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+    commandList->barriers(GuestMemoryStages(RenderBarrierStage::GRAPHICS),
                           RenderBufferBarrier(g_guestMemory.get(),
                                               RenderBufferAccess::READ | RenderBufferAccess::WRITE));
   }
@@ -4492,7 +4518,7 @@ void Present(HostTexture* frontBuffer) {
     // for 5 s then, and tried again)
     static int timeouts = 0;
     static auto pausedUntil = std::chrono::steady_clock::time_point{};
-    if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 &&
+    if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 && !UnderGamescope() &&
         std::chrono::steady_clock::now() >= pausedUntil) {
       auto start = std::chrono::steady_clock::now();
       g_swapChain->wait();
@@ -4901,6 +4927,29 @@ bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs) {
   return true;
 }
 
+// Under gamescope (the Steam Deck's Game Mode, or a game run through it):
+// it reports a frame reaching the screen at uneven times, a few ms either way,
+// so the two settings that go by those reports misbehave there. Input Latency
+// Low (each frame waits until the last is shown) made the frames come in
+// pairs, 6 then 28 ms apart, and Frame Pacing Auto (the guest's vblanks on the
+// reported refreshes) made them uneven: there they act as Standard and Timer.
+bool DrainRequested() {
+  return g_drainRequest.exchange(false, std::memory_order_relaxed);
+}
+
+bool UnderGamescope() {
+  static const bool under = [] {
+    const char* v = std::getenv("GAMESCOPE_WAYLAND_DISPLAY");
+    bool yes = v && v[0];
+    if (yes) {
+      REXLOG_INFO("video: under gamescope: Input Latency Low and Frame Pacing Auto act as "
+                  "Standard and Timer");
+    }
+    return yes;
+  }();
+  return under;
+}
+
 int64_t DisplayClockNow() {
   return SteadyNs();
 }
@@ -4925,6 +4974,19 @@ bool CreateHostDevice() {
     return false;
   }
   REXLOG_INFO("video: Vulkan device '{}'", g_device->getDescription().name);
+  {
+#if defined(_WIN32)
+    bool amd = g_device->getDescription().vendor == RenderDeviceVendor::AMD;
+#else
+    bool amd = false;
+#endif
+    const char* v = std::getenv("NG2_PROLOGUE");
+    g_prologueMode = v ? std::clamp(std::atoi(v), 0, 2) : amd ? 2 : 0;
+    if (g_prologueMode) {
+      REXLOG_INFO("video: guest memory copies before the frame ({})",
+                  g_prologueMode == 2 ? "own submit" : "in the frame's submit");
+    }
+  }
 
   g_queue = g_device->createCommandQueue(RenderCommandListType::DIRECT);
   for (size_t i = 0; i < NUM_FRAMES; i++) {

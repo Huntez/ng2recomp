@@ -156,8 +156,9 @@ each defaults to the game's own behaviour.
   to FIFO); Frame Pacing (Timer, the game's own 60 Hz clock, or Auto: the game's frames on the
   display's own refreshes, measured from the frames reaching the screen, so no frame is shown
   twice for the drift on a screen a little off 60 Hz, as 59.94; needs VK_KHR_present_wait, else it
-  runs as Timer). Timer is the default: use it on the Steam Deck, where Auto gave me uneven frame
-  pacing, and on a variable-refresh display, G-Sync or FreeSync
+  runs as Timer). Timer is the default: use it on a variable-refresh display, G-Sync or FreeSync.
+  In the Steam Deck's Game Mode (and any game run through gamescope) Auto acts as Timer: there it
+  gave me uneven frame pacing
 - **Cheats**: Infinite Health; Infinite Ninpo (each cast's ninpo filled back); Unlock Costumes;
   All Weapons and Ninpo (Level 1 or 3: every melee and projectile weapon, ninpo and ammo, given at a
   new game, a load and a stage's start; what it gives stays in the save when it's turned off, as
@@ -170,7 +171,8 @@ each defaults to the game's own behaviour.
 - **Extras**: Skip Intro; Skip Cutscenes (any, watched or not); Skip Death Screen (straight to the
   game over menu); Auto Chapter Screen (chapter cards and mission briefings go on by themselves)
 - **Gameplay**: Input Latency (Low: no finished frame waits for the screen; needs
-  VK_KHR_present_wait); Unlock Difficulties (every path in New Game and Mission Mode, at once
+  VK_KHR_present_wait; in the Steam Deck's Game Mode, and any game run through gamescope, it acts as
+  Standard, as Low made frames come in pairs there); Unlock Difficulties (every path in New Game and Mission Mode, at once
   either way)
 
 In the in-game menu, a page with six settings has no Restore Defaults row (the list has no room

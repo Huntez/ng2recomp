@@ -59,6 +59,11 @@ uint64_t RecordedCalls();
 
 void WaitForRecordedCalls(uint64_t records);
 
+// Under gamescope, where frames' times on screen are reported unevenly (video.cpp).
+bool UnderGamescope();
+// The game a frame ahead of the display and held up by it each frame: the vblank
+// timer should skip a step (video.cpp, NoteFrameWait).
+bool DrainRequested();
 // The display's last refresh and period (steady_clock ns), from the
 // presents reaching the screen; false unless steady and recent.
 bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs);

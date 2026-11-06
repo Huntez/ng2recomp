@@ -375,12 +375,15 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     const int64_t guestPeriodNs = int64_t(1e9 / hz);
     int64_t lastVblankNs = 0;
     bool lockedLogged = false;
+    int64_t lastDrainNs = 0, drainPausedUntil = 0, drainPauseNs = 30'000'000'000;
+    int drainsLogged = 0, drainsQuick = 0;
+    bool skipNext = false;
     while (running_) {
       int64_t refreshNs = 0, periodNs = 0;
       // (FIFO and Mailbox only: there the presents reach the screen on its
       // refreshes; with V-Sync Off or Adaptive a late one shows at once)
       int32_t presentMode = REXCVAR_GET(present_mode);
-      if (REXCVAR_GET(vsync) && REXCVAR_GET(frame_pacing) == 0 &&
+      if (REXCVAR_GET(vsync) && REXCVAR_GET(frame_pacing) == 0 && !ng2::video::UnderGamescope() &&
           (presentMode == 1 || presentMode == 2) &&
           ng2::video::DisplayRefresh(&refreshNs, &periodNs)) {
         int64_t every = std::clamp<int64_t>((guestPeriodNs + periodNs / 2) / periodNs, 1, 4);
@@ -411,11 +414,43 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       }
       uint64_t interval = REXCVAR_GET(vsync) ? vsyncInterval : freeInterval;
       uint64_t now = rex::chrono::Clock::QueryGuestTickCount();
+      // A frame ahead of the display under gamescope (video.cpp's
+      // DrainRequested): the next step gives no vblank, once. Up to 3 come
+      // within 3 s of each other (a queue two frames ahead takes two); a
+      // fourth means skips don't help (a GPU too slow, Steam's frame
+      // limiter): none for 30 s, doubling each time that happens again, up
+      // to 10 min. A skip with no request for 3 s after it starts that over.
+      bool drain = ng2::video::DrainRequested();  // (always taken: none left over)
+      if (drain && REXCVAR_GET(vsync) && (presentMode == 1 || presentMode == 2)) {
+        int64_t t = ng2::video::DisplayClockNow();
+        bool quick = lastDrainNs && t - lastDrainNs < 3'000'000'000;
+        if (lastDrainNs && !quick) {
+          drainPauseNs = 30'000'000'000;  // (the last skips helped)
+        }
+        drainsQuick = quick ? drainsQuick + 1 : 0;
+        if (drainsQuick >= 3) {
+          drainPausedUntil = t + drainPauseNs;
+          drainPauseNs = std::min<int64_t>(drainPauseNs * 2, 600'000'000'000);
+          drainsQuick = 0;
+          lastDrainNs = 0;
+        } else if (t >= drainPausedUntil) {
+          lastDrainNs = t;
+          skipNext = true;
+          if (drainsLogged < 20) {
+            drainsLogged++;
+            REXLOG_INFO("gpu: a vblank late, the game a frame ahead of the display");
+          }
+        }
+      }
       if (now - last > std::max(interval * 4, frequency / 20)) {
         last = now - interval;  // far behind (a stall over 50 ms): no burst
       }
       if (now - last >= interval) {
         last += interval;
+        if (skipNext) {  // (the drain: this step gives no vblank)
+          skipNext = false;
+          continue;
+        }
         lastVblankNs = ng2::video::DisplayClockNow();
         DispatchInterrupt(0, 2);
         WakeWaits();
