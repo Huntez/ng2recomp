@@ -10,11 +10,83 @@ data_dir=${XDG_DATA_HOME:-$HOME/.local/share}/ng2-recomp
 # saves, the log, a copied game) goes in a userdata folder next to it. The
 # first start offers it when that folder can be written.
 beside=${APPIMAGE:+$(dirname "$APPIMAGE")}
+
+# Dialogs: kdialog (KDE), else qarma or zenity (other desktops, such as GNOME,
+# Cinnamon or Xfce), else questions in the terminal the AppImage was started
+# from. ui_* return non-zero when the player cancels.
+ui= markup=()
+if command -v kdialog >/dev/null; then ui=kdialog
+elif command -v qarma >/dev/null; then ui=qarma
+elif command -v zenity >/dev/null; then ui=zenity markup=(--no-markup)
+elif [ -t 0 ] && [ -t 1 ]; then ui=terminal
+fi
+ui_message() {  # <title> <text>
+  case $ui in
+    kdialog) kdialog --title "$1" --msgbox "$2" ;;
+    qarma|zenity) "$ui" --info "${markup[@]}" --title "$1" --text "$2" --width 480 2>/dev/null ;;
+    terminal) printf '\n%s\n%s\n' "$1" "$2" ;;
+    *) return 1 ;;
+  esac
+}
+ui_error() {  # <text>: shown, also on the terminal
+  echo "$1" >&2
+  case $ui in
+    kdialog) kdialog --title "Ninja Gaiden II" --error "$1" || true ;;
+    qarma|zenity) "$ui" --error "${markup[@]}" --title "Ninja Gaiden II" --text "$1" --width 480 \
+                    2>/dev/null || true ;;
+  esac
+  return 0
+}
+ui_yesno() {  # <title> <yes label> <no label> <text>: 0 for yes
+  case $ui in
+    kdialog) kdialog --title "$1" --yes-label "$2" --no-label "$3" --yesno "$4" 2>/dev/null ;;
+    qarma|zenity) "$ui" --question "${markup[@]}" --title "$1" --ok-label "$2" --cancel-label "$3" --text "$4" \
+                    --width 480 2>/dev/null ;;
+    terminal)
+      local answer
+      printf '\n%s\n%s\n' "$1" "$4"
+      read -r -p "[1] $2  [2] $3: " answer || return 1
+      case $answer in 1|y|Y|yes|Yes) return 0 ;; *) return 1 ;; esac ;;
+    *) return 1 ;;
+  esac
+}
+ui_path() {  # a typed or dropped path (quoted by the terminal, ~ for home): as a path
+  local path=$1
+  path=${path%"${path##*[![:space:]]}"}  # trailing spaces
+  case $path in
+    \'*\') path=${path:1:${#path}-2} ;;
+    \"*\") path=${path:1:${#path}-2} ;;
+  esac
+  case $path in "~"|"~/"*) path="$HOME${path:1}" ;; esac
+  [ -n "$path" ] && printf '%s\n' "$path"
+}
+ui_file() {  # <title> <kdialog filter>: the chosen file's path
+  case $ui in
+    kdialog) kdialog --title "$1" --getopenfilename "$HOME" "$2" ;;
+    qarma|zenity) "$ui" --file-selection --title "$1" --filename "$HOME/" 2>/dev/null ;;
+    terminal)
+      local path
+      read -r -e -p "$1, path: " path || return 1
+      ui_path "$path" ;;
+    *) return 1 ;;
+  esac
+}
+ui_folder() {  # <title>: the chosen folder's path
+  case $ui in
+    kdialog) kdialog --title "$1" --getexistingdirectory "$HOME" ;;
+    qarma|zenity) "$ui" --file-selection --directory --title "$1" --filename "$HOME/" 2>/dev/null ;;
+    terminal)
+      local path
+      read -r -e -p "$1, folder: " path || return 1
+      ui_path "$path" ;;
+    *) return 1 ;;
+  esac
+}
 if [ -n "$beside" ] && [ ! -f "$beside/portable.txt" ] && [ ! -f "$config_dir/game_dir" ] &&
    [ ! -f "$config_dir/portable_asked" ] &&
-   [ -z "${NG2_GAME_DIR:-}" ] && [ -w "$beside" ] && command -v kdialog >/dev/null; then
-  if kdialog --title "Ninja Gaiden II" --yes-label "Portable" --no-label "Normal" --yesno \
-      "Keep the settings, saves and the installed game in a userdata folder next to the AppImage ($beside), instead of in your home folder?" 2>/dev/null; then
+   [ -z "${NG2_GAME_DIR:-}" ] && [ -w "$beside" ] && [ -n "$ui" ]; then
+  if ui_yesno "Ninja Gaiden II" "Portable" "Normal" \
+      "Keep the settings, saves and the installed game in a userdata folder next to the AppImage ($beside), instead of in your home folder?"; then
     : > "$beside/portable.txt"
   else
     mkdir -p "$config_dir" && : > "$config_dir/portable_asked"  # (Normal: not asked again)
@@ -26,13 +98,12 @@ if [ -n "$beside" ] && [ -f "$beside/portable.txt" ]; then
 fi
 mkdir -p "$config_dir" "$data_dir/user" 2>/dev/null || {
   msg="Can't write $data_dir. In portable mode the folder next to the AppImage must be writable (or delete portable.txt there)."
-  if command -v kdialog >/dev/null; then kdialog --title "Ninja Gaiden II" --error "$msg"; else echo "$msg" >&2; fi
+  ui_error "$msg"
   exit 1
 }
 
 error() {
-  if command -v kdialog >/dev/null; then kdialog --title "Ninja Gaiden II" --error "$1"
-  else echo "$1" >&2; fi
+  ui_error "$1"
   exit 1
 }
 
@@ -41,8 +112,9 @@ error() {
 extract() {
   local qdbus ref pid percent
   qdbus=$(command -v qdbus6 || command -v qdbus || true)
-  if [ -z "$qdbus" ] || ! ref=$(kdialog --title "Ninja Gaiden II" \
+  if [ "$ui" != kdialog ] || [ -z "$qdbus" ] || ! ref=$(kdialog --title "Ninja Gaiden II" \
       --progressbar "Copying the game from the disc..." 100 2>/dev/null); then
+    [ "$ui" = terminal ] && echo "Copying the game from the disc..."
     python3 -I "$here/usr/bin/xdvdfs_extract.py" "$1" "$2" 2>"$data_dir/extract.log"
     return
   fi
@@ -80,13 +152,21 @@ if [ -z "$game" ] && [ -f "$config_dir/game_dir" ]; then
     printf '%s\n' "$game" > "$config_dir/game_dir"
   fi
 fi
+# An extracted copy next to the AppImage is taken without asking (unless
+# NG2_GAME_DIR names another folder).
+if [ -z "${NG2_GAME_DIR:-}" ] && { [ -z "$game" ] || [ ! -f "$game/default.xex" ]; } && [ -n "$beside" ]; then
+  for dir in "$beside" "$beside/game_files" "$beside/game"; do
+    if [ -f "$dir/default.xex" ]; then game=$dir; printf '%s\n' "$game" > "$config_dir/game_dir"; break; fi
+  done
+fi
 if [ -z "$game" ] || [ ! -f "$game/default.xex" ]; then
-  command -v kdialog >/dev/null ||
-    error "Set NG2_GAME_DIR to the folder with default.xex (kdialog is needed to ask)."
-  kdialog --title "Ninja Gaiden II" --msgbox \
+  [ -n "$ui" ] ||
+    error "Put the extracted game (the folder with default.xex) next to the AppImage, set NG2_GAME_DIR to it, or start the AppImage from a terminal to be asked."
+  ui_message "Ninja Gaiden II" \
     "Choose your copy of the game: a disc image (.iso), the Games on Demand package (the file in 544307D5/00007000, next to its .data folder), or default.xex in an extracted copy. A disc image or package is copied into $data_dir/game." || exit 0
-  choice=$(kdialog --title "Ninja Gaiden II: game files" \
-    --getopenfilename "$HOME" "*|Disc image, Games on Demand package or default.xex") || exit 0
+  choice=$(ui_file "Ninja Gaiden II: game files" \
+    "*|Disc image, Games on Demand package or default.xex") || exit 0
+  [ -e "$choice" ] || error "There's no $choice."
   name=$(basename "$choice")
   case "${name,,}" in
     default.xex) game=$(dirname "$choice") ;;
@@ -130,12 +210,12 @@ if [ -f "$game/default.xexp" ] && [ "$(sha1sum "$game/default.xexp" | cut -d' ' 
   mv "$game/default.xexp" "$game/default.xexp.tu2" 2>/dev/null || true
 fi
 if [ ! -f "$game/default.xexp" ]; then
-  command -v kdialog >/dev/null ||
-    error "Title Update 3 is missing: put default.xexp in $game (kdialog is needed to ask)."
-  kdialog --title "Ninja Gaiden II: Title Update 3" --msgbox \
+  [ -n "$ui" ] ||
+    error "Title Update 3 is missing: put default.xexp in $game, or start the AppImage from a terminal to be asked."
+  ui_message "Ninja Gaiden II: Title Update 3" \
     "This port runs the game with Title Update 3 (for the World release, media ID 69F555CB). Choose the update: its package (TU_1A461UL_000000G000000.00000000000O4) or an extracted default.xexp." || exit 0
-  update=$(kdialog --title "Ninja Gaiden II: Title Update 3" \
-    --getopenfilename "$HOME" "TU_* default.xexp|Title update or default.xexp") || exit 0
+  update=$(ui_file "Ninja Gaiden II: Title Update 3" "TU_* default.xexp|Title update or default.xexp") || exit 0
+  [ -f "$update" ] || error "There's no $update."
   [ -w "$game" ] || error "Can't write to $game: copy default.xexp there yourself."
   case "$(basename "$update")" in
     *.xexp|*.XEXP) cp "$update" "$game/default.xexp.part" || error "Can't copy to $game." ;;
@@ -156,11 +236,11 @@ fi
 # Downloadable content, offered once: the packages in a chosen folder (at any
 # depth, as the console keeps them) copied into the game folder's dlc/, which
 # the game installs from at start.
-if [ ! -f "$config_dir/dlc_asked" ] && command -v kdialog >/dev/null; then
+if [ ! -f "$config_dir/dlc_asked" ] && [ -n "$ui" ]; then
   touch "$config_dir/dlc_asked"
-  if kdialog --title "Ninja Gaiden II: downloadable content" --yes-label "Add DLC" --no-label "Skip" \
-      --yesno "Add downloadable content? Choose the folder with the packages (for example 544307D5/00000002). You can also put them in the dlc folder inside the game folder later."; then
-    from=$(kdialog --title "Ninja Gaiden II: downloadable content" --getexistingdirectory "$HOME") || from=
+  if ui_yesno "Ninja Gaiden II: downloadable content" "Add DLC" "Skip" \
+      "Add downloadable content? Choose the folder with the packages (for example 544307D5/00000002). You can also put them in the dlc folder inside the game folder later."; then
+    from=$(ui_folder "Ninja Gaiden II: downloadable content") || from=
     if [ -n "$from" ]; then
       # One of each name, none from the game's own dlc folder.
       target=$(realpath -m "$game/dlc")
@@ -174,9 +254,9 @@ if [ ! -f "$config_dir/dlc_asked" ] && command -v kdialog >/dev/null; then
         packages+=("$package")
       done < <(python3 -I "$here/usr/bin/find_dlc.py" "$from")
       if [ ${#packages[@]} -eq 0 ]; then
-        kdialog --title "Ninja Gaiden II" --error "There's no downloadable content for this game in $from." || true
+        ui_error "There's no downloadable content for this game in $from."
       elif ! { mkdir -p "$game/dlc" && cp -f "${packages[@]}" "$game/dlc/"; }; then
-        kdialog --title "Ninja Gaiden II" --error "Can't copy the downloadable content to $game/dlc." || true
+        ui_error "Can't copy the downloadable content to $game/dlc."
       fi
     fi
   fi

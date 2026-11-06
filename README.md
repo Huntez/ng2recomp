@@ -112,9 +112,12 @@ kept, and later starts are quicker.
    choose 16:10 in RECOMP SETTINGS → Display.
 
 Needs a 64-bit Linux with glibc 2.35 or newer (SteamOS, Ubuntu 22.04+, Debian 12, Fedora 36+),
-Python 3 and `kdialog` for the first-start windows (both are on SteamOS and KDE desktops). Without
-kdialog, install it (the `kdialog` package), or set `NG2_GAME_DIR` to an extracted copy of the game
-with Title Update 3's `default.xexp` next to `default.xex` (DLC goes in its `dlc` folder).
+and Python 3. The first-start windows use `kdialog` (SteamOS and KDE desktops), or `qarma` or
+`zenity` where kdialog isn't installed (GNOME, Cinnamon, Xfce...). With none of them, start the
+AppImage from a terminal and it asks there. An extracted copy of the game next to the AppImage
+(`default.xex` beside it, or in a `game_files` or `game` folder there) is used without asking, as
+is `NG2_GAME_DIR`; Title Update 3's `default.xexp` goes next to `default.xex` and DLC in its `dlc`
+folder.
 
 ### Windows
 
