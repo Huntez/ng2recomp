@@ -256,6 +256,7 @@ std::unordered_map<uint64_t, std::unique_ptr<RenderPipeline>> g_copyPipelines;
 std::unordered_map<const void*, std::unique_ptr<HostTexture>> g_resolveTemps;
 
 // NG2_PROFILE=1: time spent per renderer stage, logged once a second.
+// NG2_PROFILE=2 also times each draw on the GPU, logged by shader pair.
 // wait: for the GPU (a frame's fence, the swapchain image), mostly inside the other stages.
 enum class Stage { kDraw, kSync, kTexture, kPipeline, kResolve, kPresent, kWait, kCount };
 constexpr const char* kStageNames[] = {"draw", "sync", "texture", "pipeline", "resolve",
@@ -263,7 +264,11 @@ constexpr const char* kStageNames[] = {"draw", "sync", "texture", "pipeline", "r
 struct Profile {
   bool enabled = [] {
     const char* v = std::getenv("NG2_PROFILE");
-    return v && v[0] == '1';
+    return v && (v[0] == '1' || v[0] == '2');
+  }();
+  bool perDraw = [] {
+    const char* v = std::getenv("NG2_PROFILE");
+    return v && v[0] == '2';
   }();
   uint64_t nanoseconds[size_t(Stage::kCount)] = {};
   uint64_t comparedBytes = 0, uploadedBytes = 0, frames = 0;
@@ -275,6 +280,9 @@ struct Profile {
   // GPU time by render pass target ("1120x584 fmt 3 x2, 2 colors, depth"): from a
   // pass's start mark to the next mark.
   std::map<std::string, uint64_t> gpuPassNs;
+  // With NG2_PROFILE=2, GPU time by shader pair (vertex, pixel): from a draw's
+  // mark to the next mark, and the number of draws.
+  std::map<std::pair<uint64_t, uint64_t>, std::pair<uint64_t, uint64_t>> gpuDrawNs;
   std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 } g_profile;
 
@@ -282,14 +290,17 @@ struct Profile {
 // its slot comes round again (its fence passed). Marks: the frame's start,
 // each resolve's start and end, the present pass's start, the frame's end.
 enum class GpuMark : uint8_t {
-  kFrameStart, kResolveStart, kResolveEnd, kPresentStart, kFrameEnd, kPass
+  kFrameStart, kResolveStart, kResolveEnd, kPresentStart, kFrameEnd, kPass, kDraw, kDrawEnd
 };
-constexpr uint32_t kGpuMarks = 512;
+uint32_t GpuMarkCapacity() {
+  return g_profile.perDraw ? 8192 : 512;
+}
 struct GpuTiming {
   std::unique_ptr<RenderQueryPool> pool;
   uint32_t count = 0;  // marks written this frame
   std::vector<GpuMark> kinds;
   std::vector<std::string> passLabels;  // per kPass mark, in order
+  std::vector<std::pair<uint64_t, uint64_t>> drawShaders;  // per kDraw mark, in order
 };
 GpuTiming g_gpuTiming[NUM_FRAMES];
 
@@ -579,6 +590,21 @@ void ReportProfile() {
       top += fmt::format("{}{} {:.2f}", i ? "; " : "", passes[i].second, passes[i].first / 1e6 / frames);
     }
     REXLOG_INFO("video: GPU ms a frame by pass target: {}", top);
+    if (!g_profile.gpuDrawNs.empty()) {
+      std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> pairs;
+      for (auto& [shaders, timed] : g_profile.gpuDrawNs) {
+        pairs.emplace_back(timed.first, shaders);
+      }
+      std::sort(pairs.rbegin(), pairs.rend());
+      std::string draws;
+      for (size_t i = 0; i < pairs.size() && i < 8; i++) {
+        auto [vs, ps] = pairs[i].second;
+        draws += fmt::format("{}vs {:016X} ps {:016X} {:.2f} ({:.0f} draws)", i ? "; " : "", vs, ps,
+                             pairs[i].first / 1e6 / frames,
+                             g_profile.gpuDrawNs[pairs[i].second].second / frames);
+      }
+      REXLOG_INFO("video: GPU ms a frame by shaders: {}", draws);
+    }
   }
   g_profile = Profile{};
   g_profile.last = now;
@@ -1443,9 +1469,16 @@ RenderCommandList* CommandList();
 uint32_t AllocGpuMark(GpuMark kind) {
   GpuTiming& t = g_gpuTiming[g_frame];
   // (the last two kept for the frame's present and end marks)
-  uint32_t limit = kind == GpuMark::kPresentStart || kind == GpuMark::kFrameEnd ? kGpuMarks
-                                                                                  : kGpuMarks - 2;
+  uint32_t capacity = GpuMarkCapacity();
+  uint32_t limit = kind == GpuMark::kPresentStart || kind == GpuMark::kFrameEnd ? capacity
+                                                                                  : capacity - 2;
   if (!g_profile.enabled || !t.pool || t.count >= limit) {
+    static bool logged = false;
+    if (g_profile.perDraw && t.pool && !logged) {
+      logged = true;
+      REXLOG_WARN("video: over {} GPU timestamps in a frame: the rest of it isn't timed by draw",
+                  limit);
+    }
     return UINT32_MAX;
   }
   t.kinds.push_back(kind);
@@ -1474,11 +1507,25 @@ void ReadGpuTiming(uint32_t frame) {
   t.pool->queryResults(t.count);  // (the written ones: the rest would fail the read)
   const uint64_t* ns = t.pool->getResults();
   uint64_t start = ns[0], resolveStart = 0, presentStart = 0, resolves = 0;
-  size_t pass = 0;
+  size_t pass = 0, draw = 0;
+  uint64_t* passNs = nullptr;  // the pass the marks are in (its draws' marks included)
   for (uint32_t i = 0; i < t.count; i++) {
-    if (t.kinds[i] == GpuMark::kPass && pass < t.passLabels.size()) {
-      uint64_t next = i + 1 < t.count ? ns[i + 1] : ns[i];
-      g_profile.gpuPassNs[t.passLabels[pass++]] += next > ns[i] ? next - ns[i] : 0;
+    uint64_t next = i + 1 < t.count ? ns[i + 1] : ns[i];
+    uint64_t span = next > ns[i] ? next - ns[i] : 0;
+    GpuMark kind = t.kinds[i];
+    if (kind == GpuMark::kPass) {
+      passNs = pass < t.passLabels.size() ? &g_profile.gpuPassNs[t.passLabels[pass++]] : nullptr;
+    } else if (kind != GpuMark::kDraw && kind != GpuMark::kDrawEnd) {
+      passNs = nullptr;
+    }
+    if (passNs) {
+      *passNs += span;
+    }
+    // A draw's own time: its mark to the mark after it (kDrawEnd).
+    if (t.kinds[i] == GpuMark::kDraw && draw < t.drawShaders.size()) {
+      auto& [drawNs, draws] = g_profile.gpuDrawNs[t.drawShaders[draw++]];
+      drawNs += span;
+      draws++;
     }
     switch (t.kinds[i]) {
       case GpuMark::kResolveStart: resolveStart = ns[i]; break;
@@ -1496,6 +1543,7 @@ void ReadGpuTiming(uint32_t frame) {
   t.count = 0;
   t.kinds.clear();
   t.passLabels.clear();
+  t.drawShaders.clear();
 }
 
 // The frame's pool reset and its start marked (once recording).
@@ -1505,9 +1553,9 @@ void BeginGpuTiming(uint32_t frame) {
   }
   GpuTiming& t = g_gpuTiming[frame];
   if (!t.pool) {
-    t.pool = g_device->createQueryPool(kGpuMarks);
+    t.pool = g_device->createQueryPool(GpuMarkCapacity());
   }
-  CommandList()->resetQueryPool(t.pool.get(), 0, kGpuMarks);
+  CommandList()->resetQueryPool(t.pool.get(), 0, GpuMarkCapacity());
   MarkGpu(GpuMark::kFrameStart);
 }
 
@@ -3587,6 +3635,7 @@ struct DrawRecord {
   std::optional<RenderIndexBufferView> indexView;
   uint32_t drawCount = 0;
   uint32_t startVertex = 0;
+  uint64_t vertexShader = 0, pixelShader = 0;  // hashes, for NG2_PROFILE=2
 };
 
 // BeginVertices / BeginIndexedVertices hand the game a pointer into the
@@ -3627,11 +3676,23 @@ void SubmitDraw(DrawRecord& record) {
   std::fill_n(scissors, viewportCount, record.scissor);
   commandList->setViewports(viewports, viewportCount);
   commandList->setScissors(scissors, viewportCount);
+  if (g_profile.perDraw) {
+    if (uint32_t mark = AllocGpuMark(GpuMark::kDraw); mark != UINT32_MAX) {
+      g_gpuTiming[g_frame].drawShaders.emplace_back(record.vertexShader, record.pixelShader);
+      WriteGpuMark(commandList, g_frame, mark);
+    }
+  }
   if (record.indexed) {
     commandList->setIndexBuffer(&*record.indexView);
     commandList->drawIndexedInstanced(record.drawCount, 1, 0, int32_t(record.startVertex), 0);
   } else {
     commandList->drawInstanced(record.drawCount, 1, record.startVertex, 0);
+  }
+  if (g_profile.perDraw) {
+    // (what comes before the next draw, clears and copies, isn't the draw's)
+    if (uint32_t mark = AllocGpuMark(GpuMark::kDrawEnd); mark != UINT32_MAX) {
+      WriteGpuMark(commandList, g_frame, mark);
+    }
   }
   // Memory export results feed later draws.
   if (record.memExport) {
@@ -4164,6 +4225,8 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   }
   DrawRecord record;
   record.pipeline = pipeline;
+  record.vertexShader = vs->entry->hash;
+  record.pixelShader = ps ? ps->entry->hash : 0;
   record.memExport = memExport;
   g_frameMemExport |= memExport;
   std::copy(targets, targets + targetCount, record.targets);
