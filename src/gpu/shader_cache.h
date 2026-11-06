@@ -24,6 +24,11 @@ struct ShaderCacheEntry {
   // reads: the others aren't uploaded or looked up for its draws.
   const uint64_t floatConstantMask[4];
   const uint32_t textureSlotMask;
+  // A variant that interpolates the part id itself with the GPU's
+  // barycentrics (the shaders that hide cut-off parts), in the same cache; 0
+  // bytes for the others.
+  const uint32_t barycentricSpirvOffset;
+  const uint32_t barycentricSpirvSize;
   struct GuestShader* guestShader;
 };
 

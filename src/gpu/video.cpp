@@ -597,7 +597,12 @@ void ReportProfile() {
       }
       std::sort(pairs.rbegin(), pairs.rend());
       std::string draws;
-      for (size_t i = 0; i < pairs.size() && i < 8; i++) {
+      // (NG2_PROFILE_TOP=<n>: that many pairs instead of 8)
+      static const size_t top = [] {
+        const char* v = std::getenv("NG2_PROFILE_TOP");
+        return v ? size_t(std::max(1, std::atoi(v))) : size_t(8);
+      }();
+      for (size_t i = 0; i < pairs.size() && i < top; i++) {
         auto [vs, ps] = pairs[i].second;
         draws += fmt::format("{}vs {:016X} ps {:016X} {:.2f} ({:.0f} draws)", i ? "; " : "", vs, ps,
                              pairs[i].first / 1e6 / frames,
@@ -984,6 +989,28 @@ RenderFormat ColorTargetFormat(uint32_t format) {
   return RenderFormat::R8G8B8A8_UNORM;
 }
 
+// Test switches for #2 (AMD's Windows driver: the draws that sample the
+// shadow map, a 16_16 resolve, cost 2-4 ms each there).
+// NG2_TEST_SHADOW_FORMAT=float: 16_16 resolves kept as R16G16_FLOAT (the same
+// range, less precision) instead of R16G16_SNORM. NG2_TEST_NO_BORDER=1: clamp
+// to border samples as clamp to edge.
+bool TestSwitch(const char* name, const char* value) {
+  const char* v = std::getenv(name);
+  bool on = v && std::strcmp(v, value) == 0;
+  if (on) {
+    REXLOG_INFO("video: test switch {}={}", name, value);
+  }
+  return on;
+}
+bool TestShadowFloat() {
+  static const bool on = TestSwitch("NG2_TEST_SHADOW_FORMAT", "float");
+  return on;
+}
+bool TestNoBorder() {
+  static const bool on = TestSwitch("NG2_TEST_NO_BORDER", "1");
+  return on;
+}
+
 // Host format for a resolve destination (a guest texture written by the GPU).
 RenderFormat ResolveTextureFormat(xenos::TextureFormat format) {
   switch (format) {
@@ -998,7 +1025,7 @@ RenderFormat ResolveTextureFormat(xenos::TextureFormat format) {
     case xenos::TextureFormat::k_16_16_16_16_EXPAND:
       return RenderFormat::R16G16B16A16_FLOAT;
     case xenos::TextureFormat::k_16_16:
-      return RenderFormat::R16G16_SNORM;
+      return TestShadowFloat() ? RenderFormat::R16G16_FLOAT : RenderFormat::R16G16_SNORM;
     case xenos::TextureFormat::k_16_16_FLOAT:
     case xenos::TextureFormat::k_16_16_EXPAND:
       return RenderFormat::R16G16_FLOAT;
@@ -2226,10 +2253,22 @@ RenderShader* HostShader(const ShaderCacheEntry* entry) {
       ZSTD_decompress(g_spirvCache.get(), g_spirvCacheDecompressedSize, g_compressedSpirvCache,
                       g_spirvCacheCompressedSize);
     }
-    const uint8_t* encoded = g_spirvCache.get() + entry->spirvOffset;
-    size_t size = smolv::GetDecodedBufferSize(encoded, entry->spirvSize);
+    // The shaders that hide cut-off parts interpolate the part id themselves
+    // where the GPU has fragment shader barycentrics (NG2_BARYCENTRIC=0: the
+    // snapped hardware interpolation instead, to compare).
+    static const bool barycentric = [] {
+      const char* v = std::getenv("NG2_BARYCENTRIC");
+      bool on = g_device->getCapabilities().fragmentShaderBarycentric && !(v && v[0] == '0');
+      REXLOG_INFO("video: part ids interpolated {}", on ? "from barycentrics" : "by the hardware");
+      return on;
+    }();
+    bool variant = barycentric && entry->barycentricSpirvSize;
+    const uint8_t* encoded =
+        g_spirvCache.get() + (variant ? entry->barycentricSpirvOffset : entry->spirvOffset);
+    uint32_t encodedSize = variant ? entry->barycentricSpirvSize : entry->spirvSize;
+    size_t size = smolv::GetDecodedBufferSize(encoded, encodedSize);
     std::vector<uint8_t> spirv(size);
-    if (smolv::Decode(encoded, entry->spirvSize, spirv.data(), size)) {
+    if (smolv::Decode(encoded, encodedSize, spirv.data(), size)) {
       MakeTimer made(g_frameStats.shaders, g_frameStats.shaderNs);
       if (!g_device->getCapabilities().roundingModeRTZ) {
         DropRoundTowardZero(spirv);
@@ -2341,7 +2380,8 @@ RenderTextureAddressMode ConvertClamp(xenos::ClampMode mode) {
     case xenos::ClampMode::kMirrorClampToEdge:
     case xenos::ClampMode::kMirrorClampToHalfway: return RenderTextureAddressMode::MIRROR_ONCE;
     case xenos::ClampMode::kClampToBorder:
-    case xenos::ClampMode::kMirrorClampToBorder: return RenderTextureAddressMode::BORDER;
+    case xenos::ClampMode::kMirrorClampToBorder:
+      return TestNoBorder() ? RenderTextureAddressMode::CLAMP : RenderTextureAddressMode::BORDER;
     default: return RenderTextureAddressMode::CLAMP;
   }
 }
@@ -3934,13 +3974,16 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     }
     if (Tracing()) {
       TraceLog("  tex {} fmt {} {}x{} base {:#x} tiled {} endian {} dim {} sign {}{}{}{} "
-                  "swizzle {:#o} exp {} -> {}",
+                  "swizzle {:#o} exp {} clamp {}{}{} mips {:#x} {}-{} filter {}{}{} -> {}",
                   slot, uint32_t(fetch.format), fetch.size_2d.width + 1,
                   fetch.size_2d.height + 1, uint32_t(fetch.base_address) << 12,
                   uint32_t(fetch.tiled), uint32_t(fetch.endianness), uint32_t(fetch.dimension),
                   uint32_t(fetch.sign_x), uint32_t(fetch.sign_y), uint32_t(fetch.sign_z),
                   uint32_t(fetch.sign_w), uint32_t(fetch.swizzle), int32_t(fetch.exp_adjust),
-                  descriptor);
+                  uint32_t(fetch.clamp_x), uint32_t(fetch.clamp_y), uint32_t(fetch.clamp_z),
+                  uint32_t(fetch.mip_address) << 12, uint32_t(fetch.mip_min_level),
+                  uint32_t(fetch.mip_max_level), uint32_t(fetch.min_filter),
+                  uint32_t(fetch.mag_filter), uint32_t(fetch.mip_filter), descriptor);
     }
     if (descriptor) {
       shared.textureIndices[0][slot] = descriptor;  // 2D
