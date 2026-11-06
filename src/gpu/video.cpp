@@ -194,9 +194,9 @@ std::unique_ptr<RenderInterface> g_interface;
 std::unique_ptr<RenderDevice> g_device;
 std::unique_ptr<RenderCommandQueue> g_queue;
 std::unique_ptr<RenderCommandList> g_commandLists[NUM_FRAMES];
-// The frame's prologue: a command list of its own, submitted before the
-// frame's, holding the guest memory copies that can run first (see
-// RecordGuestMemoryCopy). Recorded by the thread that records the frame's
+// The frame's prologue: a command list of its own, submitted just before the
+// frame's (on its own: PrologueMode), holding the guest memory copies that
+// can run first (see RecordGuestMemoryCopy). Recorded by the thread that records the frame's
 // draws, with its own pool; open from its first copy to the frame's submit.
 std::unique_ptr<RenderCommandList> g_prologueLists[NUM_FRAMES];
 bool g_prologueOpen[NUM_FRAMES] = {};
@@ -1926,8 +1926,20 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
 // within a frame) stays in order. The data is the same either way: it is
 // copied into the upload at this point (or at the frame's end for the late
 // ranges), and the prologue runs after the previous frame's commands.
+// NG2_PROLOGUE (a test switch): 2, the default, submits the prologue on its
+// own just before the frame; 1 puts it in the frame's submit, which on the
+// Steam Deck under gamescope with Mailbox made every other frame a refresh
+// late; 0 records every copy in order, as before.
+int PrologueMode() {
+  static const int mode = [] {
+    const char* v = std::getenv("NG2_PROLOGUE");
+    return v ? std::atoi(v) : 2;
+  }();
+  return mode;
+}
+
 void RecordGuestMemoryCopy(uint32_t address, const Upload& upload, uint32_t size, bool inOrder) {
-  if (!inOrder) {
+  if (!inOrder && PrologueMode() != 0) {
     auto* prologue = g_prologueLists[g_frame].get();
     if (!g_prologueOpen[g_frame]) {
       g_prologueOpen[g_frame] = true;
@@ -4430,6 +4442,10 @@ void Present(HostTexture* frontBuffer) {
                                   uint32_t waitCount, RenderCommandSemaphore** signals,
                                   uint32_t signalCount) mutable {
     const RenderCommandList* lists[2] = {g_prologueLists[frame].get(), list};
+    if (prologue && PrologueMode() == 2) {
+      g_queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, nullptr);
+      prologue = false;
+    }
     g_queue->executeCommandLists(prologue ? lists : lists + 1, prologue ? 2u : 1u, waits,
                                  waitCount, signals, signalCount, g_commandFences[frame].get());
     prologue = false;
