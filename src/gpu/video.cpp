@@ -1983,20 +1983,20 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
 
 // A copy into g_guestMemory. Recorded in the frame's command list it ends the
 // render pass (Vulkan allows no copy inside one) and takes two barriers, and
-// a frame makes dozens: on AMD's Windows driver that was most of the main
-// pass's GPU time (#2). So a copy whose bytes nothing drawn earlier in the
+// a frame makes dozens, which looked like the cost on AMD's Windows driver
+// (#2; it wasn't, see below). So a copy whose bytes nothing drawn earlier in the
 // frame has read goes to the frame's prologue instead, one list run before
 // the frame's with one barrier at each end; only a copy over memory already
 // read this frame (a range rewritten between its draws, a ring buffer wrapped
 // within a frame) stays in order. The data is the same either way: it is
 // copied into the upload at this point (or at the frame's end for the late
 // ranges), and the prologue runs after the previous frame's commands.
-// Where the prologue is used (PrologueMode, set when the device is made): on
-// AMD's Windows driver only, where the cuts were the cost (#2). Elsewhere
-// every copy stays in order, as in 0.5.4: on the Steam Deck under gamescope
-// the prologue made frames come in pairs (6 then 28 ms apart).
-// NG2_PROLOGUE=0, 1 or 2 picks it anywhere: 0 in order; 1 the prologue in the
-// frame's submit; 2 the prologue submitted on its own just before the frame.
+// Off unless asked for (PrologueMode, set when the device is made): every copy
+// stays in order, as in 0.5.4. On AMD's Windows driver (#2) it didn't change
+// the main pass's cost (19 ms with it or without), and on the Steam Deck under
+// gamescope it made frames come in pairs (6 then 28 ms apart).
+// NG2_PROLOGUE=0, 1 or 2 picks it: 0 in order; 1 the prologue in the frame's
+// submit; 2 the prologue submitted on its own just before the frame.
 int g_prologueMode = 0;
 int PrologueMode() {
   return g_prologueMode;
@@ -5038,13 +5038,8 @@ bool CreateHostDevice() {
   }
   REXLOG_INFO("video: Vulkan device '{}'", g_device->getDescription().name);
   {
-#if defined(_WIN32)
-    bool amd = g_device->getDescription().vendor == RenderDeviceVendor::AMD;
-#else
-    bool amd = false;
-#endif
     const char* v = std::getenv("NG2_PROLOGUE");
-    g_prologueMode = v ? std::clamp(std::atoi(v), 0, 2) : amd ? 2 : 0;
+    g_prologueMode = v ? std::clamp(std::atoi(v), 0, 2) : 0;
     if (g_prologueMode) {
       REXLOG_INFO("video: guest memory copies before the frame ({})",
                   g_prologueMode == 2 ? "own submit" : "in the frame's submit");
