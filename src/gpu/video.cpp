@@ -194,6 +194,12 @@ std::unique_ptr<RenderInterface> g_interface;
 std::unique_ptr<RenderDevice> g_device;
 std::unique_ptr<RenderCommandQueue> g_queue;
 std::unique_ptr<RenderCommandList> g_commandLists[NUM_FRAMES];
+// The frame's prologue: a command list of its own, submitted before the
+// frame's, holding the guest memory copies that can run first (see
+// RecordGuestMemoryCopy). Recorded by the thread that records the frame's
+// draws, with its own pool; open from its first copy to the frame's submit.
+std::unique_ptr<RenderCommandList> g_prologueLists[NUM_FRAMES];
+bool g_prologueOpen[NUM_FRAMES] = {};
 std::unique_ptr<RenderCommandFence> g_commandFences[NUM_FRAMES];
 std::unique_ptr<RenderCommandSemaphore> g_acquireSemaphores[NUM_FRAMES];
 // One per swapchain image: a present can still hold its semaphore when the
@@ -265,6 +271,7 @@ struct Profile {
   // GPU time (timestamps): whole frames, their resolves and their present pass.
   uint64_t gpuNs = 0, gpuResolveNs = 0, gpuPresentNs = 0, gpuFrames = 0;
   uint64_t barriers = 0, passes = 0;  // recorded (the CPU's count), and passes started
+  uint64_t prologueCopies = 0, inOrderCopies = 0;  // guest memory copies, by where they go
   // GPU time by render pass target ("1120x584 fmt 3 x2, 2 colors, depth"): from a
   // pass's start mark to the next mark.
   std::map<std::string, uint64_t> gpuPassNs;
@@ -375,12 +382,44 @@ class StageTimer {
   uint64_t start_ = 0;
 };
 
+// NG2_PRESENT_GAPS=1: the time between presents, each second: the median,
+// the shortest and longest, and how many were over 20 ms or under 13 ms (at
+// 60 fps an even game presents every 16.7 ms; frame pacing shows up here).
+void ReportPresentGaps(std::chrono::steady_clock::time_point now) {
+  static const bool enabled = [] {
+    const char* v = std::getenv("NG2_PRESENT_GAPS");
+    return v && v[0] == '1';
+  }();
+  if (!enabled) {
+    return;
+  }
+  static std::chrono::steady_clock::time_point last, start;
+  static std::vector<double> gaps;
+  if (last != std::chrono::steady_clock::time_point()) {
+    gaps.push_back(std::chrono::duration<double, std::milli>(now - last).count());
+  } else {
+    start = now;
+  }
+  last = now;
+  if (now - start < std::chrono::seconds(1) || gaps.empty()) {
+    return;
+  }
+  std::sort(gaps.begin(), gaps.end());
+  size_t over = std::count_if(gaps.begin(), gaps.end(), [](double g) { return g > 20.0; });
+  size_t under = std::count_if(gaps.begin(), gaps.end(), [](double g) { return g < 13.0; });
+  REXLOG_INFO("video: present gaps ms: {} median {:.2f} min {:.2f} max {:.2f}, {} over 20, {} under 13",
+              gaps.size(), gaps[gaps.size() / 2], gaps.front(), gaps.back(), over, under);
+  gaps.clear();
+  start = now;
+}
+
 void ReportHitch() {
   g_frameStats.enabled = REXCVAR_GET(log_hitches) || [] {
     const char* v = std::getenv("NG2_HITCHES");
     return v && v[0] == '1';
   }();
   auto now = std::chrono::steady_clock::now();
+  ReportPresentGaps(now);
   auto& f = g_frameStats;
   if (f.enabled && f.lastSwap != std::chrono::steady_clock::time_point()) {
     double ms = std::chrono::duration<double, std::milli>(now - f.lastSwap).count();
@@ -527,6 +566,9 @@ void ReportProfile() {
                 g_profile.gpuPresentNs / 1e6 / frames, g_profile.gpuFrames,
                 g_profile.passes / double(std::max<uint64_t>(g_profile.frames, 1)),
                 g_profile.barriers / double(std::max<uint64_t>(g_profile.frames, 1)));
+    REXLOG_INFO("video: guest memory copies a frame: {:.1f} in the prologue, {:.1f} in order",
+                g_profile.prologueCopies / double(std::max<uint64_t>(g_profile.frames, 1)),
+                g_profile.inOrderCopies / double(std::max<uint64_t>(g_profile.frames, 1)));
     std::vector<std::pair<uint64_t, std::string>> passes;
     for (auto& [label, ns] : g_profile.gpuPassNs) {
       passes.emplace_back(ns, label);
@@ -1870,15 +1912,61 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
   return upload;
 }
 
-void RecordGuestMemoryCopy(uint32_t address, const Upload& upload, uint32_t size) {
+// (Every barrier on g_guestMemory names both stages, GRAPHICS and COPY: plume
+// takes a barrier's source stages from the last one recorded on the buffer,
+// and with two lists recorded out of execution order, from two threads with
+// the render thread, that one may be the other list's.)
+// A copy into g_guestMemory. Recorded in the frame's command list it ends the
+// render pass (Vulkan allows no copy inside one) and takes two barriers, and
+// a frame makes dozens: on AMD's Windows driver that was most of the main
+// pass's GPU time (#2). So a copy whose bytes nothing drawn earlier in the
+// frame has read goes to the frame's prologue instead, one list run before
+// the frame's with one barrier at each end; only a copy over memory already
+// read this frame (a range rewritten between its draws, a ring buffer wrapped
+// within a frame) stays in order. The data is the same either way: it is
+// copied into the upload at this point (or at the frame's end for the late
+// ranges), and the prologue runs after the previous frame's commands.
+void RecordGuestMemoryCopy(uint32_t address, const Upload& upload, uint32_t size, bool inOrder) {
+  if (!inOrder) {
+    auto* prologue = g_prologueLists[g_frame].get();
+    if (!g_prologueOpen[g_frame]) {
+      g_prologueOpen[g_frame] = true;
+      prologue->begin();
+      prologue->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                         RenderBufferBarrier(g_guestMemory.get(), RenderBufferAccess::WRITE));
+    }
+    prologue->copyBufferRegion(RenderBufferReference(g_guestMemory.get(), address),
+                               RenderBufferReference(upload.buffer, upload.offset), size);
+    g_profile.prologueCopies++;
+    return;
+  }
+  g_profile.inOrderCopies++;
   auto* commandList = CommandList();
-  commandList->barriers(RenderBarrierStage::COPY,
+  commandList->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
                         RenderBufferBarrier(g_guestMemory.get(), RenderBufferAccess::WRITE));
   commandList->copyBufferRegion(RenderBufferReference(g_guestMemory.get(), address),
                                 RenderBufferReference(upload.buffer, upload.offset), size);
-  commandList->barriers(RenderBarrierStage::GRAPHICS,
+  commandList->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
                         RenderBufferBarrier(g_guestMemory.get(),
                                             RenderBufferAccess::READ | RenderBufferAccess::WRITE));
+}
+
+// What the frame's draws have read of guest memory so far (every range
+// synced, copied or not), and whether one wrote it (memory export): a copy
+// over any of it stays in order (RecordGuestMemoryCopy).
+struct FrameRead {
+  uint32_t address, size;
+};
+std::vector<FrameRead> g_frameReads;
+std::unordered_set<uint64_t> g_frameReadKeys;  // (address, size) already listed
+bool g_frameMemExport = false;
+bool ReadThisFrame(uint32_t address, uint32_t size) {
+  for (const auto& read : g_frameReads) {
+    if (address < read.address + read.size && read.address < address + size) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Makes guest physical [address, address + size) current in g_guestMemory.
@@ -1889,6 +1977,10 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
     return;
   }
   StageTimer timer(Stage::kSync);
+  bool inOrder = g_frameMemExport || ReadThisFrame(address, size);
+  if (g_frameReadKeys.insert((uint64_t(address) << 32) | size).second) {
+    g_frameReads.push_back({address, size});
+  }
   // (inline draws' data, always copied, at addresses and sizes that vary
   // without end: a range of their own, not kept)
   GuestMemoryRange scratch;
@@ -1900,7 +1992,7 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
     if (range.lateFrame != g_frameCount) {
       range.lateFrame = g_frameCount;
       Upload upload = Allocate(size, 16);
-      RecordGuestMemoryCopy(address, upload, size);
+      RecordGuestMemoryCopy(address, upload, size, inOrder);
       g_frameRanges.push_back({address, size, &range, upload.data});
     }
     return;
@@ -1959,7 +2051,7 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
   std::memcpy(shadow + begin, source + begin, length);
   Upload upload = Allocate(length, 16);
   std::memcpy(upload.data, source + begin, length);
-  RecordGuestMemoryCopy(address + begin, upload, length);
+  RecordGuestMemoryCopy(address + begin, upload, length, inOrder);
 }
 
 // End of frame, before submitting: fills the late ranges' copies and finds
@@ -1995,6 +2087,9 @@ void FinishGuestMemory() {
     }
   }
   g_frameRanges.clear();
+  g_frameReads.clear();
+  g_frameReadKeys.clear();
+  g_frameMemExport = false;
 }
 
 // Shaders ---------------------------------------------------------------------
@@ -3502,7 +3597,7 @@ void SubmitDraw(DrawRecord& record) {
   }
   // Memory export results feed later draws.
   if (record.memExport) {
-    commandList->barriers(RenderBarrierStage::GRAPHICS,
+    commandList->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
                           RenderBufferBarrier(g_guestMemory.get(),
                                               RenderBufferAccess::READ | RenderBufferAccess::WRITE));
   }
@@ -4032,6 +4127,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   DrawRecord record;
   record.pipeline = pipeline;
   record.memExport = memExport;
+  g_frameMemExport |= memExport;
   std::copy(targets, targets + targetCount, record.targets);
   record.targetCount = targetCount;
   record.depth = depth;
@@ -4319,6 +4415,25 @@ void Present(HostTexture* frontBuffer) {
   g_boundFramebuffer = nullptr;
   g_recording = false;
   (void)commandList;
+  // The prologue's copies done before the frame's commands read the memory.
+  bool prologue = g_prologueOpen[frame];
+  if (prologue) {
+    g_prologueOpen[frame] = false;
+    auto* list = g_prologueLists[frame].get();
+    list->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                   RenderBufferBarrier(g_guestMemory.get(),
+                                       RenderBufferAccess::READ | RenderBufferAccess::WRITE));
+    list->end();
+  }
+  // The frame's submit: the prologue first, once.
+  auto submit = [frame, prologue](RenderCommandList* list, RenderCommandSemaphore** waits,
+                                  uint32_t waitCount, RenderCommandSemaphore** signals,
+                                  uint32_t signalCount) mutable {
+    const RenderCommandList* lists[2] = {g_prologueLists[frame].get(), list};
+    g_queue->executeCommandLists(prologue ? lists : lists + 1, prologue ? 2u : 1u, waits,
+                                 waitCount, signals, signalCount, g_commandFences[frame].get());
+    prologue = false;
+  };
 
   // The frame's pad read (NG2_LATENCY_LOG), to its present.
   int64_t inputNs = g_handedInputNs.exchange(0);
@@ -4342,7 +4457,7 @@ void Present(HostTexture* frontBuffer) {
       WriteGpuMark(list, frame, endMark);
       presentMark = endMark = UINT32_MAX;  // (without the thread the list goes on below)
       list->end();
-      g_queue->executeCommandLists(list, g_commandFences[frame].get());
+      submit(list, nullptr, 0, nullptr, 0);
       if (RenderThreadEnabled()) {
         g_resizeRequested = true;
         FrameSubmitted();
@@ -4432,11 +4547,9 @@ void Present(HostTexture* frontBuffer) {
 
     list->end();
     if (g_swapChainValid) {
-      const RenderCommandList* commandLists[] = {list};
       RenderCommandSemaphore* waitSemaphores[] = {g_acquireSemaphores[frame].get()};
       RenderCommandSemaphore* signalSemaphores[] = {g_renderSemaphores[index].get()};
-      g_queue->executeCommandLists(commandLists, 1, waitSemaphores, 1, signalSemaphores, 1,
-                                   g_commandFences[frame].get());
+      submit(list, waitSemaphores, 1, signalSemaphores, 1);
       FrameSubmitted();
       g_swapChainValid = g_swapChain->present(index, signalSemaphores, 1);
       ReportLatency();
@@ -4447,7 +4560,7 @@ void Present(HostTexture* frontBuffer) {
         }
       }
     } else {
-      g_queue->executeCommandLists(list, g_commandFences[frame].get());
+      submit(list, nullptr, 0, nullptr, 0);
       FrameSubmitted();
     }
   });
@@ -4800,6 +4913,8 @@ bool CreateHostDevice() {
   g_queue = g_device->createCommandQueue(RenderCommandListType::DIRECT);
   for (size_t i = 0; i < NUM_FRAMES; i++) {
     g_commandLists[i] = g_queue->createCommandList();
+    g_prologueLists[i] = g_queue->createCommandList();
+    g_prologueOpen[i] = false;
     g_commandFences[i] = g_device->createCommandFence();
     g_acquireSemaphores[i] = g_device->createCommandSemaphore();
   }
@@ -4948,6 +5063,8 @@ void DestroyHostDevice() {
   g_swapChain.reset();
   for (size_t i = 0; i < NUM_FRAMES; i++) {
     g_commandLists[i].reset();
+    g_prologueLists[i].reset();
+    g_prologueOpen[i] = false;
     g_commandFences[i].reset();
     g_acquireSemaphores[i].reset();
   }
