@@ -418,6 +418,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           }
           lastVblankNs = ng2::video::DisplayClockNow();
           last = rex::chrono::Clock::QueryGuestTickCount();
+          // A drain request (gamescope's, below) isn't acted on while locked:
+          // taken here so it doesn't skip a vblank when the lock lets go.
+          ng2::video::DrainRequested();
           DispatchInterrupt(0, 2);
           WakeWaits();
           continue;

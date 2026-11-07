@@ -79,7 +79,8 @@ devices, and none of the player's settings or saves.
 - `NG2_PRESENT_GAPS=1`: the time between real presents (on the thread that makes them) each second.
   Test switches for choppy play at a steady 60 (#36, #46): `NG2_TEST_EVEN_PRESENT=1` holds a present
   until 90% of a refresh after the last (V-Sync FIFO or Mailbox only); `NG2_TEST_GAMESCOPE_AUTO=1` lets
-  Frame Pacing Auto work under gamescope, where it otherwise acts as Timer. At 60 fps the game's own
+  Frame Pacing Auto work under gamescope, where it otherwise acts as Timer (experimental: if gamescope
+  reports a frame shown when it arrives, the lock can follow its own presents). At 60 fps the game's own
   frame limiter (sub_822F0BF8) doesn't run (its interval word is 0): the presents pace the game.
 - `NG2_LATENCY_LOG=1`: every 10 s, from the game reading the pad to that frame's present and to its
   reaching the screen (the display clock, VK_KHR_present_wait). `NG2_TEST_REFRESH=59` (run-headless.sh)

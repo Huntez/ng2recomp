@@ -5132,7 +5132,7 @@ bool UnderGamescope() {
     bool yes = v && v[0];
     if (yes) {
       REXLOG_INFO("video: under gamescope: Input Latency Low and Frame Pacing Auto act as "
-                  "Standard and Timer");
+                  "Standard and Timer (Auto not with NG2_TEST_GAMESCOPE_AUTO=1)");
     }
     return yes;
   }();
