@@ -5584,7 +5584,11 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           }
           std::fprintf(f, " now %g %g %g %g %s\n", y[0], y[1], y[2], y[3], how);
         };
-        const bool full = dumpLeft >= 300;
+        static const bool allFull = [] {  // NG2_INTERP_DUMP_FULL=1: every frame's constants
+          const char* v = std::getenv("NG2_INTERP_DUMP_FULL");
+          return v && v[0] == '1';
+        }();
+        const bool full = dumpLeft >= 300 || allFull;
         for (size_t i = 0; i < g.current.size(); i++) {
           auto& d = g.current[i];
           if (!d.submitted) {
