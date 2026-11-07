@@ -161,11 +161,11 @@ namespace {
 constexpr size_t NUM_FRAMES = 3;
 bool InterpEnabled();
 uint32_t FrameSlots() {
-  static const uint32_t slots = [] {
+  static const bool two = [] {
     const char* v = std::getenv("NG2_INTERP_SLOTS");  // (2 to compare)
-    return InterpEnabled() ? (v && v[0] == '2' ? 2u : 3u) : 2u;
+    return v && v[0] == '2';
   }();
-  return slots;
+  return InterpEnabled() && !two ? 3u : 2u;
 }
 constexpr RenderFormat BACKBUFFER_FORMAT = RenderFormat::B8G8R8A8_UNORM;
 // Bindless heaps, laid out as the translated shaders expect (docs/shaders.md).
@@ -2126,8 +2126,11 @@ void BeginFrame() {
   }
 }
 
+void SwitchInterp();
+
 RenderCommandList* CommandList() {
   if (!g_recording) {
+    SwitchInterp();
     if (g_resizeRequested.load()) {
       WaitForGPU();  // (queued presents may raise it again: cleared after)
       g_resizeRequested.store(false);
@@ -4330,6 +4333,17 @@ struct InterpFrames {
 constexpr uint32_t kInterpMaxPictures = 8;
 std::atomic<uint32_t> g_interpPictureCap{4};
 std::atomic<int64_t> g_modeRefreshNs{0};  // the display mode's refresh (SDL), 0 not known
+// The last frame's build (game thread's): waited for before the next, and
+// before interpolation is switched.
+std::shared_future<std::shared_ptr<InterpFrames>> g_interpLastJob;
+// The swapchain's images: 8 with interpolation (NG2_INTERP_IMAGES), else 3.
+uint32_t SwapChainImages() {
+  if (!InterpEnabled()) {
+    return 3;
+  }
+  const char* v = std::getenv("NG2_INTERP_IMAGES");
+  return v && std::atoi(v) >= 3 ? uint32_t(std::atoi(v)) : 8u;
+}
 // From a frame's present to its pictures handed to the presenter (the build
 // and the recording), the slowest lately: the pictures' first time is after it.
 std::atomic<int64_t> g_interpReadyLagNs{4'000'000};
@@ -4345,12 +4359,9 @@ bool InterpPacedByDisplay() {
   return paced;
 }
 uint32_t InterpDivider() {
-  static const uint32_t divider = [] {
-    const char* v = std::getenv("NG2_INTERP_DIVIDER");
-    return v ? std::clamp<uint32_t>(uint32_t(std::atoi(v)), 1u, 6u)
-             : REXCVAR_GET(frame_interpolation) == 2 ? 2u : 1u;
-  }();
-  return divider;
+  const char* v = std::getenv("NG2_INTERP_DIVIDER");
+  return v ? std::clamp<uint32_t>(uint32_t(std::atoi(v)), 1u, 6u)
+           : REXCVAR_GET(frame_interpolation) == 2 ? 2u : 1u;
 }
 // The display's refresh: measured (VK_KHR_present_wait) when steady, else
 // the display mode's; 0 not known.
@@ -4390,19 +4401,70 @@ struct InterpCapture {
 };
 InterpCapture g_interpCapture;
 
+// What the setting (or NG2_INTERP=1/0, which overrides it) asks for.
+bool InterpWanted() {
+  const char* v = std::getenv("NG2_INTERP");
+  if (v && v[0] ? v[0] != '1' : REXCVAR_GET(frame_interpolation) <= 0) {
+    return false;
+  }
+  if (!RenderThreadEnabled()) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      REXLOG_WARN("video: interpolation needs the render thread (NG2_RENDER_THREAD=0 is set): off");
+    }
+    return false;
+  }
+  return true;
+}
+// On or off for the frame being made: changed between frames only
+// (SwitchInterp), as the setting is.
+std::atomic<int> g_interpOn{-1};
 bool InterpEnabled() {
-  static const bool enabled = [] {
-    const char* v = std::getenv("NG2_INTERP");
-    if (v && v[0] ? v[0] != '1' : REXCVAR_GET(frame_interpolation) <= 0) {
-      return false;
-    }
-    if (!RenderThreadEnabled()) {
-      REXLOG_WARN("video: NG2_INTERP needs the render thread (NG2_RENDER_THREAD=0 is set): off");
-      return false;
-    }
-    return true;
-  }();
-  return enabled;
+  int on = g_interpOn.load();
+  if (on < 0) {
+    on = InterpWanted() ? 1 : 0;
+    g_interpOn = on;
+  }
+  return on != 0;
+}
+
+// Frame Interpolation switched in the menu: between frames, with the GPU and
+// the build idle; the swapchain made again with its images (8 with it, 3
+// without: FIFO's queue of 7 would be the latency of a frame that outruns
+// the display).
+void SwitchInterp() {
+  bool wanted = InterpWanted();
+  if (wanted == InterpEnabled()) {
+    return;
+  }
+  if (g_interpLastJob.valid()) {
+    g_interpLastJob.wait();
+  }
+  WaitForGPU();
+  g_interpLastJob = {};
+  g_interp.previous.clear();
+  g_interp.current.clear();
+  g_interp.previousPalettes.clear();
+  g_interp.palettes.clear();
+  g_interp.paletteIndex.clear();
+  g_interp.keptFor = 0;
+  g_interp.baseNs = g_interp.gridNs = g_interp.lastFullNs = g_interp.lastPresentNs = 0;
+  g_interp.slowRun = 0;
+  g_interp.slow = false;
+  g_interpCapture.current.clear();
+  g_interpCapture.palettes.clear();
+  g_interpCapture.paletteIndex.clear();
+  g_interpOn = wanted ? 1 : 0;
+  if (g_frame >= FrameSlots()) {
+    g_frame = 0;
+  }
+  g_swapChain->setTextureCount(SwapChainImages());
+  g_swapChainFramebuffers.clear();
+  g_swapChainValid = g_swapChain->resize();
+  g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
+  REXLOG_INFO("video: frame interpolation {} ({} swapchain images)", wanted ? "on" : "off",
+              g_swapChain->getTextureCount());
 }
 
 // Pictures between two frames (NG2_INTERP_FRAMES, 2 by default: 180 Hz for the game's 60).
@@ -7082,7 +7144,7 @@ void Present(HostTexture* frontBuffer) {
   std::shared_future<std::shared_ptr<InterpFrames>> interpJob;
   const bool interpWanted = source == frontBuffer && sourceDescriptor;
   if (InterpEnabled()) {
-    static std::shared_future<std::shared_ptr<InterpFrames>> lastJob;
+    auto& lastJob = g_interpLastJob;
     if (lastJob.valid()) {
       lastJob.wait();  // (the build's state is its own till it's done)
     }
@@ -7919,12 +7981,7 @@ bool CreateHostDevice() {
     g_acquireSemaphores[i] = g_device->createCommandSemaphore();
   }
 
-  uint32_t images = 3;
-  if (InterpEnabled()) {
-    const char* v = std::getenv("NG2_INTERP_IMAGES");
-    images = v && std::atoi(v) >= 3 ? uint32_t(std::atoi(v)) : 8u;
-  }
-  g_swapChain = g_queue->createSwapChain(renderWindow, images, BACKBUFFER_FORMAT, 1);
+  g_swapChain = g_queue->createSwapChain(renderWindow, SwapChainImages(), BACKBUFFER_FORMAT, 1);
   g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
   if (InterpEnabled()) {
     g_presenter.StartWatchdog();

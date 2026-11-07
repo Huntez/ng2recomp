@@ -82,11 +82,16 @@ devices, and none of the player's settings or saves.
 - `NG2_EXCLUSIVE=1` (Windows): the swapchain takes the display (VK_EXT_full_screen_exclusive), so its
   presents are flipped by the display instead of composed by DWM, which drops pictures at high refresh
   rates. Needs `fullscreen` and `exclusive_fullscreen` on in ng2.toml; `2` leaves it to the driver.
-- `NG2_INTERP=1`: frame interpolation (work in progress): each frame's draws drawn again with their vertex
-  constants and bone palettes part of the way from the last frame's, `NG2_INTERP_FRAMES` (2) pictures
-  between, for 180 Hz from the game's 60. Draws are matched by mesh, then by shaders and constants; stats
-  every 600 frames. Best with `NG2_EXCLUSIVE=1`. F8: every picture for 5 s (a 640x360 crop) to
-  `interp_record/`; `NG2_INTERP_SHOTS=<s>`: a frame's pictures every so often to `interp_shots/`.
+- Frame Interpolation (RECOMP SETTINGS, Display; `frame_interpolation` 0 off, 1 a picture each refresh,
+  2 each second; switched live), or `NG2_INTERP=1`/`0` over it: each frame's draws drawn again with their
+  constants and bone palettes part of the way from the last frame's, a picture for each refresh of the
+  display, as far along as when it is shown (`NG2_INTERP_DIVIDER=<n>`: each n-th refresh;
+  `NG2_INTERP_REFRESH=<Hz>`: paced as for that display, for tests; `NG2_INTERP_FRAMES=1..3`: that many
+  pictures between instead, the older way). Draws are matched by mesh, then by shaders and constants; stats
+  every 600 frames. Best with `NG2_EXCLUSIVE=1`. `NG2_INTERP_SLOTS=2`, `NG2_INTERP_IMAGES=<n>` (8),
+  `NG2_INTERP_THREAD=0`, `NG2_INTERP_WORKERS=<n>` for comparisons. F8: every picture for 5 s (made
+  960x540) to `interp_record/`, F9 with the matching of those frames to `interp_dump/`;
+  `NG2_INTERP_SHOTS=<s>`: a frame's pictures every so often to `interp_shots/`.
   `NG2_INTERP_DEBUG=1` leaves out the draws without their own match; `NG2_INTERP_DEBUG_T=<t>` draws every
   picture between at that point; `NG2_INTERP_BONES=0`, `NG2_INTERP_JUMP`, `NG2_INTERP_BY_PLACE`,
   `NG2_INTERP_PACE` are switches for comparisons. `NG2_INTERP_PROBE=1`: how alike frames are, logged.
