@@ -1,0 +1,59 @@
+From 5f31ec6eddf052ef36eb64624e9452f57ca4c068 Mon Sep 17 00:00:00 2001
+From: Huntez <osigor5464@gmail.com>
+Date: Sat, 7 Nov 2026 19:54:55 +0100
+Subject: [PATCH] Swapchain: setTextureCount, the images asked for from the
+ next resize
+
+Lets the app change how many images the swapchain has (frame interpolation
+switched on or off while running) without making it again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plume_render_interface.h | 2 ++
+ plume_vulkan.cpp         | 4 ++++
+ plume_vulkan.h           | 1 +
+ 3 files changed, 7 insertions(+)
+
+diff --git a/plume_render_interface.h b/plume_render_interface.h
+index 95c22c1..11af951 100644
+--- a/plume_render_interface.h
++++ b/plume_render_interface.h
+@@ -114,6 +114,8 @@ namespace plume {
+         virtual uint32_t getHeight() const = 0;
+         virtual RenderTexture *getTexture(uint32_t textureIndex) = 0;
+         virtual uint32_t getTextureCount() const = 0;
++        // Images asked for from the next resize (the surface's limits still apply).
++        virtual void setTextureCount(uint32_t count) { (void)count; }
+         virtual bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) = 0;
+         virtual RenderWindow getWindow() const = 0;
+         virtual bool isEmpty() const = 0;
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index b73d014..2770962 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -2592,6 +2592,10 @@ namespace plume {
+         return true;
+     }
+ 
++    void VulkanSwapChain::setTextureCount(uint32_t count) {
++        textureCount = std::max(count, 1u);
++    }
++
+     bool VulkanSwapChain::needsResize() const {
+         uint32_t windowWidth, windowHeight;
+         getWindowSize(windowWidth, windowHeight);
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 5ab5a71..71b4417 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -267,6 +267,7 @@ namespace plume {
+         uint32_t getHeight() const override;
+         RenderTexture *getTexture(uint32_t textureIndex) override;
+         uint32_t getTextureCount() const override;
++        void setTextureCount(uint32_t count) override;
+         bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) override;
+         RenderWindow getWindow() const override;
+         bool isEmpty() const override;
+-- 
+2.54.0
+
