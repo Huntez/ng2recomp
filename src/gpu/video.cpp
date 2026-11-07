@@ -1855,6 +1855,12 @@ class Presenter {
     hurry_ = false;
   }
 
+  // Pictures handed over and not yet presented.
+  size_t Pending() {
+    std::lock_guard lock(mutex_);
+    return queue_.size() + busy_;
+  }
+
   // Until at most `left` pictures wait.
   void WaitFor(size_t left, Watch* watch) {
     watch->Set(kWaitPresenter);
@@ -1882,8 +1888,11 @@ class Presenter {
         busy_ = 1;
         busyTimed_ = item.timed;
         // Behind (a later frame waits): shown at once, to catch up (the
-        // screen keeps the newest of them).
-        if (!queue_.empty() && queue_.back().frame > item.frame) {
+        // screen keeps the newest of them). Not one with its time on the
+        // display's grid: the last frame's last picture still waits for its
+        // refresh when the next frame's come, and shown at once it came a
+        // refresh or two early, then a gap (a stutter in a turn).
+        if (!item.timed && !queue_.empty() && queue_.back().frame > item.frame) {
           item.atNs = 0;
         }
       }
@@ -7373,9 +7382,17 @@ void Present(HostTexture* frontBuffer) {
     // last full frame's pictures are still being shown by the clock).
     const bool hide = interp && interp->partial && (interp->slow || interp->paced);
     const bool ownHidden = hide || (interp && interp->paced && !interp->ownShown);
-    if (!hide && InterpEnabled()) {
-      g_presenter.Hurry(&g_presenter.renderWatch);
-    }
+    // The pictures waiting for their time hurried out only when an acquire
+    // could otherwise wait for an image that only their present frees: the
+    // images not yet presented and those taken this frame near all the
+    // swapchain's, less the display's own (hurried each frame, the last
+    // frame's last picture came early: a stutter in a turn).
+    auto hurryIfShort = [&](uint32_t taken) {
+      if (!hide && InterpEnabled() &&
+          g_presenter.Pending() + taken + 3 > g_swapChain->getTextureCount()) {
+        g_presenter.Hurry(&g_presenter.renderWatch);
+      }
+    };
     static std::unique_ptr<RenderCommandSemaphore> interpAcquire[NUM_FRAMES][kMaxPictures - 1];
     uint32_t indices[kMaxPictures] = {};
     uint32_t pictures = 0;
@@ -7465,6 +7482,7 @@ void Present(HostTexture* frontBuffer) {
         auto& fence = interpFences[frame][k];
         uint32_t index = 0;
         int64_t acquireStart = SteadyNs();
+        hurryIfShort(pictures);
       g_presenter.renderWatch.Set(Presenter::kAcquire);
         if (!g_swapChain->acquireTexture(semaphore.get(), &index)) {
           break;
@@ -7494,6 +7512,7 @@ void Present(HostTexture* frontBuffer) {
       }
     }
     if (g_swapChainValid && !ownHidden) {
+      hurryIfShort(pictures);
       int64_t acquireStart = SteadyNs();
       g_presenter.renderWatch.Set(Presenter::kAcquire);
       g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &frameIndex);
