@@ -4187,6 +4187,7 @@ struct InterpDraw {
   std::vector<float> psConstants;
   uint16_t targetWidth = 0, targetHeight = 0;  // (F9's dump: what it draws to)
   bool depthOnly = false;
+  bool ui = false;  // in the game's 2D pass (HUD, menus): drawn as it is now
 };
 struct InterpPalette {
   uint32_t address = 0, size = 0;
@@ -4237,6 +4238,7 @@ int32_t CaptureInterpDraw(uint64_t group, const uint32_t* guestConstants,
                           const uint64_t (*psMask)[4] = nullptr) {
   InterpDraw draw;
   draw.group = group;
+  draw.ui = ng2::aspect::In2DPass();
   if (psConstants && psMask) {
     for (uint32_t word = 0; word < 4; word++) {
       for (uint64_t bits = (*psMask)[word]; bits; bits &= bits - 1) {
@@ -4621,6 +4623,13 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
   g.frames++;
   g.draws += submitted;
   g.matched += matched;
+  // The HUD and menus as they are now: their pieces (icons, a list that
+  // scrolls) are many alike, and mixed with another's they'd leave a trail.
+  for (size_t i = 0; i < g.current.size(); i++) {
+    if (g.current[i].ui) {
+      match[i] = -1;
+    }
+  }
   int64_t matchedNs = SteadyNs();
   g.matchNs += matchedNs - startNs;
   // This frame's bone palettes, as the next frame will need them too.
@@ -4852,7 +4861,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
     uint64_t borrowedDraws = 0;
     for (size_t i = 0; i < g.current.size(); i++) {
       auto& d = g.current[i];
-      if (!d.submitted) {
+      if (!d.submitted || d.ui) {
         continue;
       }
       const bool poisoned = false;  // (moved values are taken as now one by one, below)
