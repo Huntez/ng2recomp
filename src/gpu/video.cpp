@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <thread>
 #if defined(__linux__)
 #include <pthread.h>
@@ -691,6 +692,9 @@ struct UploadAllocator {
   }
 };
 UploadAllocator g_uploads[NUM_FRAMES];
+// The pictures between's constants and bones, made on their own thread while
+// the game goes on (NG2_INTERP): reset with the frame's.
+UploadAllocator g_interpUploads[NUM_FRAMES];
 struct Upload {
   RenderBuffer* buffer;
   uint64_t offset;
@@ -2030,6 +2034,7 @@ RenderCommandList* CommandList() {
     ReadGpuTiming(g_frame);
     g_boundFramebuffer = nullptr;
     g_uploads[g_frame].Reset();
+    g_interpUploads[g_frame].Reset();
     for (auto& texture : g_garbage[g_frame]) {
       g_descriptors.Free(texture->descriptor);
       ForgetTexture(texture.get());
@@ -2400,8 +2405,7 @@ void ResolveByDraw(HostTexture& source, HostTexture& dest, int32_t x1, int32_t y
 
 // Uploads ----------------------------------------------------------------------
 
-Upload Allocate(uint64_t size, uint64_t alignment = 256) {
-  auto& allocator = g_uploads[g_frame];
+Upload AllocateFrom(UploadAllocator& allocator, uint64_t size, uint64_t alignment = 256) {
   allocator.offset = (allocator.offset + alignment - 1) & ~(alignment - 1);
   // Move on while the current chunk can't hold it (chunks can be bigger
   // than UPLOAD_CHUNK_SIZE for big uploads).
@@ -2423,14 +2427,19 @@ Upload Allocate(uint64_t size, uint64_t alignment = 256) {
     chunk.data = static_cast<uint8_t*>(chunk.buffer->map());
     chunk.address = chunk.buffer->getDeviceAddress();
     allocator.chunks.push_back(std::move(chunk));
-    REXLOG_INFO("video: upload chunk {} of frame slot {} ({} MB)", allocator.chunks.size(),
-                g_frame, allocator.chunks.back().size >> 20);
+    REXLOG_INFO("video: upload chunk {}{} ({} MB)", allocator.chunks.size(),
+                &allocator >= g_interpUploads && &allocator < g_interpUploads + NUM_FRAMES ? " (interpolation)" : "",
+                allocator.chunks.back().size >> 20);
   }
   auto& chunk = allocator.chunks[allocator.chunk];
   Upload upload{chunk.buffer.get(), allocator.offset, chunk.data + allocator.offset,
                 chunk.address + allocator.offset};
   allocator.offset += size;
   return upload;
+}
+
+Upload Allocate(uint64_t size, uint64_t alignment = 256) {
+  return AllocateFrom(g_uploads[g_frame], size, alignment);
 }
 
 // A copy into g_guestMemory. Recorded in the frame's command list it ends the
@@ -4209,7 +4218,15 @@ struct InterpState {
   uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0, psDraws = 0, timeStill = 0;
   uint32_t keptFor = 0;  // frames the last full frame was kept over (partial ones)  // draws without a match given the shared registers' values before
 };
-InterpState g_interp;
+InterpState g_interp;  // the build's (its thread's while one runs)
+// What this frame's draws are, filled as they're drawn (game thread); handed
+// to the build at the present.
+struct InterpCapture {
+  std::vector<InterpDraw> current;
+  std::vector<InterpPalette> palettes;
+  std::unordered_map<uint64_t, int32_t> paletteIndex;
+};
+InterpCapture g_interpCapture;
 
 bool InterpEnabled() {
   static const bool enabled = [] {
@@ -4265,22 +4282,22 @@ int32_t CaptureInterpDraw(uint64_t group, const uint32_t* guestConstants,
       }
     }
   }
-  g_interp.current.push_back(std::move(draw));
-  return int32_t(g_interp.current.size() - 1);
+  g_interpCapture.current.push_back(std::move(draw));
+  return int32_t(g_interpCapture.current.size() - 1);
 }
 
 int32_t NoteInterpPalette(uint32_t address, uint32_t size) {
   auto [it, added] =
-      g_interp.paletteIndex.emplace((uint64_t(address) << 32) | size, int32_t(g_interp.palettes.size()));
+      g_interpCapture.paletteIndex.emplace((uint64_t(address) << 32) | size, int32_t(g_interpCapture.palettes.size()));
   if (added) {
-    g_interp.palettes.push_back({address, size, {}});
+    g_interpCapture.palettes.push_back({address, size, {}});
   }
   return it->second;
 }
 
 void NoteInterpDraw(const DrawRecord& record) {
-  if (record.interpIndex >= 0 && size_t(record.interpIndex) < g_interp.current.size()) {
-    auto& draw = g_interp.current[record.interpIndex];
+  if (record.interpIndex >= 0 && size_t(record.interpIndex) < g_interpCapture.current.size()) {
+    auto& draw = g_interpCapture.current[record.interpIndex];
     std::copy(std::begin(record.pushConstants), std::end(record.pushConstants),
               draw.pushConstants.begin());
     draw.submitted = true;
@@ -4373,7 +4390,11 @@ static const float kPaletteJump = [] {
   return v ? float(std::atof(v)) : 0.75f;
 }();
 
-std::shared_ptr<InterpFrames> BuildInterpFrames() {
+std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCount) {
+  // (its own uploads: the game thread's go on with the next frame)
+  auto Allocate = [slot](uint64_t size, uint64_t alignment = 256) {
+    return AllocateFrom(g_interpUploads[slot], size, alignment);
+  };
   auto& g = g_interp;
   int64_t startNs = SteadyNs();
   struct Timed {
@@ -4476,9 +4497,13 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
       if (!d.boneSize || it == previousPalette.end() || b.boneSize != d.boneSize) {
         return 0.0f;
       }
+      auto at = g.paletteIndex.find((uint64_t(d.boneAddress) << 32) | d.boneSize);
+      if (at == g.paletteIndex.end()) {
+        return 0.0f;
+      }
       const auto& then = g.previousPalettes[it->second].words;
-      const auto* now = reinterpret_cast<const uint32_t*>(guest::Physical(d.boneAddress));
-      size_t rows = std::min<size_t>(then.size(), d.boneSize / 4) / 4;
+      const auto* now = g.palettes[at->second].words.data();  // (copied at the present)
+      size_t rows = std::min(then.size(), g.palettes[at->second].words.size()) / 4;
       double sum = 0;
       size_t n = 0, step = std::max<size_t>(1, rows / 48);
       for (size_t r = 0; r < rows && n < 48; r += step, n++) {
@@ -4646,11 +4671,6 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
   }
   int64_t matchedNs = SteadyNs();
   g.matchNs += matchedNs - startNs;
-  // This frame's bone palettes, as the next frame will need them too.
-  for (auto& palette : g.palettes) {
-    palette.words.resize(palette.size / 4);
-    std::memcpy(palette.words.data(), guest::Physical(palette.address), palette.size & ~3u);
-  }
   // A partial frame (a few passes over the last picture, the scene not drawn
   // again: some places do it every third frame): not drawn again between,
   // as its passes add to what is there, and the next frame goes on from the
@@ -5038,7 +5058,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
 #endif
       std::string path = fmt::format("interp_dump/{:03}.txt", dumpCount++);
       if (FILE* f = std::fopen(path.c_str(), "w")) {
-        std::fprintf(f, "frame %llu draws %zu before %zu matched %u steps %u\n", (unsigned long long)g_frameCount,
+        std::fprintf(f, "frame %llu draws %zu before %zu matched %u steps %u\n", (unsigned long long)frameCount,
                      g.current.size(), g.previous.size(), matched, steps);
         auto row = [&](const char* what, uint16_t reg, const float* x, const float* y, const char* how) {
           std::fprintf(f, "  %s c%-3u", what, reg);
@@ -5085,7 +5105,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
           }
         }
         std::fclose(f);
-        REXLOG_INFO("video: interp: dumped frame {} to {}", g_frameCount, path);
+        REXLOG_INFO("video: interp: dumped frame {} to {}", frameCount, path);
       }
     }
     int64_t mixedNs = SteadyNs();
@@ -5173,7 +5193,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
       // a spike in the pictures between came from (the first 400 a run).
       static uint32_t bigMovesLogged = 0;
       static uint64_t lastLogged = 0;  // (the same row seen through another window of the buffer: once)
-      uint64_t seen = (uint64_t(g_frameCount) << 32) ^ then.words[worstRow * 4 + 3] ^ (uint64_t(now.words[worstRow * 4 + 3]) << 16);
+      uint64_t seen = (uint64_t(frameCount) << 32) ^ then.words[worstRow * 4 + 3] ^ (uint64_t(now.words[worstRow * 4 + 3]) << 16);
       if (((g_interpDumpDetail && worst > 0.5f) || (worst > 2.0f && bigMovesLogged < 3000)) && seen != lastLogged) {
         lastLogged = seen;
         bigMovesLogged++;
@@ -5182,7 +5202,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
         };
         REXLOG_INFO("video: interp: frame {} palette {:x} (was {:x}) {} rows ({} far): mean move {:.3f}, row {} moved {:.3f}: "
                     "{} {} {} {} -> {} {} {} {}{}{}",
-                    g_frameCount, now.address, then.address, rows, farRows, rows ? moved / double(rows) : 0.0, worstRow, worst,
+                    frameCount, now.address, then.address, rows, farRows, rows ? moved / double(rows) : 0.0, worstRow, worst,
                     value(then.words, worstRow, 0), value(then.words, worstRow, 1), value(then.words, worstRow, 2),
                     value(then.words, worstRow, 3), value(now.words, worstRow, 0), value(now.words, worstRow, 1),
                     value(now.words, worstRow, 2), value(now.words, worstRow, 3), jumped ? " (as now)" : "",
@@ -5965,12 +5985,12 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
                      uint64_t(shape->format) ^ (target ? 0 : 1ull << 63);
     interpIndex = CaptureInterpDraw(group, vsSource, vs->entry->floatConstantMask, ps ? psSource : nullptr,
                                     ps ? &ps->entry->floatConstantMask : nullptr);
-    g_interp.current[interpIndex].boneAddress = interpBoneAddress;
-    g_interp.current[interpIndex].boneSize = interpBoneSize;
-    g_interp.current[interpIndex].mesh = interpMesh;
-    g_interp.current[interpIndex].targetWidth = uint16_t(shape->width);
-    g_interp.current[interpIndex].targetHeight = uint16_t(shape->height);
-    g_interp.current[interpIndex].depthOnly = !target;
+    g_interpCapture.current[interpIndex].boneAddress = interpBoneAddress;
+    g_interpCapture.current[interpIndex].boneSize = interpBoneSize;
+    g_interpCapture.current[interpIndex].mesh = interpMesh;
+    g_interpCapture.current[interpIndex].targetWidth = uint16_t(shape->width);
+    g_interpCapture.current[interpIndex].targetHeight = uint16_t(shape->height);
+    g_interpCapture.current[interpIndex].depthOnly = !target;
   }
   if (InterpProbe()) {
     const HostTexture* shape = target ? target : depth;
@@ -6731,12 +6751,43 @@ void Present(HostTexture* frontBuffer) {
   uint32_t frame = g_frame;
   // The pictures between the last frame and this one (NG2_INTERP); not for a
   // movie the presenter draws itself.
-  std::shared_ptr<InterpFrames> interp;
+  // Made on their own thread while the game goes on to its next frame (in a
+  // crowd it took up to 15 ms of the game's 16); the render thread waits for
+  // them before drawing them. NG2_INTERP_THREAD=0: on the game thread.
+  std::shared_future<std::shared_ptr<InterpFrames>> interpJob;
+  const bool interpWanted = source == frontBuffer && sourceDescriptor;
   if (InterpEnabled()) {
-    interp = BuildInterpFrames();
-    if (source != frontBuffer || !sourceDescriptor) {
-      interp.reset();
+    static std::shared_future<std::shared_ptr<InterpFrames>> lastJob;
+    if (lastJob.valid()) {
+      lastJob.wait();  // (the build's state is its own till it's done)
     }
+    // This frame's bones, as the game will write the next ones there.
+    auto& capture = g_interpCapture;
+    for (auto& palette : capture.palettes) {
+      palette.words.resize(palette.size / 4);
+      std::memcpy(palette.words.data(), guest::Physical(palette.address), palette.size & ~3u);
+    }
+    g_interp.current.swap(capture.current);
+    g_interp.palettes.swap(capture.palettes);
+    g_interp.paletteIndex.swap(capture.paletteIndex);
+    capture.current.clear();
+    capture.palettes.clear();
+    capture.paletteIndex.clear();
+    static const bool onThread = [] {
+      const char* v = std::getenv("NG2_INTERP_THREAD");
+      return !v || v[0] != '0';
+    }();
+    uint64_t frameCount = g_frameCount;
+    if (onThread) {
+      interpJob = std::async(std::launch::async, [frame, frameCount] {
+                    return BuildInterpFrames(frame, frameCount);
+                  }).share();
+    } else {
+      std::promise<std::shared_ptr<InterpFrames>> done;
+      done.set_value(BuildInterpFrames(frame, frameCount));
+      interpJob = done.get_future().share();
+    }
+    lastJob = interpJob;
   }
   g_logOps = false;
   OpArena* frameLog = &g_frameLogs[frame];
@@ -6775,6 +6826,10 @@ void Present(HostTexture* frontBuffer) {
   uint32_t endMark = AllocGpuMark(GpuMark::kFrameEnd);  // (each written once: see the resize path)
   // The swapchain's part, with the frame's real command list.
   OnRenderThread([=](RenderCommandList* list) mutable {
+    std::shared_ptr<InterpFrames> interp = interpJob.valid() ? interpJob.get() : nullptr;
+    if (!interpWanted) {
+      interp.reset();
+    }
     static int32_t loggedMode = -1;
     // NG2_INTERP: the presenter shows a picture each refresh itself; mailbox
     // presents don't block (a FIFO present in full screen may wait for the
