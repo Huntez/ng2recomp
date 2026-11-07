@@ -66,6 +66,8 @@ devices, and none of the player's settings or saves.
   builds only: the packages leave out the GPU plugin, `librexgpu-xenos`). The native renderer runs
   with no GPU emulation (src/gpu/native_gpu.cpp).
 - `NG2_AUDIO=0`: no audio device; the game's audio still runs.
+- `NG2_BARYCENTRIC=1` or `0`: cut-off parts' id interpolated in the shader, or by the hardware
+  (default: in the shader on NVIDIA, where the GPU supports it).
 - `NG2_CONFIG=<file>`: settings file instead of `<exe dir>/ng2.toml`.
 - `NG2_PROFILE=1`: time per renderer stage, once a second, and every 5 s (Linux) the busiest threads' CPU
   time ("threads, ms of CPU each second"; "(renderer)" is the game's render thread, "Render
