@@ -5198,6 +5198,28 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // that value (one light, the same in each pass); the matrices go on part
     // of the way, so a thing lit by a light sorted again stays in one piece.
     std::unordered_set<uint64_t> jumpedValues;
+    // Every value the last frame's draws had (any register): one now that a
+    // draw didn't have but another did is a list's entry taken from it (a
+    // light), not this one's moved.
+    auto vectorKey = [](const float* y) {
+      uint64_t a, b;
+      std::memcpy(&a, y, 8);
+      std::memcpy(&b, y + 2, 8);
+      return (a * 0x9E3779B97F4A7C15ull) ^ (b + 0x632BE59BD9B4E019ull + (a << 6) + (a >> 2));
+    };
+    std::unordered_set<uint64_t> valuesBefore;
+    valuesBefore.reserve(g.previous.size() * 16);
+    for (auto& d : g.previous) {
+      if (!d.submitted) {
+        continue;
+      }
+      for (size_t r = 0; r < d.registers.size(); r++) {
+        const float* y = &d.constants[r * 4];
+        if (!(y[0] == y[1] && y[1] == y[2] && y[2] == y[3])) {
+          valuesBefore.insert(vectorKey(y));
+        }
+      }
+    }
     for (size_t i = 0; i < g.current.size(); i++) {
       if (match[i] < 0 || matchDistance[i] == 0.0f) {
         continue;
@@ -5207,19 +5229,32 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       std::vector<uint8_t> moved(d.registers.size(), 0), asNow;
       bool anyMoved = false;
       for (size_t r = 0; r < d.registers.size(); r++) {
-        if (r < skips[i].size() && skips[i][r]) {
-          continue;
-        }
+        const bool shared = r < skips[i].size() && skips[i][r];
         const float* x = &before.constants[r * 4];
         const float* y = &d.constants[r * 4];
-        float change = 0;
+        float change = 0, size = 1.0f;
         for (uint32_t c = 0; c < 4; c++) {
           change = std::max(change, std::fabs(x[c] - y[c]));
+          size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
         }
+        // Changed to a value another draw had the frame before: a list's
+        // entry taken from there (a light gone from this draw's list and
+        // another in its place: 35,-1,-1 reach 10 then 107,11,-109 reach 6;
+        // part of the way, the light crossed the room and the walls' shading
+        // with it, seen as the walls moving). A moving thing's or camera's
+        // values are new each frame. Also for the registers many draws share
+        // (a light is).
+        // (By a third of itself at least: a colour fading a little isn't.)
+        static const bool swaps = [] {  // NG2_INTERP_SWAPS=1: looked for (not yet by default)
+          const char* v = std::getenv("NG2_INTERP_SWAPS");
+          return v && v[0] == '1';
+        }();
+        bool other = swaps && change > 0.3f * size && !(y[0] == y[1] && y[1] == y[2] && y[2] == y[3]) &&
+                     valuesBefore.count(vectorKey(y)) != 0;
         // Moved to another register (a list sorted again: the lights): not a
         // turn, however fast, which goes part of the way.
-        moved[r] = !std::isfinite(change) ||
-                   (d.registers.size() == before.registers.size() &&
+        moved[r] = !std::isfinite(change) || other ||
+                   (!shared && d.registers.size() == before.registers.size() &&
                     InterpMovedFromAnother(before.constants.data(), d.constants.data(), d.registers.size(), r));
         anyMoved |= moved[r] != 0;
       }
@@ -5231,7 +5266,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       // another's reach (a flash on a wall, on the floor).
       InterpRunsFrom(moved, d.registers, asNow);
       for (size_t r = 0; r < d.registers.size(); r++) {
-        if (!asNow[r] || (r < skips[i].size() && skips[i][r])) {
+        if (!asNow[r]) {
           continue;
         }
         if (std::memcmp(&before.constants[r * 4], &d.constants[r * 4], 16) != 0) {

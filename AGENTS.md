@@ -94,7 +94,8 @@ devices, and none of the player's settings or saves.
   `NG2_INTERP_SHOTS=<s>`: a frame's pictures every so often to `interp_shots/`.
   `NG2_INTERP_DEBUG=1` leaves out the draws without their own match; `NG2_INTERP_DEBUG_T=<t>` draws every
   picture between at that point; `NG2_INTERP_BONES=0`, `NG2_INTERP_JUMP`, `NG2_INTERP_TELEPORT=<units>` (off: a thing without bones moved more in
-  a frame is drawn as now; it took walls for such in a turn), `NG2_INTERP_AUTOPAUSE=0` (paused for a while when
+  a frame is drawn as now; it took walls for such in a turn), `NG2_INTERP_SWAPS=1` (a value another draw had
+  the frame before taken as now: a light list's entry; not yet by default), `NG2_INTERP_AUTOPAUSE=0` (paused for a while when
   building the pictures takes the game below 60, as on the Steam Deck in a big fight), `NG2_INTERP_BY_PLACE`,
   `NG2_INTERP_PACE` are switches for comparisons. `NG2_INTERP_PROBE=1`: how alike frames are, logged.
 - `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).
