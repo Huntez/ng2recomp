@@ -2302,6 +2302,8 @@ TextureFormatInfo GetTextureFormatInfo(xenos::TextureFormat format) {
     case F::k_8_8_8_8:
     case F::k_8_8_8_8_A:
     case F::k_8_8_8_8_AS_16_16_16_16: return {RenderFormat::R8G8B8A8_UNORM, 1, 4};
+    case F::k_2_10_10_10:
+    case F::k_2_10_10_10_AS_16_16_16_16: return {RenderFormat::R10G10B10A2_UNORM, 1, 4};
     case F::k_16: return {RenderFormat::R16_UNORM, 1, 2};
     case F::k_16_16: return {RenderFormat::R16G16_UNORM, 1, 4};
     case F::k_16_16_16_16: return {RenderFormat::R16G16B16A16_UNORM, 1, 8};
