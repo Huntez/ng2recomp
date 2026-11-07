@@ -7402,10 +7402,21 @@ void Present(HostTexture* frontBuffer) {
     // could otherwise wait for an image that only their present frees: the
     // images not yet presented and those taken this frame near all the
     // swapchain's, less the display's own (hurried each frame, the last
-    // frame's last picture came early: a stutter in a turn).
+    // frame's last picture came early: a stutter in a turn). Only in
+    // exclusive full screen, where the display holds no more than that:
+    // elsewhere a compositor (gamescope, DWM) keeps images of its own, and
+    // an image taken whose release waited for a present behind its own
+    // drawing stood the GPU still (the Steam Deck: 40 s) - there each frame
+    // hurries the last one's out before its first acquire, as before.
+    static const bool exclusive = [] {
+      const char* v = std::getenv("NG2_EXCLUSIVE");
+      return v && v[0] && v[0] != '0';
+    }();
     auto hurryIfShort = [&](uint32_t taken) {
-      if (!hide && InterpEnabled() &&
-          g_presenter.Pending() + taken + 3 > g_swapChain->getTextureCount()) {
+      if (hide || !InterpEnabled()) {
+        return;
+      }
+      if (exclusive ? g_presenter.Pending() + taken + 3 > g_swapChain->getTextureCount() : taken == 0) {
         g_presenter.Hurry(&g_presenter.renderWatch);
       }
     };
