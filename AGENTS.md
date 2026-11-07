@@ -90,7 +90,8 @@ devices, and none of the player's settings or saves.
   pictures between instead, the older way). Draws are matched by mesh, then by shaders and constants; stats
   every 600 frames. Best with `NG2_EXCLUSIVE=1`. `NG2_INTERP_SLOTS=2`, `NG2_INTERP_IMAGES=<n>` (8),
   `NG2_INTERP_THREAD=0`, `NG2_INTERP_WORKERS=<n>` for comparisons. F8: every picture for 5 s (made
-  960x540) to `interp_record/`, F9 with the matching of those frames to `interp_dump/`;
+  960x540) to `interp_record/`, F9 with the matching of those frames to `interp_dump/`
+  (`NG2_INTERP_DUMP_FULL=1`: every register of each);
   `NG2_INTERP_SHOTS=<s>`: a frame's pictures every so often to `interp_shots/`.
   `NG2_INTERP_DEBUG=1` leaves out the draws without their own match; `NG2_INTERP_DEBUG_T=<t>` draws every
   picture between at that point; `NG2_INTERP_BONES=0`, `NG2_INTERP_JUMP`, `NG2_INTERP_TELEPORT=<units>` (off: a thing without bones moved more in
