@@ -1,13 +1,13 @@
-From 676529c1ea06b5189211d1e8e86aec8db3120b30 Mon Sep 17 00:00:00 2001
+From 2aee55c4bc4877322a9668628daecf3da1090e0e Mon Sep 17 00:00:00 2001
 From: Huntez <osigor5464@gmail.com>
 Date: Sat, 7 Nov 2026 08:50:20 +0100
 Subject: [PATCH] Forward jumps as if/else blocks instead of the pc loop where
  they nest
 
 ---
- XenosRecomp/pch.h                 |  2 ++
- XenosRecomp/shader_recompiler.cpp | 60 ++++++++++++++++++++++++++++---
- 2 files changed, 58 insertions(+), 4 deletions(-)
+ XenosRecomp/pch.h                 |  2 +
+ XenosRecomp/shader_recompiler.cpp | 69 +++++++++++++++++++++++++++++--
+ 2 files changed, 67 insertions(+), 4 deletions(-)
 
 diff --git a/XenosRecomp/pch.h b/XenosRecomp/pch.h
 index e59682c..48ccae2 100644
@@ -23,10 +23,10 @@ index e59682c..48ccae2 100644
  #include <zstd.h>
  
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 9cc770e..7fa6d82 100644
+index 9cc770e..15ee3b3 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
-@@ -1798,6 +1798,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1798,6 +1798,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
      uint32_t instrAddress = 0;
      uint32_t instrSize = shader->size;
      bool simpleControlFlow = true;
@@ -38,11 +38,12 @@ index 9cc770e..7fa6d82 100644
 +    // those vertex shaders to scratch (#2).
 +    std::vector<uint32_t> openIfEnds;  // innermost last
 +    std::unordered_set<uint32_t> elseJumps;  // the unconditional jumps that are an else
++    std::unordered_set<uint32_t> nextJumps;  // unconditional jumps to the next instruction (an empty else)
 +    uint32_t cfIndex = 0;
  
      while (instrAddress < instrSize)
      {
-@@ -1810,6 +1819,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1810,6 +1820,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          {
              uint32_t address = 0;
  
@@ -52,7 +53,7 @@ index 9cc770e..7fa6d82 100644
              switch (cfInstr.opcode)
              {
              case ControlFlowOpcode::Exec:
-@@ -1831,10 +1843,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1831,10 +1844,39 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
              case ControlFlowOpcode::CondJmp:
              {
@@ -63,6 +64,10 @@ index 9cc770e..7fa6d82 100644
 +                if (cfInstr.condJmp.direction)
 +                {
                      simpleControlFlow = false;
++                }
++                else if (cfInstr.condJmp.isUnconditional && target == cfIndex + 1)
++                {
++                    nextJumps.insert(cfIndex);
 +                }
 +                else if (cfInstr.condJmp.isUnconditional)
 +                {
@@ -90,7 +95,7 @@ index 9cc770e..7fa6d82 100644
  
                  break;
              }
-@@ -1842,6 +1879,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1842,6 +1884,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
              if (address != 0)
                  instrSize = std::min<uint32_t>(instrSize, address * 12);
@@ -99,12 +104,16 @@ index 9cc770e..7fa6d82 100644
          }
  
          controlFlowCode += 3;
-@@ -1968,9 +2007,22 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1968,9 +2012,26 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
              case ControlFlowOpcode::CondJmp:
              {
 -                if (cfInstr.condJmp.isUnconditional)
-+                if (cfInstr.condJmp.isUnconditional && simpleControlFlow)
++                if (cfInstr.condJmp.isUnconditional && simpleControlFlow && nextJumps.count(pc - 1) != 0)
++                {
++                    // Lands on the next instruction: nothing to do.
++                }
++                else if (cfInstr.condJmp.isUnconditional && simpleControlFlow)
 +                {
 +                    // The end of an if block (closed here instead of at its
 +                    // end label): the instructions up to the target are its else.

@@ -129,14 +129,16 @@ component, so their output didn't change).
 Xenos jumps are translated as structured `if` blocks wherever they nest: a
 forward conditional jump opens a block that ends at its target, and an
 unconditional jump that is the last instruction of such a block and lands
-past its end, within the enclosing block, is that block's `else` (patch
-0017). Only shaders with anything else (a jump back, overlapping blocks) are
+past its end, within the enclosing block, is that block's `else`; one that
+lands on the next instruction (an empty else) does nothing (patch 0017).
+Only shaders with anything else (a jump back, overlapping blocks) are
 emitted as Unleashed did, a `while (true) { switch (pc) { ... } }` state
-machine. NG2 has none of those: before 0017, 17 shaders took the loop, all
-for if/else jumps (the skinning and lighting vertex shaders among them).
+machine. Before 0017 every shader with an unconditional jump took the loop;
+NG2's jumps all nest, so none does now (301 of its 663 shaders have an else,
+the skinning and lighting vertex shaders among them).
 
-The loop is expensive on AMD's Windows driver (#2): it compiled every one of
-those vertex shaders to 256 VGPRs and spilled the rest to scratch, up to
+The loop is expensive on AMD's Windows driver (#2): it compiled the vertex
+shaders among those to 256 VGPRs and spilled the rest to scratch, up to
 23 KB a vertex (vs 8282819E0F311055), so a few skinned draws took most of a
 frame whatever the resolution (RX 6800: 55-125 ms of GPU time a frame in
 Chapter 1's first fight). Structured, the same shaders use 50-121 VGPRs and
