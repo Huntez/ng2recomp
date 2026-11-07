@@ -850,12 +850,17 @@ int64_t g_traceFrames = 0, g_traceLeft = 0;
 FILE* g_traceConstants = nullptr;
 
 std::atomic<bool> g_recordRequest{false};  // F8 (NG2_INTERP): every picture for a while
+std::atomic<bool> g_interpDumpRequest{false};  // F9 (NG2_INTERP): the matching of a few frames, as text
 bool SDLCALL WatchTraceKey(void*, SDL_Event* event) {
   if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F7 && !event->key.repeat) {
     g_traceRequest = true;
   }
   if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F8 && !event->key.repeat) {
     g_recordRequest = true;
+  }
+  if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F9 && !event->key.repeat) {
+    g_interpDumpRequest = true;
+    g_recordRequest = true;  // (the pictures of the same moment)
   }
   return true;
 }
@@ -4991,6 +4996,73 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
           std::memcpy(out + d.registers[r] * 4, v, sizeof(v));  // (write-combined: written once)
         }
         phase[i][0] = upload.address;
+      }
+    }
+    // F9: every draw of this frame and the next two, what it was matched with
+    // and each register before and now, and what the pictures between took
+    // (interp_dump/<n>.txt, with the frame number F8's list.txt has).
+    static uint32_t dumpLeft = 0, dumpCount = 0;
+    if (g_interpDumpRequest.exchange(false)) {
+      dumpLeft = 303;  // (3 in full, then 300 as lists of draws: F8's 5 s)
+    }
+    g_interpDumpDetail = dumpLeft >= 301;  // (this one detailed: dumpLeft not yet counted down)
+    if (dumpLeft) {
+      dumpLeft--;
+#if defined(_WIN32)
+      CreateDirectoryA("interp_dump", nullptr);
+#else
+      mkdir("interp_dump", 0755);
+#endif
+      std::string path = fmt::format("interp_dump/{:03}.txt", dumpCount++);
+      if (FILE* f = std::fopen(path.c_str(), "w")) {
+        std::fprintf(f, "frame %llu draws %zu before %zu matched %u steps %u\n", (unsigned long long)g_frameCount,
+                     g.current.size(), g.previous.size(), matched, steps);
+        auto row = [&](const char* what, uint16_t reg, const float* x, const float* y, const char* how) {
+          std::fprintf(f, "  %s c%-3u", what, reg);
+          if (x) {
+            std::fprintf(f, " was %g %g %g %g", x[0], x[1], x[2], x[3]);
+          } else {
+            std::fprintf(f, " was -");
+          }
+          std::fprintf(f, " now %g %g %g %g %s\n", y[0], y[1], y[2], y[3], how);
+        };
+        const bool full = dumpLeft >= 300;
+        for (size_t i = 0; i < g.current.size(); i++) {
+          auto& d = g.current[i];
+          if (!d.submitted) {
+            continue;
+          }
+          std::fprintf(f, "draw %zu group %016llx mesh %016llx bones %x match %d dist %.4f %s target %ux%u%s was-bones %x\n", i,
+                       (unsigned long long)d.group, (unsigned long long)d.mesh, d.boneAddress, match[i],
+                       match[i] >= 0 ? matchDistance[i] : -1.0f, notOwn[i] ? "not-own" : "own", d.targetWidth,
+                       d.targetHeight, d.depthOnly ? " depth" : "",
+                       match[i] >= 0 ? g.previous[match[i]].boneAddress : 0u);
+          if (!full) {
+            continue;
+          }
+          const InterpDraw* own = lerpMatch[i] >= 0 ? &g.previous[lerpMatch[i]] : nullptr;
+          for (size_t r = 0; r < d.registers.size(); r++) {
+            const float* y = &d.constants[r * 4];
+            const float* ownX = own ? &own->constants[r * 4] : nullptr;
+            const float* used = borrowed[i].empty() ? nullptr : borrowed[i][r];
+            bool skip = r < skips[i].size() && skips[i][r];
+            bool jumped = jumpedValues.count(valueAt(d.registers[r], y)) != 0;
+            const char* how = used ? (used == ownX ? "lerp-own" : "lerp-other") : (jumped ? "now-moved" : "now");
+            if (ownX && std::memcmp(ownX, y, 16) == 0 && !used) {
+              how = "same";
+            }
+            std::string tag = std::string(how) + (skip ? " shared" : "");
+            row("vs", d.registers[r], used ? used : ownX, y, tag.c_str());
+          }
+          for (size_t r = 0; r < d.psRegisters.size(); r++) {
+            const float* y = &d.psConstants[r * 4];
+            const float* x = (own && own->psRegisters == d.psRegisters) ? &own->psConstants[r * 4] : nullptr;
+            const char* how = !psLerp[i].empty() && psLerp[i][r] ? "lerp" : (x && std::memcmp(x, y, 16) == 0 ? "same" : "now");
+            row("ps", d.psRegisters[r], x, y, how);
+          }
+        }
+        std::fclose(f);
+        REXLOG_INFO("video: interp: dumped frame {} to {}", g_frameCount, path);
       }
     }
     int64_t mixedNs = SteadyNs();
