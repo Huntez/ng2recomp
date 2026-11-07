@@ -5154,14 +5154,22 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // than this in a frame was put elsewhere, not moved: as now. (Some places
     // draw the broken pieces on the floor all at one spot for a frame, then
     // back: gone halfway, they'd fly across the floor and back.)
+    // Off unless NG2_INTERP_TELEPORT=<units> is set: in a turn of the camera
+    // it took walls for things put elsewhere, and they slid.
     static const float kTeleport = [] {
       const char* v = std::getenv("NG2_INTERP_TELEPORT");
-      return v ? float(std::atof(v)) : 3.0f;
+      return v ? float(std::atof(v)) : 0.0f;
     }();
-    for (size_t i = 0; i < g.current.size(); i++) {
+    // Only a few of the frame's: many at once is the camera turning (a
+    // place seen from it, x, y, z, 1, moves far for a wall across the room),
+    // and a wall drawn as now in a turn slid back and forth.
+    std::vector<uint32_t> putElsewhere;
+    uint32_t rigid = 0;
+    for (size_t i = 0; kTeleport > 0.0f && i < g.current.size(); i++) {
       if (match[i] < 0 || matchDistance[i] == 0.0f || g.current[i].boneSize) {
         continue;
       }
+      rigid++;
       auto& d = g.current[i];
       auto& before = g.previous[match[i]];
       for (size_t r = 0; r < d.registers.size(); r++) {
@@ -5175,10 +5183,15 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         }
         float dx = x[0] - y[0], dy = x[1] - y[1], dz = x[2] - y[2];
         if (!(dx * dx + dy * dy + dz * dz <= kTeleport * kTeleport)) {
-          lerpMatch[i] = -1;
-          g.teleported++;
+          putElsewhere.push_back(uint32_t(i));
           break;
         }
+      }
+    }
+    if (kTeleport > 0.0f && putElsewhere.size() * 10 <= rigid) {
+      for (uint32_t i : putElsewhere) {
+        lerpMatch[i] = -1;
+        g.teleported++;
       }
     }
     // Only the moved registers take the value now, in every draw that has
