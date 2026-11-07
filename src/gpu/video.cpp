@@ -4292,6 +4292,13 @@ static const float kInterpJump = [] {
   return v ? float(std::atof(v)) : 0.6f;
 }();
 
+// How far most of a palette's bones may move in a frame and still be its
+// own (NG2_INTERP_BONE_JUMP to try others): more, another thing's bones.
+static const float kPaletteJump = [] {
+  const char* v = std::getenv("NG2_INTERP_BONE_JUMP");
+  return v ? float(std::atof(v)) : 0.75f;
+}();
+
 std::shared_ptr<InterpFrames> BuildInterpFrames() {
   auto& g = g_interp;
   int64_t startNs = SteadyNs();
@@ -4371,6 +4378,34 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
         meshesNow[meshKey(g.current[i])].push_back(i);
       }
     }
+    // Copies of one skinned mesh (bodies of one kind of enemy) can have the
+    // same constants and differ only in their bones: how far the bones of
+    // one before are from these now (the median of some rows' moves).
+    std::unordered_map<uint64_t, int32_t> previousPalette;
+    for (int32_t p = 0; p < int32_t(g.previousPalettes.size()); p++) {
+      previousPalette.emplace((uint64_t(g.previousPalettes[p].address) << 32) | g.previousPalettes[p].size, p);
+    }
+    auto bonesApart = [&](const InterpDraw& d, const InterpDraw& b) {
+      auto it = previousPalette.find((uint64_t(b.boneAddress) << 32) | b.boneSize);
+      if (!d.boneSize || it == previousPalette.end() || b.boneSize != d.boneSize) {
+        return 0.0f;
+      }
+      const auto& then = g.previousPalettes[it->second].words;
+      const auto* now = reinterpret_cast<const uint32_t*>(guest::Physical(d.boneAddress));
+      size_t rows = std::min<size_t>(then.size(), d.boneSize / 4) / 4;
+      double sum = 0;
+      size_t n = 0, step = std::max<size_t>(1, rows / 48);
+      for (size_t r = 0; r < rows && n < 48; r += step, n++) {
+        float move = 0;
+        for (size_t c = 0; c < 4; c++) {
+          float fx = std::bit_cast<float>(rex::byte_swap(then[r * 4 + c]));
+          float fy = std::bit_cast<float>(rex::byte_swap(now[r * 4 + c]));
+          move = std::max(move, std::isfinite(fx - fy) ? std::fabs(fx - fy) : 1e9f);
+        }
+        sum += move;
+      }
+      return n ? float(sum / double(n)) : 0.0f;
+    };
     for (auto& [key, now] : meshesNow) {
       auto it = meshes.find(key);
       if (it == meshes.end()) {
@@ -4382,15 +4417,47 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
       for (uint32_t i : now) {
         auto& d = g.current[i];
         int32_t best = -1;
-        float bestDistance = 1e30f;
+        float bestDistance = 1e30f, bestScore = 1e30f;
+        // A copy before at the same place in the bone buffer is this one
+        // (another place is another body of its kind): only it, if there's one.
+        bool havePlace = false;
+        if (d.boneSize) {
+          for (uint32_t j : before) {
+            havePlace |= (d.boneAddress & 0xFFFF) == (g.previous[j].boneAddress & 0xFFFF);
+          }
+        }
         for (uint32_t j : before) {
           if (used[j] || g.previous[j].constants.size() != d.constants.size()) {
             continue;
           }
-          float distance = InterpDistance(d, g.previous[j], bestDistance, &skips[i]);
-          if (distance < bestDistance) {
+          if (d.boneSize && (d.boneAddress & 0xFFFF) != (g.previous[j].boneAddress & 0xFFFF)) {
+            if (havePlace) {
+              continue;
+            }
+            // (another place: only one no copy now is at, or it's that one's)
+            bool taken = false;
+            for (uint32_t k : now) {
+              taken |= (g.current[k].boneAddress & 0xFFFF) == (g.previous[j].boneAddress & 0xFFFF);
+            }
+            if (taken) {
+              continue;
+            }
+          }
+          float distance = InterpDistance(d, g.previous[j], bestScore, &skips[i]);
+          if (!(distance < bestScore)) {
+            continue;  // (can't be better)
+          }
+          float apart = bonesApart(d, g.previous[j]);
+          if (apart > kPaletteJump) {
+            continue;  // (another's bones)
+          }
+          // (the same place in the bone buffer, the next of its copies: most likely it)
+          bool samePlace = (d.boneAddress & 0xFFFF) == (g.previous[j].boneAddress & 0xFFFF);
+          float score = distance + apart + (d.boneSize && !samePlace ? 0.25f : 0.0f);
+          if (score < bestScore) {
             best = int32_t(j);
             bestDistance = distance;
+            bestScore = score;
           }
         }
         if (best >= 0 && bestDistance <= bound) {
@@ -4423,6 +4490,11 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
     auto consider = [&](uint32_t j) {
       if (used[j] || g.previous[j].constants.size() != d.constants.size()) {
         return;
+      }
+      if (d.boneSize && g.previous[j].boneSize &&
+          (d.mesh != g.previous[j].mesh ||
+           (d.boneAddress & 0xFFFF) != (g.previous[j].boneAddress & 0xFFFF))) {
+        return;  // (skinned: another body; its own was looked for by mesh)
       }
       float distance = InterpDistance(d, g.previous[j], bestDistance, &skips[i]);
       if (distance < bestDistance) {
