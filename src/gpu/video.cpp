@@ -4711,6 +4711,7 @@ void Present(HostTexture* frontBuffer) {
         // movie at its own.
         float windowWidth = float(g_swapChain->getWidth());
         float windowHeight = float(g_swapChain->getHeight());
+        ng2::aspect::SetWindowShape(g_swapChain->getWidth(), g_swapChain->getHeight());
         float width = std::floor(std::min(windowWidth, windowHeight * aspect));
         float height = std::floor(std::min(windowHeight, windowWidth / aspect));
         RenderViewport viewport((windowWidth - width) / 2, (windowHeight - height) / 2, width,

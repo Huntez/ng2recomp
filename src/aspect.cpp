@@ -355,6 +355,15 @@ void SetConstantWritable(bool writable) {
   g_constantWritable = writable;
 }
 
+// Width / height of the window (0 until the first present).
+std::atomic<float> g_windowShape{0.0f};
+
+void SetWindowShape(uint32_t width, uint32_t height) {
+  if (height) {
+    g_windowShape.store(float(width) / float(height), std::memory_order_relaxed);
+  }
+}
+
 float Aspect() {
   if (!g_constantWritable) {
     return kNative;  // the 3D would stay 16:9
@@ -362,8 +371,13 @@ float Aspect() {
   switch (AspectIndex()) {
     case 1:
       return 16.0f / 10.0f;
-    case 2:
-      return 21.0f / 9.0f;
+    case 2: {
+      // "21:9" monitors are a little wider than 21:9 (2560x1080 2.37, 3440x1440
+      // 2.39, 3840x1600 2.4): in a window of about that shape, its own shape,
+      // so the picture fills it; else (a 21:9 picture in a 16:9 window) 21:9.
+      float window = g_windowShape.load(std::memory_order_relaxed);
+      return window >= 2.2f && window <= 2.6f ? window : 21.0f / 9.0f;
+    }
     case 3:
       return 32.0f / 9.0f;
     case 4:

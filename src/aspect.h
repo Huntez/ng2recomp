@@ -28,4 +28,7 @@ float SqueezeY();
 // The constant's page was made writable (else the 3D stays 16:9).
 void SetConstantWritable(bool writable);
 
+// The window's size, from the presenter (21:9 follows its exact shape).
+void SetWindowShape(uint32_t width, uint32_t height);
+
 }  // namespace ng2::aspect
