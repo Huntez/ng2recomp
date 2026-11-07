@@ -5012,15 +5012,30 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   // the next frame, which draws the scene, matched to this one would be most
   // draws new, a cut, and not one picture between.
   bool repeat = submitted && submitted < submittedBefore && g.keptFor < 2;
+  // (And the poses the same: a still camera over one standing in place, a
+  // spark gone, isn't one, its bones moved.)
   uint32_t unmatchedNow = 0;
+  std::unordered_map<uint64_t, int32_t> paletteBefore;
   for (size_t i = 0; repeat && i < g.current.size(); i++) {
-    if (!g.current[i].submitted) {
+    auto& d = g.current[i];
+    if (!d.submitted) {
       continue;
     }
     if (match[i] < 0) {
       repeat = ++unmatchedNow <= 2;
     } else if (matchDistance[i] != 0.0f) {
       repeat = false;
+    } else if (d.boneSize) {
+      if (paletteBefore.empty()) {
+        for (int32_t p = 0; p < int32_t(g.previousPalettes.size()); p++) {
+          paletteBefore.emplace((uint64_t(g.previousPalettes[p].address) << 32) | g.previousPalettes[p].size, p);
+        }
+      }
+      auto& b = g.previous[match[i]];
+      auto now = g.paletteIndex.find((uint64_t(d.boneAddress) << 32) | d.boneSize);
+      auto then = paletteBefore.find((uint64_t(b.boneAddress) << 32) | b.boneSize);
+      repeat = now != g.paletteIndex.end() && then != paletteBefore.end() &&
+               g.palettes[now->second].words == g.previousPalettes[then->second].words;
     }
   }
   const bool partial = submitted && (submitted * 4 < submittedBefore || repeat) && g.keptFor < 2;
