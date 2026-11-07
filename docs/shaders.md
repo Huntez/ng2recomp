@@ -130,10 +130,10 @@ Xenos jumps are translated as structured `if` blocks wherever they nest: a
 forward conditional jump opens a block that ends at its target, and an
 unconditional jump that is the last instruction of such a block and lands
 past its end, within the enclosing block, is that block's `else`; one that
-lands on the next instruction (an empty else) does nothing (patch 0017).
+lands on the next instruction (an empty else) does nothing (patch 0018).
 Only shaders with anything else (a jump back, overlapping blocks) are
 emitted as Unleashed did, a `while (true) { switch (pc) { ... } }` state
-machine. Before 0017 every shader with an unconditional jump took the loop;
+machine. Before 0018 every shader with an unconditional jump took the loop;
 NG2's jumps all nest, so none does now (301 of its 663 shaders have an else,
 the skinning and lighting vertex shaders among them).
 
