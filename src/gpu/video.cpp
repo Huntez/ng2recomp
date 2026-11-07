@@ -4287,6 +4287,43 @@ float InterpDistance(const InterpDraw& a, const InterpDraw& b, float bound = 1e3
 // now. Not less: a fast turn of the camera changes the matrices that have it
 // by about half (at 30 degrees a frame), and those must go part of the way.
 // NG2_INTERP_JUMP=<part> to try others.
+// Register r now holds what another register, itself changed, held before: a
+// list sorted again (lights by distance), however little the values differ.
+// (Not a value in many places: zeros, ones.)
+static bool InterpMovedFromAnother(const float* before, const float* now, size_t count, size_t r) {
+  const float* x = before + r * 4;
+  const float* y = now + r * 4;
+  if (std::memcmp(x, y, 16) == 0 || (y[0] == y[1] && y[1] == y[2] && y[2] == y[3])) {
+    return false;
+  }
+  for (size_t r2 = 0; r2 < count; r2++) {
+    const float* x2 = before + r2 * 4;
+    if (r2 == r || std::memcmp(x2, now + r2 * 4, 16) == 0) {
+      continue;
+    }
+    bool same = true;
+    for (uint32_t c = 0; c < 4 && same; c++) {
+      same = std::fabs(x2[c] - y[c]) <= 1e-4f * std::max(1.0f, std::fabs(y[c]));
+    }
+    if (same) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Each register from a moved one on, in a run (a light is several: where,
+// colour, reach), taken as now.
+static void InterpRunsFrom(const std::vector<uint8_t>& moved, const std::vector<uint16_t>& registers,
+                           std::vector<uint8_t>& asNow) {
+  asNow.assign(registers.size(), 0);
+  for (size_t r = 0; r < registers.size(); r++) {
+    if (moved[r] || (r > 0 && asNow[r - 1] && registers[r] == registers[r - 1] + 1)) {
+      asNow[r] = 1;
+    }
+  }
+}
+
 static const float kInterpJump = [] {
   const char* v = std::getenv("NG2_INTERP_JUMP");
   return v ? float(std::atof(v)) : 0.6f;
@@ -4619,33 +4656,38 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
       }
       auto& d = g.current[i];
       auto& before = g.previous[match[i]];
+      std::vector<uint8_t> moved(d.registers.size(), 0), asNow;
+      bool anyMoved = false;
       for (size_t r = 0; r < d.registers.size(); r++) {
         if (r < skips[i].size() && skips[i][r]) {
           continue;
         }
         const float* x = &before.constants[r * 4];
         const float* y = &d.constants[r * 4];
-        float size = 1.0f, change = 0;
+        float change = 0;
         for (uint32_t c = 0; c < 4; c++) {
-          size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
           change = std::max(change, std::fabs(x[c] - y[c]));
         }
-        bool reordered = false;
-        if (!(change <= kInterpJump * size)) {
-          // Moved to another register (a list sorted again: the lights):
-          // not a turn, however fast, which goes part of the way.
-          for (size_t r2 = 0; r2 < d.registers.size() && !reordered; r2++) {
-            const float* x2 = &before.constants[r2 * 4];
-            bool same = r2 != r;
-            for (uint32_t c = 0; c < 4 && same; c++) {
-              same = std::fabs(x2[c] - y[c]) <= 1e-4f * std::max(1.0f, std::fabs(y[c]));
-            }
-            reordered = same;
-          }
-          reordered |= !std::isfinite(change);
+        // Moved to another register (a list sorted again: the lights): not a
+        // turn, however fast, which goes part of the way.
+        moved[r] = !std::isfinite(change) ||
+                   (d.registers.size() == before.registers.size() &&
+                    InterpMovedFromAnother(before.constants.data(), d.constants.data(), d.registers.size(), r));
+        anyMoved |= moved[r] != 0;
+      }
+      if (!anyMoved) {
+        continue;
+      }
+      // A light is several registers (where, colour, reach): one found moved,
+      // its run from it is taken as now, or one light's place would go with
+      // another's reach (a flash on a wall, on the floor).
+      InterpRunsFrom(moved, d.registers, asNow);
+      for (size_t r = 0; r < d.registers.size(); r++) {
+        if (!asNow[r] || (r < skips[i].size() && skips[i][r])) {
+          continue;
         }
-        if (reordered) {
-          jumpedValues.insert(sharedKey(d.registers[r], y));
+        if (std::memcmp(&before.constants[r * 4], &d.constants[r * 4], 16) != 0) {
+          jumpedValues.insert(sharedKey(d.registers[r], &d.constants[r * 4]));
           jumpedDraws++;
         }
       }
