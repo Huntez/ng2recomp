@@ -5679,7 +5679,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 // each is (the frame, the picture of it). A ring of readback buffers, written
 // by a thread 150 ms after each was copied (done on the GPU by then).
 struct InterpRecord {
-  static constexpr uint32_t kRing = 96, kWidth = 640, kHeight = 360;
+  static constexpr uint32_t kRing = 64, kWidth = 960, kHeight = 540;
   struct Slot {
     std::unique_ptr<RenderBuffer> buffer;
     int64_t atNs = 0;
@@ -5690,7 +5690,12 @@ struct InterpRecord {
   bool on = false;
   int64_t untilNs = 0;
   uint64_t seq = 0, skipped = 0;
-  uint32_t texel = 4;
+  uint32_t texel = 4, take = 0;  // (take: which recording, its own folder)
+  // The whole picture made small on the GPU (as the present draws it, with
+  // the gamma): NG2_INTERP_RECORD_CROP=1 for the middle at full size instead.
+  std::unique_ptr<RenderTexture> small;
+  std::unique_ptr<RenderFramebuffer> smallFramebuffer;
+  bool scaled = false;
   bool wide = false;
   std::thread writer;
   std::atomic<bool> writing{false};
@@ -5704,7 +5709,13 @@ void InterpRecordWriter() {
 #else
   mkdir("interp_record", 0755);
 #endif
-  FILE* list = std::fopen("interp_record/list.txt", "w");
+  const std::string folder = fmt::format("interp_record/{}", r.take);
+#if defined(_WIN32)
+  CreateDirectoryA(folder.c_str(), nullptr);
+#else
+  mkdir(folder.c_str(), 0755);
+#endif
+  FILE* list = std::fopen((folder + "/list.txt").c_str(), "w");
   uint64_t next = 0;
   while (r.writing.load() || next < r.seq) {
     auto& slot = r.slots[next % InterpRecord::kRing];
@@ -5721,13 +5732,13 @@ void InterpRecordWriter() {
     }
     const auto* data = static_cast<const uint8_t*>(slot.buffer->map());
     if (data) {
-      std::string path = fmt::format("interp_record/{:05}.rgb", next);
+      std::string path = fmt::format("{}/{:05}.rgb", folder, next);
       if (FILE* f = std::fopen(path.c_str(), "wb")) {
         std::vector<uint8_t> gray(InterpRecord::kWidth * InterpRecord::kHeight * 3);
         for (uint32_t i = 0; i < InterpRecord::kWidth * InterpRecord::kHeight; i++) {
           const uint8_t* at = data + size_t(i) * r.texel;
           for (uint32_t c = 0; c < 3; c++) {
-            gray[i * 3 + c] = r.wide ? at[c * 2 + 1] : at[c];
+            gray[i * 3 + c] = r.scaled ? at[2 - c] : r.wide ? at[c * 2 + 1] : at[c];
           }
         }
         std::fwrite(gray.data(), 1, gray.size(), f);
@@ -5745,11 +5756,12 @@ void InterpRecordWriter() {
   if (list) {
     std::fclose(list);
   }
-  REXLOG_INFO("video: interp: recorded {} pictures ({} skipped)", r.seq, r.skipped);
+  REXLOG_INFO("video: interp: recorded {} pictures ({} skipped) to {}", r.seq, r.skipped, folder);
 }
 
 // (render thread) a picture to record, when recording
-void RecordInterpPicture(RenderCommandList* l, const HostTexture* source, uint64_t frame, uint32_t picture) {
+void RecordInterpPicture(RenderCommandList* l, const HostTexture* source, uint64_t frame, uint32_t picture,
+                         uint32_t gamma) {
   auto& r = g_interpRecord;
   if (!r.on) {
     if (!g_recordRequest.exchange(false) || r.writing.load() || !source) {
@@ -5758,8 +5770,23 @@ void RecordInterpPicture(RenderCommandList* l, const HostTexture* source, uint64
     if (source->format != RenderFormat::R8G8B8A8_UNORM && source->format != RenderFormat::R16G16B16A16_UNORM) {
       return;
     }
-    r.wide = source->format == RenderFormat::R16G16B16A16_UNORM;
+    static const bool crop = [] {
+      const char* v = std::getenv("NG2_INTERP_RECORD_CROP");
+      return v && v[0] == '1';
+    }();
+    r.scaled = !crop && source->descriptor;
+    r.wide = !r.scaled && source->format == RenderFormat::R16G16B16A16_UNORM;
     r.texel = r.wide ? 8 : 4;
+    if (r.scaled && !r.small) {
+      r.small = g_device->createTexture(RenderTextureDesc::Texture2D(
+          InterpRecord::kWidth, InterpRecord::kHeight, 1, BACKBUFFER_FORMAT, RenderTextureFlag::RENDER_TARGET));
+      const RenderTexture* attachments[] = {r.small.get()};
+      RenderFramebufferDesc desc;
+      desc.colorAttachments = attachments;
+      desc.colorAttachmentsCount = 1;
+      r.smallFramebuffer = r.small ? g_device->createFramebuffer(desc) : nullptr;
+      r.scaled = r.small && r.smallFramebuffer;
+    }
     for (auto& slot : r.slots) {
       if (!slot.buffer) {
         slot.buffer = g_device->createBuffer(
@@ -5774,16 +5801,21 @@ void RecordInterpPicture(RenderCommandList* l, const HostTexture* source, uint64
     if (r.writer.joinable()) {
       r.writer.join();
     }
+    r.take++;
     r.writing = true;
     r.writer = std::thread(InterpRecordWriter);
-    REXLOG_INFO("video: interp: recording 5 s of pictures");
+    REXLOG_INFO("video: interp: recording 5 s of pictures ({}x{} at scale {}: {} {}x{})", source->width,
+                source->height, source->scale, r.scaled ? "all of it made" : "the middle", InterpRecord::kWidth,
+                InterpRecord::kHeight);
   }
   if (SteadyNs() > r.untilNs) {
     r.on = false;
     r.writing = false;
     return;
   }
-  if (!source || source->width < InterpRecord::kWidth || source->height < InterpRecord::kHeight) {
+  const uint32_t sourceWidth = source ? source->width : 0;  // (host pixels already)
+  const uint32_t sourceHeight = source ? source->height : 0;
+  if (!source || sourceWidth < InterpRecord::kWidth || sourceHeight < InterpRecord::kHeight) {
     return;
   }
   auto& slot = r.slots[r.seq % InterpRecord::kRing];
@@ -5792,12 +5824,42 @@ void RecordInterpPicture(RenderCommandList* l, const HostTexture* source, uint64
     r.seq++;
     return;
   }
-  uint32_t x = (source->width - InterpRecord::kWidth) / 2, y = (source->height - InterpRecord::kHeight) / 2;
+  if (r.scaled) {
+    RenderTexture* small = r.small.get();
+    l->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(small, RenderTextureLayout::COLOR_WRITE));
+    l->setFramebuffer(r.smallFramebuffer.get());
+    uint32_t constants[3] = {source->descriptor, SAMPLER_LINEAR_CLAMP, gamma};
+    l->setGraphicsPipelineLayout(g_pipelineLayout.get());
+    l->setPipeline(g_presentPipeline.get());
+    l->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+    l->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+    l->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+    l->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+    l->setGraphicsPushConstants(0, constants, 0, sizeof(constants));
+    RenderViewport viewport(0.0f, 0.0f, float(InterpRecord::kWidth), float(InterpRecord::kHeight));
+    RenderRect scissor(0, 0, int32_t(InterpRecord::kWidth), int32_t(InterpRecord::kHeight));
+    l->setViewports(&viewport, 1);
+    l->setScissors(&scissor, 1);
+    l->drawInstanced(3, 1, 0, 0);
+    l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(small, RenderTextureLayout::COPY_SOURCE));
+    l->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(slot.buffer.get(), BACKBUFFER_FORMAT,
+                                                                     InterpRecord::kWidth, InterpRecord::kHeight, 1,
+                                                                     InterpRecord::kWidth),
+                         RenderTextureCopyLocation::Subresource(small));
+    slot.seq = r.seq++;
+    slot.frame = frame;
+    slot.picture = picture;
+    slot.atNs = SteadyNs();
+    slot.full = true;
+    return;
+  }
+  uint32_t x = (sourceWidth - InterpRecord::kWidth) / 2, y = (sourceHeight - InterpRecord::kHeight) / 2;
   RenderBox box(int32_t(x), int32_t(y), int32_t(x + InterpRecord::kWidth), int32_t(y + InterpRecord::kHeight));
   l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source->texture.get(), RenderTextureLayout::COPY_SOURCE));
   l->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(slot.buffer.get(), source->format, InterpRecord::kWidth,
                                                                    InterpRecord::kHeight, 1, InterpRecord::kWidth),
-                       RenderTextureCopyLocation::Subresource(source->texture.get()), 0, 0, 0, &box);
+                       RenderTextureCopyLocation::Subresource(source->texture.get()), x, y, 0, &box);
+  // (plume takes the image's offset from dstX/dstY in a copy to a buffer, not from the box)
   l->barriers(RenderBarrierStage::GRAPHICS,
               RenderTextureBarrier(source->texture.get(), RenderTextureLayout::SHADER_READ));
   slot.seq = r.seq++;
@@ -5848,9 +5910,10 @@ bool ArmInterpShots(const HostTexture* source) {
   }
   g.nextNs = SteadyNs() + g.everyNs;
   uint32_t texel = source->format == RenderFormat::R16G16B16A16_UNORM ? 8 : 4;
-  g.rowWidth = (source->width + 63) & ~63u;
-  g.width = source->width, g.height = source->height, g.format = source->format;
-  uint64_t size = uint64_t(g.rowWidth) * source->height * texel;
+  g.width = source->width, g.height = source->height;  // (host pixels)
+  g.rowWidth = (g.width + 63) & ~63u;
+  g.format = source->format;
+  uint64_t size = uint64_t(g.rowWidth) * g.height * texel;
   static const uint32_t burst = [] {
     const char* v = std::getenv("NG2_INTERP_SHOT_FRAMES");
     return std::clamp(v ? uint32_t(std::atoi(v)) : 2u, 1u, 10u);
@@ -6416,7 +6479,7 @@ void Present(HostTexture* frontBuffer) {
         g_replayConstants = nullptr;
         g_replayCopies = nullptr;
         CaptureInterpShot(interpList.get(), source, uint32_t(k));
-        RecordInterpPicture(interpList.get(), source, g_frameCount, uint32_t(k));
+        RecordInterpPicture(interpList.get(), source, g_frameCount, uint32_t(k), gamma);
         blit(interpList.get(), index);
         interpList->end();
         RenderCommandSemaphore* wait = semaphore.get();
@@ -6442,7 +6505,7 @@ void Present(HostTexture* frontBuffer) {
       uint32_t shotIndex = interp ? uint32_t(std::min<size_t>(interp->phases.size(), 3)) : 0;
       CaptureInterpShot(list, source, shotIndex);
       if (InterpEnabled()) {
-        RecordInterpPicture(list, source, g_frameCount, 9);  // (9: the frame's own)
+        RecordInterpPicture(list, source, g_frameCount, 9, gamma);  // (9: the frame's own)
       }
       blit(list, frameIndex);
       if (g_interpShots.armed) {
