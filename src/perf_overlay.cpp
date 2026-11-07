@@ -1,9 +1,10 @@
 // ng2 - Ninja Gaiden II static recompilation
 //
 // show_fps: the frame rate and frame time in a corner, drawn as the game's
-// own menu text. A text item like the ones on the Options pages (a sprite,
-// then a text part: docs/menus.md) lives in guest memory and is queued into
-// each frame's 2D lists right after the game starts the frame
+// own menu text; and the port's version in the title menu's bottom right
+// corner, the same way. A text item like the ones on the Options pages (a
+// sprite, then a text part: docs/menus.md) lives in guest memory and is
+// queued into each frame's 2D lists right after the game starts the frame
 // (sub_822F0EF8, which empties them).
 
 #include <algorithm>
