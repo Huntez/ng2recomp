@@ -82,6 +82,14 @@ devices, and none of the player's settings or saves.
 - `NG2_EXCLUSIVE=1` (Windows): the swapchain takes the display (VK_EXT_full_screen_exclusive), so its
   presents are flipped by the display instead of composed by DWM, which drops pictures at high refresh
   rates. Needs `fullscreen` and `exclusive_fullscreen` on in ng2.toml; `2` leaves it to the driver.
+- `NG2_INTERP=1`: frame interpolation (work in progress): each frame's draws drawn again with their vertex
+  constants and bone palettes part of the way from the last frame's, `NG2_INTERP_FRAMES` (2) pictures
+  between, for 180 Hz from the game's 60. Draws are matched by mesh, then by shaders and constants; stats
+  every 600 frames. Best with `NG2_EXCLUSIVE=1`. F8: every picture for 5 s (a 640x360 crop) to
+  `interp_record/`; `NG2_INTERP_SHOTS=<s>`: a frame's pictures every so often to `interp_shots/`.
+  `NG2_INTERP_DEBUG=1` leaves out the draws without their own match; `NG2_INTERP_DEBUG_T=<t>` draws every
+  picture between at that point; `NG2_INTERP_BONES=0`, `NG2_INTERP_JUMP`, `NG2_INTERP_BY_PLACE`,
+  `NG2_INTERP_PACE` are switches for comparisons. `NG2_INTERP_PROBE=1`: how alike frames are, logged.
 - `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).
   `--async_file_reads=false`: reads the game asks to be asynchronous block its thread again.
   `--test_read_delay_us_per_mb=12000`: slow every read to about SD card speed, to measure loading
