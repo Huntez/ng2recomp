@@ -206,9 +206,10 @@ constexpr Setting kSettings[] = {
     {u"Input Latency", {u"Standard", u"Low"}, 2, "input_latency", Kind::kLevel},
     // The guest's vblanks on the display's refreshes (gpu/native_gpu.cpp).
     {u"Frame Pacing", {u"Auto", u"Timer"}, 2, "frame_pacing", Kind::kLevel},
-    // Pictures made between the game's frames, one each refresh (or each
-    // second): from the next start (gpu/video.cpp).
-    {u"Frame Interpolation", {u"Off", u"Every Refresh", u"Every 2nd Refresh"}, 3,
+    // Pictures made between the game's frames: one each refresh of the
+    // display (Full Rate) or each second one (Half Rate); gpu/video.cpp.
+    // (Short: a longer choice is squeezed narrow to fit.)
+    {u"Frame Interpolation", {u"Off", u"Full Rate", u"Half Rate"}, 3,
      "frame_interpolation", Kind::kLevel},
 };
 // The window sizes for the chosen aspect ratio.
