@@ -4405,7 +4405,8 @@ struct InterpState {
   uint64_t drawsSeen = 0, drawsWorst = 0;
   uint64_t frames = 0, interpolated = 0, draws = 0, matched = 0, snapped = 0, registers = 0;
   uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0, psDraws = 0, timeStill = 0,
-           teleported = 0;
+           teleported = 0, paused = 0;
+  int64_t lastBuildNs = 0;  // the last frame's build
   uint32_t keptFor = 0;  // frames the last full frame was kept over (partial ones)
   int64_t lastFullNs = 0;  // the last full frame's present (game thread's clock)
   int64_t lastPresentNs = 0;
@@ -4651,8 +4652,85 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       int64_t ns = SteadyNs() - start;
       g_interp.buildNs += ns;
       g_interp.worstNs = std::max(g_interp.worstNs, ns);
+      g_interp.lastBuildNs = ns;
     }
   } timed{startNs};
+  // Paused when the pictures cost the game its 60 (the Steam Deck in a big
+  // fight: 7-12 ms of building a frame, the game at 30): the frames shown as
+  // they are for a while (1.5 s, longer each time it comes back too soon), then
+  // tried again. Whether they cost it is seen in the pause: a game no faster
+  // without them (a cutscene at 30 of its own) isn't paused again while it
+  // runs at that rate. NG2_INTERP_AUTOPAUSE=0: never.
+  {
+    static const bool autoPause = [] {
+      const char* v = std::getenv("NG2_INTERP_AUTOPAUSE");
+      return !v || v[0] != '0';
+    }();
+    static int64_t pausedUntil = 0, holdNs = 0, resumedNs = 0, lastNs = 0;
+    static double buildAvg = 0, gapAvg = 1e9 / 60.0, gapBefore = 0, ownRate = 0, pausedSum = 0;
+    static uint32_t behind = 0, pausedCount = 0;
+    int64_t gap = lastNs ? presentNs - lastNs : 0;
+    lastNs = presentNs;
+    const bool gapValid = gap > 0 && gap < 150'000'000;
+    if (gapValid) {
+      gapAvg += (double(gap) - gapAvg) * 0.1;
+    }
+    if (pausedUntil) {
+      if (gapValid) {
+        pausedSum += double(gap);
+        pausedCount++;
+      }
+      if (presentNs < pausedUntil) {
+        g.previous.clear();
+        g.current.clear();
+        g.previousPalettes.clear();
+        g.palettes.clear();
+        g.paletteIndex.clear();
+        g.keptFor = 0;
+        g.lastFullNs = g.lastPresentNs = g.baseNs = g.gridNs = 0;
+        g.slowRun = 0;
+        g.slow = false;
+        g.lastBuildNs = 0;
+        return nullptr;
+      }
+      pausedUntil = 0;
+      resumedNs = presentNs;
+      behind = 0;
+      buildAvg = 0;
+      double without = pausedCount ? pausedSum / pausedCount : 0;
+      if (pausedCount >= 10 && without > gapBefore * 0.85) {
+        ownRate = gapBefore;  // (no faster without them: its own rate)
+        holdNs = 0;
+        REXLOG_INFO("video: interp: on again: the game is at {:.0f} fps without the pictures too", 1e9 / without);
+      } else {
+        REXLOG_INFO("video: interp: on again ({:.0f} fps without the pictures, {:.0f} with)",
+                    without > 0 ? 1e9 / without : 0.0, 1e9 / gapBefore);
+      }
+    } else if (autoPause) {
+      buildAvg += (double(g.lastBuildNs) - buildAvg) * 0.1;
+      if (ownRate && gapAvg < 18'000'000) {
+        ownRate = 0;  // (back at 60)
+      }
+      const double late = ownRate ? ownRate * 1.15 : 18'500'000.0;
+      if (gapValid && double(gap) > late && buildAvg > 3e6) {
+        behind++;
+      } else if (gapValid && double(gap) < (ownRate ? ownRate * 1.05 : 17'500'000.0)) {
+        behind = behind > 2 ? behind - 2 : 0;
+      }
+      if (behind >= 20) {
+        holdNs = resumedNs && holdNs && presentNs - resumedNs < 10'000'000'000
+                     ? std::min<int64_t>(holdNs * 2, 24'000'000'000)
+                     : 1'500'000'000;
+        pausedUntil = presentNs + holdNs;
+        gapBefore = gapAvg;
+        pausedSum = 0;
+        pausedCount = 0;
+        g.paused++;
+        REXLOG_INFO("video: interp: paused for {:.0f} s (building a frame {:.1f} ms, the game at {:.0f} fps)",
+                    double(holdNs) / 1e9, buildAvg / 1e6, 1e9 / gapAvg);
+      }
+    }
+  }
   g.drawsSeen += g.current.size();
   g.drawsWorst = std::max<uint64_t>(g.drawsWorst, g.current.size());
   std::shared_ptr<InterpFrames> frames;
