@@ -1802,6 +1802,7 @@ class Presenter {
     RenderCommandFence* done = nullptr;  // its drawing's (a picture between)
     int64_t inputNs = 0;                 // the frame's pad read (NG2_LATENCY_LOG)
     uint8_t order = 0;                   // 1: the frame's first picture, 2: its own, 3: both
+    bool timed = false;                  // a slow screen's: by the clock always
   };
 
   ~Presenter() {
@@ -1824,6 +1825,29 @@ class Presenter {
       }
     }
     cv_.notify_all();
+  }
+
+  // The pictures waiting for their time (a slow screen's) presented at once,
+  // and waited for: before a frame's drawing that acquires images (in
+  // exclusive full screen an image is freed only by a later present, which
+  // queued behind that drawing's wait would never come: the GPU stood 12 s).
+  void Hurry(Watch* watch) {
+    {
+      std::lock_guard lock(mutex_);
+      bool timed = busyTimed_;
+      for (auto& queued : queue_) {
+        timed |= queued.timed;
+      }
+      if (!timed) {
+        return;  // (none waits for its time)
+      }
+      for (auto& queued : queue_) {
+        queued.atNs = 0;
+      }
+      hurry_ = true;
+    }
+    WaitFor(0, watch);
+    hurry_ = false;
   }
 
   // Until at most `left` pictures wait.
@@ -1851,6 +1875,7 @@ class Presenter {
         item = queue_.front();
         queue_.pop_front();
         busy_ = 1;
+        busyTimed_ = item.timed;
         // Behind (a later frame waits): shown at once, to catch up (the
         // screen keeps the newest of them).
         if (!queue_.empty() && queue_.back().frame > item.frame) {
@@ -1879,7 +1904,7 @@ class Presenter {
         const char* v = std::getenv("NG2_INTERP_PACE");
         return v ? v[0] == '1' : !exclusive;
       }();
-      if (!paced) {
+      if (!paced && !item.timed) {
         item.atNs = 0;
       }
       presenterWatch.Set(kTimer);
@@ -1894,11 +1919,11 @@ class Presenter {
         return begin && begin(1) == 0;
       }();
       (void)period;
-      while (item.atNs - SteadyNs() > 2000000) {
+      while (!hurry_.load() && item.atNs - SteadyNs() > 2000000) {
         Sleep(1);
       }
 #endif
-      for (int64_t now = SteadyNs(); now < item.atNs; now = SteadyNs()) {
+      for (int64_t now = SteadyNs(); now < item.atNs && !hurry_.load(); now = SteadyNs()) {
         if (item.atNs - now > 2000000) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         } else {
@@ -1934,6 +1959,27 @@ class Presenter {
           NotePadToPresent(SteadyNs() - item.inputNs, 1);
         }
       }
+      if (item.timed) {
+        static int64_t lastNs = 0, lateSum = 0, lateMax = 0, gapMin = INT64_MAX, gapMax = 0;
+        static uint32_t count = 0, gaps = 0, short4 = 0, long15 = 0;
+        int64_t late = presentStart - item.atNs;
+        lateSum += late, lateMax = std::max(lateMax, late);
+        if (lastNs && presentStart - lastNs < 100'000'000) {
+          int64_t gap = presentStart - lastNs;
+          gapMin = std::min(gapMin, gap), gapMax = std::max(gapMax, gap);
+          short4 += gap < 4'000'000, long15 += gap > 15'000'000;
+          gaps++;
+        }
+        lastNs = presentStart;
+        if (++count == 120) {
+          REXLOG_INFO("video: interp: slow screen presents: {:.2f} ms late on average (max {:.1f}); "
+                      "{:.1f} to {:.1f} ms apart, {} under 4 ms, {} over 15 ms of {}",
+                      double(lateSum) / 120e6, double(lateMax) / 1e6, double(gapMin) / 1e6, double(gapMax) / 1e6,
+                      short4, long15, gaps);
+          lateSum = lateMax = gapMax = 0, gapMin = INT64_MAX;
+          count = gaps = short4 = long15 = 0;
+        }
+      }
       int64_t took = SteadyNs() - presentStart;
       presentNs += took;
       presentMaxNs = std::max<int64_t>(presentMaxNs, took);
@@ -1941,6 +1987,7 @@ class Presenter {
       {
         std::lock_guard lock(mutex_);
         busy_ = 0;
+        busyTimed_ = false;
       }
       idle_.notify_all();
     }
@@ -1950,6 +1997,8 @@ class Presenter {
   std::condition_variable cv_, idle_;
   std::deque<Item> queue_;
   size_t busy_ = 0;
+  std::atomic<bool> hurry_{false};
+  bool busyTimed_ = false;  // the picture being presented is a timed one (mutex_)
   bool stop_ = false;
   uint64_t lastId_ = 0;  // the last present's (presenter thread)
   std::thread thread_;
@@ -4255,7 +4304,18 @@ struct InterpPalette {
 struct InterpFrames {
   std::vector<std::vector<std::array<uint64_t, 3>>> phases;  // push constants by draw
   std::vector<std::vector<RenderBufferReference>> copies;    // palette copies by palette
+  // A slow screen (the scene drawn 30 or 15 times a second: Game Over): the
+  // pictures spread by the clock over spanNs, the time since the last full
+  // frame; a partial frame there (the last picture again) not shown.
+  bool slow = false, partial = false;
+  int64_t spanNs = 0;
+  int64_t spacingNs = 0;  // whole refreshes between its pictures (0: span / pictures)
 };
+// The most pictures a frame (between and its own): what the swapchain's
+// images leave (set with it).
+constexpr uint32_t kInterpMaxPictures = 8;
+std::atomic<uint32_t> g_interpPictureCap{4};
+std::atomic<int64_t> g_modeRefreshNs{0};  // the display mode's refresh (SDL), 0 not known
 struct InterpState {
   std::vector<InterpDraw> previous, current;
   std::vector<InterpPalette> previousPalettes, palettes;
@@ -4266,7 +4326,10 @@ struct InterpState {
   uint64_t drawsSeen = 0, drawsWorst = 0;
   uint64_t frames = 0, interpolated = 0, draws = 0, matched = 0, snapped = 0, registers = 0;
   uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0, psDraws = 0, timeStill = 0;
-  uint32_t keptFor = 0;  // frames the last full frame was kept over (partial ones)  // draws without a match given the shared registers' values before
+  uint32_t keptFor = 0;  // frames the last full frame was kept over (partial ones)
+  int64_t lastFullNs = 0;  // the last full frame's present (game thread's clock)
+  uint32_t slowRun = 0;    // full frames in a row a long time apart
+  bool slow = false;  // draws without a match given the shared registers' values before
 };
 InterpState g_interp;  // the build's (its thread's while one runs)
 // What this frame's draws are, filled as they're drawn (game thread); handed
@@ -4440,7 +4503,7 @@ static const float kPaletteJump = [] {
   return v ? float(std::atof(v)) : 0.75f;
 }();
 
-std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCount) {
+std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCount, int64_t presentNs) {
   // (its own uploads: the game thread's go on with the next frame)
   auto Allocate = [slot](uint64_t size, uint64_t alignment = 256) {
     return AllocateFrom(g_interpUploads[slot], size, alignment);
@@ -4733,6 +4796,23 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   if (partial) {
     g.partial++;
   }
+  // Full frames 28 ms or more apart three times in a row: a slow screen
+  // (a hitch now and then isn't one); back under 22 ms, not.
+  int64_t span = 0;
+  if (!partial && submitted) {
+    span = g.lastFullNs ? presentNs - g.lastFullNs : 0;
+    g.lastFullNs = presentNs;
+    if (span >= 28'000'000 && span < 150'000'000) {
+      g.slowRun = std::min(g.slowRun + 1, 3u);
+    } else if (span < 22'000'000 || span >= 150'000'000) {
+      g.slowRun = 0;
+    }
+    if (g.slow != (g.slowRun >= 3)) {
+      REXLOG_INFO("video: interp: {} slow screen (full frames {:.1f} ms apart)", g.slow ? "out of a" : "a",
+                  double(span) / 1e6);
+    }
+    g.slow = g.slowRun >= 3;
+  }
   // A cut (another camera, a loaded room): most draws are new.
   if (!partial && !g.previous.empty() && submitted && matched * 2 < submitted) {
     g.cuts++;
@@ -4746,6 +4826,30 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   if (!partial && !g.previous.empty() && submitted && matched * 2 >= submitted) {
     frames = std::make_shared<InterpFrames>();
     uint32_t steps = InterpSteps();
+    if (g.slow && span) {
+      // As many pictures as the usual rate gives in that time, or with the
+      // display's refresh known, each the same whole number of refreshes
+      // (two at 180 Hz for 15 a second: pictures held one, then three,
+      // looked as choppy as before).
+      double pictureNs = 1e9 / 60.0 / double(steps + 1);
+      int64_t wanted = std::llround(double(span) / pictureNs);
+      int64_t cap = std::min<int64_t>(kInterpMaxPictures, g_interpPictureCap.load());
+      if (int64_t refresh = g_modeRefreshNs.load()) {
+        double refreshes = double(span) / double(refresh);
+        int64_t per = std::max<int64_t>(1, int64_t(std::ceil(refreshes / double(cap) - 0.05)));
+        wanted = std::max<int64_t>(1, std::llround(refreshes / double(per)));
+        frames->spacingNs = per * refresh;
+      }
+      steps = uint32_t(std::clamp<int64_t>(wanted, steps + 1, std::max<int64_t>(cap, steps + 1)) - 1);
+      frames->slow = true;
+      frames->spanNs = span;
+      static uint32_t logged = 0;
+      if (logged < 20) {
+        logged++;
+        REXLOG_INFO("video: interp: slow screen frame {}: {} pictures over {:.1f} ms", frameCount, steps + 1,
+                    double(span) / 1e6);
+      }
+    }
     frames->phases.resize(steps);
     // What the matched draws' registers were the frame before, by register and
     // value now: the camera, the view, the light (the same for every draw that
@@ -5184,7 +5288,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // as the fetch reads them) unchanged copied, a row that jumped taken as it
     // is now, the others part of the way, written straight to each picture's
     // upload.
-    float ts[4] = {};
+    float ts[kInterpMaxPictures] = {};
     for (uint32_t k = 0; k < steps; k++) {
       ts[k] = float(k + 1) / float(steps + 1);
       static const char* debugT = std::getenv("NG2_INTERP_DEBUG_T");
@@ -5207,7 +5311,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       double moved = 0;
       size_t rows = 0, worstRow = 0, farRows = 0;
       float worst = 0;
-      uint32_t* outs[4] = {};
+      uint32_t* outs[kInterpMaxPictures] = {};
       uint64_t snapped = 0;
     };
     std::vector<PaletteJob> jobs(g.palettes.size());
@@ -5441,6 +5545,11 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   }
   if (partial) {
     g.keptFor++;
+    if (!frames) {
+      frames = std::make_shared<InterpFrames>();
+    }
+    frames->partial = true;
+    frames->slow = g.slow;
     g.current.clear();
     g.palettes.clear();
     g.paletteIndex.clear();
@@ -6894,13 +7003,14 @@ void Present(HostTexture* frontBuffer) {
       return !v || v[0] != '0';
     }();
     uint64_t frameCount = g_frameCount;
+    int64_t presentNs = SteadyNs();
     if (onThread) {
-      interpJob = std::async(std::launch::async, [frame, frameCount] {
-                    return BuildInterpFrames(frame, frameCount);
+      interpJob = std::async(std::launch::async, [frame, frameCount, presentNs] {
+                    return BuildInterpFrames(frame, frameCount, presentNs);
                   }).share();
     } else {
       std::promise<std::shared_ptr<InterpFrames>> done;
-      done.set_value(BuildInterpFrames(frame, frameCount));
+      done.set_value(BuildInterpFrames(frame, frameCount, presentNs));
       interpJob = done.get_future().share();
     }
     lastJob = interpJob;
@@ -7058,7 +7168,13 @@ void Present(HostTexture* frontBuffer) {
 
     // Images in the order they are shown: the pictures between, then the
     // frame's (drawn first: its commands have run).
-    constexpr uint32_t kMaxPictures = 4;
+    constexpr uint32_t kMaxPictures = kInterpMaxPictures;
+    // A slow screen's partial frame: the last picture again, not shown (the
+    // last full frame's pictures are still being shown by the clock).
+    const bool hide = interp && interp->partial && interp->slow;
+    if (!hide && InterpEnabled()) {
+      g_presenter.Hurry(&g_presenter.renderWatch);
+    }
     static std::unique_ptr<RenderCommandSemaphore> interpAcquire[NUM_FRAMES][kMaxPictures - 1];
     uint32_t indices[kMaxPictures] = {};
     uint32_t pictures = 0;
@@ -7106,7 +7222,7 @@ void Present(HostTexture* frontBuffer) {
     }
     // At most a frame's pictures waiting to be shown (the swapchain's images
     // last; plume's acquire lets go of the swapchain between short waits).
-    if (interp || InterpEnabled()) {
+    if ((interp || InterpEnabled()) && !hide) {
       int64_t roomStart = SteadyNs();
       g_presenter.WaitFor(3, &g_presenter.renderWatch);
       int64_t took = SteadyNs() - roomStart;
@@ -7176,7 +7292,7 @@ void Present(HostTexture* frontBuffer) {
         interpLists[frame][k]->end();
       }
     }
-    if (g_swapChainValid) {
+    if (g_swapChainValid && !hide) {
       int64_t acquireStart = SteadyNs();
       g_presenter.renderWatch.Set(Presenter::kAcquire);
       g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &frameIndex);
@@ -7186,20 +7302,22 @@ void Present(HostTexture* frontBuffer) {
     growSemaphores();
     if (g_swapChainValid) {
       WriteGpuMark(list, frame, presentMark);
-      uint32_t shotIndex = interp ? uint32_t(std::min<size_t>(interp->phases.size(), 3)) : 0;
-      CaptureInterpShot(list, source, shotIndex);
-      if (InterpEnabled()) {
-        RecordInterpPicture(list, source, g_frameCount, 9, gamma);  // (9: the frame's own)
-      }
-      blit(list, frameIndex);
-      if (g_interpShots.armed) {
-        WriteInterpShots(shotIndex + 1);
+      if (!hide) {
+        uint32_t shotIndex = interp ? uint32_t(std::min<size_t>(interp->phases.size(), 3)) : 0;
+        CaptureInterpShot(list, source, shotIndex);
+        if (InterpEnabled()) {
+          RecordInterpPicture(list, source, g_frameCount, 9, gamma);  // (9: the frame's own)
+        }
+        blit(list, frameIndex);
+        if (g_interpShots.armed) {
+          WriteInterpShots(shotIndex + 1);
+        }
       }
     }
     WriteGpuMark(list, frame, endMark);
 
     list->end();
-    if (g_swapChainValid) {
+    if (g_swapChainValid && !hide) {
       RenderCommandSemaphore* waits[] = {g_acquireSemaphores[frame].get()};
       RenderCommandSemaphore* signals[] = {g_renderSemaphores[frameIndex].get()};
       int64_t submitStart = SteadyNs();
@@ -7214,13 +7332,32 @@ void Present(HostTexture* frontBuffer) {
       pictures++;
       static uint64_t presents = 0;
       if (InterpEnabled()) {
-        // One at a time, a part of the frame interval apart (Presenter).
+        // One at a time, a part of the frame interval apart (Presenter); a
+        // slow screen's evenly over the time since its last full frame, the
+        // first at once.
         int64_t firstNs = SteadyNs();
+        const bool timed = interp && interp->slow && !interp->partial && pictures > 1;
+        // A slow screen's: one after another a spacing apart, on from the
+        // last frame's (the game's frames come unevenly, 26 then 41 ms), the
+        // first no sooner than now.
+        static int64_t slowNext = 0;
+        int64_t spacing = 0;
+        if (timed) {
+          spacing = interp->spacingNs ? interp->spacingNs : interp->spanNs / pictures;
+          if (slowNext > firstNs + 4 * interp->spanNs || slowNext + 4 * interp->spanNs < firstNs) {
+            slowNext = firstNs;  // (a new screen, or far off)
+          }
+          while (slowNext < firstNs) {
+            slowNext += spacing;
+          }
+        }
         for (uint32_t i = 0; i < pictures; i++) {
-          g_presenter.Push({indices[i], signalSemaphores[i],
-                            firstNs + int64_t(intervalNs * (i + 1) / pictures), presents,
-                            doneFences[i], inputNs,
-                            uint8_t((i == 0 ? 1 : 0) | (i + 1 == pictures ? 2 : 0))});
+          int64_t at = timed ? slowNext : firstNs + int64_t(intervalNs * (i + 1) / pictures);
+          if (timed) {
+            slowNext += spacing;
+          }
+          g_presenter.Push({indices[i], signalSemaphores[i], at, presents, doneFences[i], inputNs,
+                            uint8_t((i == 0 ? 1 : 0) | (i + 1 == pictures ? 2 : 0)), timed});
         }
       } else {
         g_swapChainValid = g_swapChain->present(indices[0], &signalSemaphores[0], 1);
@@ -7276,6 +7413,12 @@ bool GetRenderWindow(RenderWindow& renderWindow) {
   if (!window) {
     REXLOG_ERROR("video: no SDL window");
     return false;
+  }
+  if (const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window))) {
+    if (mode->refresh_rate > 20.0f) {
+      g_modeRefreshNs = int64_t(1e9 / double(mode->refresh_rate));
+      REXLOG_INFO("video: display mode {:.2f} Hz", mode->refresh_rate);
+    }
   }
 #if defined(__linux__)
   SDL_PropertiesID props = SDL_GetWindowProperties(window);
@@ -7649,6 +7792,7 @@ bool CreateHostDevice() {
     images = v && std::atoi(v) >= 3 ? uint32_t(std::atoi(v)) : 8u;
   }
   g_swapChain = g_queue->createSwapChain(renderWindow, images, BACKBUFFER_FORMAT, 1);
+  g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
   if (InterpEnabled()) {
     g_presenter.StartWatchdog();
   }
