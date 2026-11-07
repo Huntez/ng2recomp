@@ -133,9 +133,9 @@ REXCVAR_DEFINE_INT32(texture_lod_bias, 0, "Extras", "0: the game's, 1: 0, 2: -1"
 REXCVAR_DEFINE_INT32(input_latency, 0, "Video", "0: standard, 1: low (needs VK_KHR_present_wait)");
 // Frame Interpolation: pictures made between the game's frames (its draws
 // again, part of the way from the last frame's), one for each refresh of the
-// display, or each second one; from the next start. NG2_INTERP=1/0 overrides.
+// display, or each second one; switched live. NG2_INTERP=1/0 overrides.
 REXCVAR_DEFINE_INT32(frame_interpolation, 0, "Video",
-                     "0: off, 1: a picture each refresh, 2: each second refresh (from the next start)");
+                     "0: off, 1: a picture each refresh, 2: each second refresh (each one below 120 Hz)");
 REXCVAR_DEFINE_INT32(anisotropic_filtering, -1, "Video",
                      "Anisotropic filtering for mipmapped textures: -1 as the game asks, "
                      "0 off, 1-5 for 1x, 2x, 4x, 8x, 16x")
@@ -4367,10 +4367,24 @@ bool InterpPacedByDisplay() {
   }();
   return paced;
 }
+int64_t InterpRefreshNs();
 uint32_t InterpDivider() {
   const char* v = std::getenv("NG2_INTERP_DIVIDER");
-  return v ? std::clamp<uint32_t>(uint32_t(std::atoi(v)), 1u, 6u)
-           : REXCVAR_GET(frame_interpolation) == 2 ? 2u : 1u;
+  if (v) {
+    return std::clamp<uint32_t>(uint32_t(std::atoi(v)), 1u, 6u);
+  }
+  if (REXCVAR_GET(frame_interpolation) != 2) {
+    return 1;
+  }
+  // Half Rate: never fewer pictures than the game's 60 frames (at 60 or 70 Hz
+  // each second refresh was 30 or 35 a second): each as many refreshes as
+  // fit in the game's frame, two at most (one at 70 or 90 Hz, two at 120 Hz
+  // and up).
+  int64_t refresh = InterpRefreshNs();
+  if (refresh <= 0) {
+    return 2;
+  }
+  return std::clamp<uint32_t>(uint32_t(1e9 / 60.0 / double(refresh) + 0.05), 1u, 2u);
 }
 // The display's refresh: measured (VK_KHR_present_wait) when steady, else
 // the display mode's; 0 not known.
