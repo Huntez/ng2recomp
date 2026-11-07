@@ -79,6 +79,9 @@ devices, and none of the player's settings or saves.
   sets the headless display's rate.
 - `NG2_RENDER_THREAD=0`: Vulkan commands, submits and presents on the game's render thread again
   instead of the "Render Commands" thread (for comparisons).
+- `NG2_EXCLUSIVE=1` (Windows): the swapchain takes the display (VK_EXT_full_screen_exclusive), so its
+  presents are flipped by the display instead of composed by DWM, which drops pictures at high refresh
+  rates. Needs `fullscreen` and `exclusive_fullscreen` on in ng2.toml; `2` leaves it to the driver.
 - `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).
   `--async_file_reads=false`: reads the game asks to be asynchronous block its thread again.
   `--test_read_delay_us_per_mb=12000`: slow every read to about SD card speed, to measure loading
