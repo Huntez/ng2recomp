@@ -131,6 +131,11 @@ REXCVAR_DEFINE_INT32(texture_lod_bias, 0, "Extras", "0: the game's, 1: 0, 2: -1"
 // display (FIFO's three images let two): about one or two refreshes less
 // between a press and its picture, with less slack for a slow frame.
 REXCVAR_DEFINE_INT32(input_latency, 0, "Video", "0: standard, 1: low (needs VK_KHR_present_wait)");
+// Frame Interpolation: pictures made between the game's frames (its draws
+// again, part of the way from the last frame's), one for each refresh of the
+// display, or each second one; from the next start. NG2_INTERP=1/0 overrides.
+REXCVAR_DEFINE_INT32(frame_interpolation, 0, "Video",
+                     "0: off, 1: a picture each refresh, 2: each second refresh (from the next start)");
 REXCVAR_DEFINE_INT32(anisotropic_filtering, -1, "Video",
                      "Anisotropic filtering for mipmapped textures: -1 as the game asks, "
                      "0 off, 1-5 for 1x, 2x, 4x, 8x, 16x")
@@ -4342,7 +4347,8 @@ bool InterpPacedByDisplay() {
 uint32_t InterpDivider() {
   static const uint32_t divider = [] {
     const char* v = std::getenv("NG2_INTERP_DIVIDER");
-    return v ? std::clamp<uint32_t>(uint32_t(std::atoi(v)), 1u, 6u) : 1u;
+    return v ? std::clamp<uint32_t>(uint32_t(std::atoi(v)), 1u, 6u)
+             : REXCVAR_GET(frame_interpolation) == 2 ? 2u : 1u;
   }();
   return divider;
 }
@@ -4387,7 +4393,7 @@ InterpCapture g_interpCapture;
 bool InterpEnabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("NG2_INTERP");
-    if (!v || v[0] != '1') {
+    if (v && v[0] ? v[0] != '1' : REXCVAR_GET(frame_interpolation) <= 0) {
       return false;
     }
     if (!RenderThreadEnabled()) {
