@@ -52,6 +52,12 @@ constexpr uint32_t kTextColor = 0x85371760;  // a focused row's (16 bytes)
 
 uint32_t g_item = 0;  // 0 until made
 uint32_t g_resource = 0;  // the item sprite's
+// The version in the title menu's bottom right corner, the same kind of item.
+uint32_t g_versionItem = 0;
+uint32_t g_versionResource = 0;
+uint64_t g_frameNumber = 0;
+uint64_t g_titleMenuFrame = ~0ull;  // the last frame the title menu updated in
+constexpr float kVersionX = 1150.0f - 953.0f, kVersionY = 684.0f - 650.0f;
 std::chrono::steady_clock::time_point g_last;
 double g_seconds = 0.0;  // frame times since the text last changed
 uint32_t g_frames = 0;
@@ -98,11 +104,12 @@ REX_EXTERN(__imp__sub_83704978);  // a sprite's update
 
 namespace {
 
-bool MakeItem(PPCContext& ctx, uint8_t* base) {
+// A text item at (x, y) from the frame's anchor, or 0.
+uint32_t NewTextItem(PPCContext& ctx, uint8_t* base, float x, float y) {
   uint32_t item = CallGuest(ctx, base, __imp__sub_83835960,
                             {kItemSize + kTextChars * 2, kAllocAttributes});
   if (!item) {
-    return false;
+    return 0;
   }
   std::memset(ng2::guest::Virtual(item), 0, kItemSize + kTextChars * 2);
   CallGuest(ctx, base, __imp__sub_83704630, {item});
@@ -112,10 +119,23 @@ bool MakeItem(PPCContext& ctx, uint8_t* base) {
   // (as the lists' value text is).
   Store32(item + kTextPart + 8, (ng2::guest::Load32(item + kTextPart + 8) & 0xFFFC3FFF) | 0x4000);
   Store32(item + 0xF0, 1);
-  StoreFloat(item + kTextPosition, kX);
-  StoreFloat(item + kTextPosition + 4, kY);
-  g_item = item;
-  return true;
+  StoreFloat(item + kTextPosition, x);
+  StoreFloat(item + kTextPosition + 4, y);
+  return item;
+}
+
+bool MakeItem(PPCContext& ctx, uint8_t* base) {
+  g_item = NewTextItem(ctx, base, kX, kY);
+  return g_item != 0;
+}
+
+// The item's text (ASCII, up to kTextChars - 1).
+void SetText(uint32_t item, const std::string& text) {
+  uint8_t* chars = ng2::guest::Virtual(item + kItemSize);
+  std::memset(chars, 0, kTextChars * 2);
+  for (size_t i = 0; i < text.size() && i + 1 < kTextChars; i++) {
+    chars[2 * i + 1] = uint8_t(text[i]);
+  }
 }
 
 // The text frame, while its package is loaded.
@@ -132,7 +152,53 @@ uint32_t FindTextFrame() {
   return Load32(Load32(list + 0x20) + 4 * kTextFrame);
 }
 
+// The item queued for this frame in the menu font: its sprite on the text
+// frame (while that package is loaded), scaled, coloured as a focused row.
+// *resource is the frame the sprite was last set to.
+void QueueText(PPCContext& ctx, uint8_t* base, uint32_t item, uint32_t* resource) {
+  uint32_t frame = FindTextFrame();
+  if (!frame) {
+    return;
+  }
+  if (frame != *resource) {
+    *resource = frame;
+    CallGuest(ctx, base, __imp__sub_837047E0, {item, frame});
+  }
+  // The menu font's scale, once its font is loaded.
+  double scale = 0.0;
+  CallGuest(ctx, base, __imp__sub_836CEDE8, {kMenuFontSize}, &scale);
+  if (!std::isfinite(scale) || scale <= 0.0) {
+    return;
+  }
+  StoreFloat(item + kTextScale, float(scale));
+  StoreFloat(item + kTextScale + 4, float(scale));
+  std::memcpy(ng2::guest::Virtual(item + 0x40), ng2::guest::Virtual(kTextColor), 16);
+  CallGuest(ctx, base, __imp__sub_83704978, {item});
+  CallGuest(ctx, base, __imp__sub_83691AD8, {item, kLayer});
+}
+
+// The version, while the title menu is up.
+void VersionFrame(PPCContext& ctx, uint8_t* base) {
+  if (g_titleMenuFrame + 1 < g_frameNumber || g_titleMenuFrame == ~0ull) {
+    return;
+  }
+  if (!g_versionItem) {
+    g_versionItem = NewTextItem(ctx, base, kVersionX, kVersionY);
+    if (!g_versionItem) {
+      return;
+    }
+    SetText(g_versionItem, "v" NG2_VERSION);
+  }
+  QueueText(ctx, base, g_versionItem, &g_versionResource);
+}
+
 }  // namespace
+
+// From the title menu's per-frame update (recomp_settings.cpp's hook of
+// sub_8366FBC0): the version is shown while it runs.
+void TitleMenuFrame() {
+  g_titleMenuFrame = g_frameNumber;
+}
 
 void CheatsFrame();  // cheats.cpp
 
@@ -167,6 +233,8 @@ REX_HOOK_RAW(sub_822F0EF8) {
     }
   }
   g_last = now;
+  g_frameNumber++;
+  VersionFrame(ctx, base);
   // In gameplay only (the HUD up), not on loading screens and menus.
   if (!REXCVAR_GET(show_fps) || !ng2::aspect::HudShown() || (!g_item && !MakeItem(ctx, base))) {
     return;
@@ -179,32 +247,9 @@ REX_HOOK_RAW(sub_822F0EF8) {
                                        : std::string("-- FPS");
     g_shown.assign(text.begin(), text.end());
     g_shown.resize(std::min<size_t>(g_shown.size(), kTextChars - 1));
-    uint8_t* chars = ng2::guest::Virtual(g_item + kItemSize);
-    std::memset(chars, 0, kTextChars * 2);
-    for (size_t i = 0; i < g_shown.size(); i++) {
-      chars[2 * i] = uint8_t(g_shown[i] >> 8);
-      chars[2 * i + 1] = uint8_t(g_shown[i]);
-    }
+    SetText(g_item, text);
     g_seconds = 0.0;
     g_frames = 0;
   }
-  uint32_t resource = FindTextFrame();
-  if (!resource) {
-    return;
-  }
-  if (resource != g_resource) {
-    g_resource = resource;
-    CallGuest(ctx, base, __imp__sub_837047E0, {g_item, resource});
-  }
-  // The menu font's scale, once its font is loaded.
-  double scale = 0.0;
-  CallGuest(ctx, base, __imp__sub_836CEDE8, {kMenuFontSize}, &scale);
-  if (!std::isfinite(scale) || scale <= 0.0) {
-    return;
-  }
-  StoreFloat(g_item + kTextScale, float(scale));
-  StoreFloat(g_item + kTextScale + 4, float(scale));
-  std::memcpy(ng2::guest::Virtual(g_item + 0x40), ng2::guest::Virtual(kTextColor), 16);
-  CallGuest(ctx, base, __imp__sub_83704978, {g_item});
-  CallGuest(ctx, base, __imp__sub_83691AD8, {g_item, kLayer});
+  QueueText(ctx, base, g_item, &g_resource);
 }

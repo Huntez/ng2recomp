@@ -990,10 +990,13 @@ REX_HOOK_RAW(sub_8366F2E8) {
   __imp__sub_8366F2E8(ctx, base);
 }
 
-// The title menu's input: Confirm on the exit entry quits.
+// The title menu's input: Confirm on the exit entry quits. (Each frame the
+// menu is up: perf_overlay.cpp shows the version then.)
+void TitleMenuFrame();
 REX_EXTERN(__imp__sub_8366FBC0);
 REX_HOOK_RAW(sub_8366FBC0) {
   __imp__sub_8366FBC0(ctx, base);
+  TitleMenuFrame();
   using ng2::guest::Load32;
   uint32_t player = *ng2::guest::Virtual(kPlayerPad);
   uint32_t cursor = Load32(kTitleCursor);
