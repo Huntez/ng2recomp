@@ -382,8 +382,19 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       int64_t refreshNs = 0, periodNs = 0;
       // (FIFO and Mailbox only: there the presents reach the screen on its
       // refreshes; with V-Sync Off or Adaptive a late one shows at once)
+      // NG2_TEST_GAMESCOPE_AUTO=1 (#46): Auto under gamescope too, where it
+      // otherwise acts as Timer.
+      static const bool gamescopeAuto = [] {
+        const char* v = std::getenv("NG2_TEST_GAMESCOPE_AUTO");
+        bool on = v && v[0] == '1';
+        if (on) {
+          REXLOG_INFO("video: test switch NG2_TEST_GAMESCOPE_AUTO=1");
+        }
+        return on;
+      }();
       int32_t presentMode = REXCVAR_GET(present_mode);
-      if (REXCVAR_GET(vsync) && REXCVAR_GET(frame_pacing) == 0 && !ng2::video::UnderGamescope() &&
+      if (REXCVAR_GET(vsync) && REXCVAR_GET(frame_pacing) == 0 &&
+          (!ng2::video::UnderGamescope() || gamescopeAuto) &&
           (presentMode == 1 || presentMode == 2) &&
           ng2::video::DisplayRefresh(&refreshNs, &periodNs)) {
         int64_t every = std::clamp<int64_t>((guestPeriodNs + periodNs / 2) / periodNs, 1, 4);

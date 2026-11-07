@@ -430,7 +430,6 @@ void ReportHitch() {
     return v && v[0] == '1';
   }();
   auto now = std::chrono::steady_clock::now();
-  ReportPresentGaps(now);
   auto& f = g_frameStats;
   if (f.enabled && f.lastSwap != std::chrono::steady_clock::time_point()) {
     double ms = std::chrono::duration<double, std::milli>(now - f.lastSwap).count();
@@ -1009,6 +1008,44 @@ bool TestShadowFloat() {
 bool TestNoBorder() {
   static const bool on = TestSwitch("NG2_TEST_NO_BORDER", "1");
   return on;
+}
+
+// NG2_TEST_EVEN_PRESENT=1 (#36, #46): a present that would follow the last
+// by less than 90% of a refresh waits until then. With a frame's work near a
+// refresh the game hands frames over in pairs (3 then 33 ms apart); this
+// spreads them out so the display's queue doesn't run dry between them, at up
+// to a frame of latency while it happens. The last part of the wait spins
+// (Windows' sleeps are whole milliseconds).
+void EvenOutPresent() {
+  static const bool on = TestSwitch("NG2_TEST_EVEN_PRESENT", "1");
+  // (with V-Sync on, FIFO or Mailbox: off or Adaptive, the game runs
+  // uncapped and this would cap it near the refresh rate)
+  int32_t mode = REXCVAR_GET(present_mode);
+  if (!on || !REXCVAR_GET(vsync) || (mode != 1 && mode != 2)) {
+    return;
+  }
+  static int64_t last = 0;
+  int64_t refresh = 0, period = 16'666'667;
+  int64_t measured = 0;
+  if (DisplayRefresh(&refresh, &measured) && measured > 4'000'000 && measured < 50'000'000) {
+    period = measured;
+  }
+  int64_t now = SteadyNs();
+  int64_t until = last + period * 9 / 10;
+  if (last && now < until) {
+#if defined(_WIN32)
+    constexpr int64_t kSpin = 1'500'000;
+#else
+    constexpr int64_t kSpin = 300'000;
+#endif
+    if (until - now > kSpin) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(until - now - kSpin));
+    }
+    while (SteadyNs() < until) {
+      std::this_thread::yield();
+    }
+  }
+  last = SteadyNs();
 }
 
 // Host format for a resolve destination (a guest texture written by the GPU).
@@ -4742,7 +4779,10 @@ void Present(HostTexture* frontBuffer) {
       RenderCommandSemaphore* signalSemaphores[] = {g_renderSemaphores[index].get()};
       submit(list, waitSemaphores, 1, signalSemaphores, 1);
       FrameSubmitted();
+      EvenOutPresent();
       g_swapChainValid = g_swapChain->present(index, signalSemaphores, 1);
+      // (timed at the present itself, on the thread that makes it)
+      ReportPresentGaps(std::chrono::steady_clock::now());
       ReportLatency();
       if (inputNs) {
         if (uint64_t id = g_swapChain->getPresentId()) {
