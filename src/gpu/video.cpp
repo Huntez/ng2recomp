@@ -46,6 +46,14 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 #if defined(__linux__)
 #include <unistd.h>
 #endif
@@ -841,9 +849,13 @@ int64_t g_traceFrames = 0, g_traceLeft = 0;
 // the guest has them: big-endian), in draw order, beside its draw lines.
 FILE* g_traceConstants = nullptr;
 
+std::atomic<bool> g_recordRequest{false};  // F8 (NG2_INTERP): every picture for a while
 bool SDLCALL WatchTraceKey(void*, SDL_Event* event) {
   if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F7 && !event->key.repeat) {
     g_traceRequest = true;
+  }
+  if (event->type == SDL_EVENT_KEY_DOWN && event->key.key == SDLK_F8 && !event->key.repeat) {
+    g_recordRequest = true;
   }
   return true;
 }
@@ -1119,6 +1131,33 @@ class OpArena {
     count_ = 0;
   }
 
+  // Runs every op in order and keeps them (a frame's log, run again).
+  void RunKeep(RenderCommandList* list) {
+    for (size_t c = 0; c < chunks_.size(); c++) {
+      Chunk& chunk = chunks_[c];
+      for (size_t at = 0; at < chunk.used;) {
+        auto* header = reinterpret_cast<Header*>(chunk.data.get() + at);
+        header->run(chunk.data.get() + at + kHeaderSize, list);
+        at += header->size;
+      }
+    }
+  }
+
+  // Forgets every op without running it.
+  void Clear() {
+    for (size_t c = 0; c < chunks_.size(); c++) {
+      Chunk& chunk = chunks_[c];
+      for (size_t at = 0; at < chunk.used;) {
+        auto* header = reinterpret_cast<Header*>(chunk.data.get() + at);
+        header->destroy(chunk.data.get() + at + kHeaderSize);
+        at += header->size;
+      }
+      chunk.used = 0;
+    }
+    current_ = 0;
+    count_ = 0;
+  }
+
   size_t count() const { return count_; }
 
  private:
@@ -1148,6 +1187,23 @@ class OpArena {
   size_t current_ = 0;
   size_t count_ = 0;
 };
+
+// Frame interpolation (NG2_INTERP=1, with the render thread): each frame's
+// commands are kept (g_frameLogs, per frame slot) and run again at its
+// present with each draw's vertex constants part of the way from the last
+// frame's, for pictures between the two (video.cpp BuildInterpFrames).
+bool InterpEnabled();
+OpArena g_frameLogs[NUM_FRAMES];
+bool g_logOps = false;     // game thread: commands are being kept
+int32_t g_drawTag = -1;    // game thread: the draw whose push constants come next
+// Render thread: while a log runs again, each tagged draw's push constants.
+const std::vector<std::array<uint64_t, 3>>* g_replayConstants = nullptr;
+// Bone palettes (fetch slot 94, in guest memory): the copy that fills one is
+// tagged with its index in the frame, and filled from elsewhere when the log
+// runs again (g_replayCopies, by palette; ref null = as it was).
+int32_t g_copyTag = -1;
+const std::vector<RenderBufferReference>* g_replayCopies = nullptr;
+int32_t NoteInterpPalette(uint32_t address, uint32_t size);
 
 class RenderThread {
  public:
@@ -1292,6 +1348,9 @@ class QueuedCommandList final : public RenderCommandList {
  public:
   template <typename F>
   void Op(F&& f) {
+    if (g_logOps) {
+      g_frameLogs[g_frame].Push(f);  // (a copy, run again for the pictures between: NG2_INTERP)
+    }
     g_renderThread.Push(std::forward<F>(f));
   }
 
@@ -1324,6 +1383,20 @@ class QueuedCommandList final : public RenderCommandList {
     std::array<uint8_t, PUSH_CONSTANT_SIZE> bytes{};
     size = uint32_t(std::min<size_t>(size ? size : PUSH_CONSTANT_SIZE, bytes.size()));
     std::memcpy(bytes.data(), data, size);
+    if (g_logOps && g_drawTag >= 0) {
+      // A draw's: its constants are replaced when the log runs again.
+      int32_t tag = g_drawTag;
+      g_frameLogs[g_frame].Push([=](RenderCommandList* l) {
+        if (g_replayConstants && size_t(tag) < g_replayConstants->size()) {
+          l->setGraphicsPushConstants(range, (*g_replayConstants)[tag].data(), offset, size);
+        } else {
+          l->setGraphicsPushConstants(range, bytes.data(), offset, size);
+        }
+      });
+      g_renderThread.Push(
+          [=](RenderCommandList* l) { l->setGraphicsPushConstants(range, bytes.data(), offset, size); });
+      return;
+    }
     Op([=](RenderCommandList* l) { l->setGraphicsPushConstants(range, bytes.data(), offset, size); });
   }
   void setGraphicsDescriptorSet(RenderDescriptorSet* set, uint32_t index) override {
@@ -1367,6 +1440,18 @@ class QueuedCommandList final : public RenderCommandList {
     });
   }
   void copyBufferRegion(RenderBufferReference dst, RenderBufferReference src, uint64_t size) override {
+    if (g_logOps && g_copyTag >= 0) {
+      int32_t tag = g_copyTag;
+      g_frameLogs[g_frame].Push([=](RenderCommandList* l) {
+        if (g_replayCopies && size_t(tag) < g_replayCopies->size() && (*g_replayCopies)[tag].ref) {
+          l->copyBufferRegion(dst, (*g_replayCopies)[tag], size);
+        } else {
+          l->copyBufferRegion(dst, src, size);
+        }
+      });
+      g_renderThread.Push([=](RenderCommandList* l) { l->copyBufferRegion(dst, src, size); });
+      return;
+    }
     Op([=](RenderCommandList* l) { l->copyBufferRegion(dst, src, size); });
   }
   void copyTextureRegion(const RenderTextureCopyLocation& dst, const RenderTextureCopyLocation& src,
@@ -1414,11 +1499,12 @@ class QueuedCommandList final : public RenderCommandList {
   void buildTopLevelAS(const RenderAccelerationStructure*, RenderBufferReference, RenderBufferReference,
                        const RenderTopLevelASBuildInfo&) override { Unused("buildTopLevelAS"); }
   void discardTexture(const RenderTexture*) override { Unused("discardTexture"); }
+  // (not kept for interpolation: a query written twice)
   void resetQueryPool(const RenderQueryPool* pool, uint32_t first, uint32_t count) override {
-    Op([=](RenderCommandList* l) { l->resetQueryPool(pool, first, count); });
+    g_renderThread.Push([=](RenderCommandList* l) { l->resetQueryPool(pool, first, count); });
   }
   void writeTimestamp(const RenderQueryPool* pool, uint32_t index) override {
-    Op([=](RenderCommandList* l) { l->writeTimestamp(pool, index); });
+    g_renderThread.Push([=](RenderCommandList* l) { l->writeTimestamp(pool, index); });
   }
 };
 QueuedCommandList g_queuedCommandList;
@@ -1461,6 +1547,7 @@ void NoteFrameWait(int64_t ns) {
   }
 }
 
+std::atomic<int64_t> g_frameWaitSince{0};  // (NG2_INTERP's watchdog) the game waits for a frame's GPU work
 void WaitForFrame(uint32_t frame) {
   if (g_commandListPending[frame]) {
     StageTimer timer(Stage::kWait);
@@ -1473,7 +1560,9 @@ void WaitForFrame(uint32_t frame) {
         return g_renderThread.submitted.load(std::memory_order_acquire) >= g_submitTicket[frame];
       });
     }
+    g_frameWaitSince = SteadyNs();
     g_queue->waitForCommandFence(g_commandFences[frame].get());
+    g_frameWaitSince = 0;
     g_commandListPending[frame] = false;
     if (UnderGamescope()) {
       NoteFrameWait(SteadyNs() - waitStart);
@@ -1481,10 +1570,338 @@ void WaitForFrame(uint32_t frame) {
   }
 }
 
+// NG2_INTERP: a frame's pictures are presented one at a time, a part of
+// the frame interval apart, by a thread of their own (presents queued
+// together may be shown as one, the newest, as Windows does), while the
+// render thread goes on with the next frame.
+#if defined(_WIN32)
+// The primary display's next vblank (gdi32's D3DKMT calls), or false.
+bool WaitForVblank() {
+  struct OpenFromName {
+    WCHAR name[32];
+    UINT adapter;
+    LUID luid;
+    UINT source;
+  };
+  struct OpenFromHdc {
+    HDC hdc;
+    UINT adapter;
+    LUID luid;
+    UINT source;
+  };
+  struct WaitForVerticalBlank {
+    UINT adapter;
+    UINT device;
+    UINT source;
+  };
+  using OpenNameFn = LONG(APIENTRY*)(OpenFromName*);
+  using OpenHdcFn = LONG(APIENTRY*)(OpenFromHdc*);
+  using WaitFn = LONG(APIENTRY*)(const WaitForVerticalBlank*);
+  static WaitFn wait = nullptr;
+  static WaitForVerticalBlank args{};
+  static const bool ready = [] {
+    HMODULE gdi = LoadLibraryA("gdi32.dll");
+    if (!gdi) {
+      return false;
+    }
+    auto openName = reinterpret_cast<OpenNameFn>(GetProcAddress(gdi, "D3DKMTOpenAdapterFromGdiDisplayName"));
+    auto openHdc = reinterpret_cast<OpenHdcFn>(GetProcAddress(gdi, "D3DKMTOpenAdapterFromHdc"));
+    wait = reinterpret_cast<WaitFn>(GetProcAddress(gdi, "D3DKMTWaitForVerticalBlankEvent"));
+    LONG nameStatus = -1, hdcStatus = -1;
+    bool opened = false;
+    // The primary display's GDI name (\.\DISPLAYn).
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    // The game window's display (else the primary).
+    HMONITOR monitor = nullptr;
+    int windowCount = 0;
+    SDL_Window** windows = SDL_GetWindows(&windowCount);
+    if (windows && windowCount > 0) {
+      auto hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+          SDL_GetWindowProperties(windows[0]), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+      if (hwnd) {
+        monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+      }
+    }
+    SDL_free(windows);
+    if (!monitor) {
+      monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    }
+    if (openName && monitor && GetMonitorInfoW(monitor, &info)) {
+      OpenFromName open{};
+      wcsncpy(open.name, info.szDevice, 31);
+      nameStatus = openName(&open);
+      if (nameStatus == 0) {
+        args = {open.adapter, 0, open.source};
+        opened = true;
+      }
+    }
+    if (!opened && openHdc) {
+      HDC hdc = CreateDCW(L"DISPLAY", info.szDevice[0] ? info.szDevice : nullptr, nullptr, nullptr);
+      OpenFromHdc open{hdc, 0, {}, 0};
+      hdcStatus = hdc ? openHdc(&open) : -2;
+      if (hdc) {
+        DeleteDC(hdc);
+      }
+      if (hdcStatus == 0) {
+        args = {open.adapter, 0, open.source};
+        opened = true;
+      }
+    }
+    opened &= wait != nullptr;
+    LONG test = opened ? wait(&args) : -1;
+    // Its rate, from a few waits.
+    double hz = 0;
+    if (opened && test == 0) {
+      int64_t start = SteadyNs();
+      for (int i = 0; i < 10; i++) {
+        wait(&args);
+      }
+      hz = 10e9 / double(std::max<int64_t>(SteadyNs() - start, 1));
+    }
+    std::string device;
+    for (WCHAR c : info.szDevice) {
+      if (!c) {
+        break;
+      }
+      device += char(c);
+    }
+    REXLOG_INFO("video: interp: pictures paced by the vblank of {}: {} ({:.1f} Hz; open by name "
+                "{:#x}, by dc {:#x}, wait {:#x})",
+                device, opened && test == 0 ? "yes" : "no", hz, uint32_t(nameStatus),
+                uint32_t(hdcStatus), uint32_t(test));
+    return opened && test == 0;
+  }();
+  return ready && wait(&args) == 0;
+}
+#else
+bool WaitForVblank() {
+  return false;
+}
+#endif
+
+// NG2_INTERP: long waits for a swapchain image, logged.
+void NoteAcquire(int64_t ns) {
+  static int64_t total = 0, longest = 0;
+  static uint32_t count = 0, slow = 0;
+  total += ns;
+  longest = std::max(longest, ns);
+  slow += ns > 4000000;
+  if (++count == 1800) {
+    REXLOG_INFO("video: interp: acquires {:.2f} ms each, max {:.1f}, {} over 4 ms; {} images",
+                double(total) / 1800e6, double(longest) / 1e6, slow, g_swapChain->getTextureCount());
+    total = longest = 0;
+    count = slow = 0;
+  }
+}
+
+class Presenter {
+ public:
+  // (NG2_INTERP) where each thread waits, and since when: logged by a
+  // watchdog when one waits long (a hang in full screen).
+  enum Stage : int { kIdle, kFence, kTimer, kPresent, kAcquire, kWaitPresenter };
+  struct Watch {
+    std::atomic<int> stage{kIdle};
+    std::atomic<int64_t> sinceNs{0};
+    void Set(int s) {
+      sinceNs = SteadyNs();
+      stage = s;
+    }
+  };
+  Watch presenterWatch, renderWatch, gameWatch;
+  void StartWatchdog() {
+    static std::once_flag once;
+    std::call_once(once, [this] {
+      std::thread([this] {
+        static const char* names[] = {"idle", "fence", "timer", "present", "acquire", "wait presenter"};
+        while (true) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(500));
+          int64_t now = SteadyNs();
+          // (a file of its own, flushed: the log may stop with the hang)
+          static FILE* out = std::fopen("interp_watch.txt", "w");
+          if (out) {
+            std::fprintf(out, "%.1f s: presented %llu; presenter %s %lld ms, render %s %lld ms, game %s %lld ms\n",
+                         double(now) / 1e9, (unsigned long long)presented.load(),
+                         names[presenterWatch.stage.load()], (long long)((now - presenterWatch.sinceNs.load()) / 1000000),
+                         names[renderWatch.stage.load()], (long long)((now - renderWatch.sinceNs.load()) / 1000000),
+                         names[gameWatch.stage.load()], (long long)((now - gameWatch.sinceNs.load()) / 1000000));
+            if (int64_t since = g_frameWaitSince.load()) {
+              std::fprintf(out, "  frame fence wait %lld ms\n", (long long)((now - since) / 1000000));
+            }
+            std::fflush(out);
+          }
+          for (auto [name, w] : {std::pair<const char*, Watch*>{"presenter", &presenterWatch},
+                                 {"render", &renderWatch}, {"game", &gameWatch}}) {
+            int st = w->stage.load();
+            int64_t ms = (now - w->sinceNs.load()) / 1000000;
+            if (st != kIdle && ms > 400) {
+              size_t queued;
+              {
+                std::lock_guard lock(mutex_);
+                queued = queue_.size();
+              }
+              REXLOG_WARN("video: interp: {} waits in {} for {} ms ({} queued)", name, names[st], ms,
+                          queued);
+            }
+          }
+        }
+      }).detach();
+    });
+  }
+
+  struct Item {
+    uint32_t index;
+    RenderCommandSemaphore* semaphore;
+    int64_t atNs;
+    uint64_t frame;                     // the game's frame it shows
+    RenderCommandFence* done = nullptr;  // its drawing's (a picture between)
+  };
+
+  ~Presenter() {
+    if (thread_.joinable()) {
+      {
+        std::lock_guard lock(mutex_);
+        stop_ = true;
+      }
+      cv_.notify_all();
+      thread_.detach();
+    }
+  }
+
+  void Push(const Item& item) {
+    {
+      std::lock_guard lock(mutex_);
+      queue_.push_back(item);
+      if (!thread_.joinable()) {
+        thread_ = std::thread([this] { Main(); });
+      }
+    }
+    cv_.notify_all();
+  }
+
+  // Until at most `left` pictures wait.
+  void WaitFor(size_t left, Watch* watch) {
+    watch->Set(kWaitPresenter);
+    std::unique_lock lock(mutex_);
+    idle_.wait(lock, [&] { return queue_.size() + busy_ <= left || stop_; });
+    watch->Set(kIdle);
+  }
+
+  std::atomic<bool> failed{false};  // a present found the swapchain out of date
+  std::atomic<uint64_t> presented{0};
+  std::atomic<int64_t> presentNs{0}, presentMaxNs{0};
+
+ private:
+  void Main() {
+    while (true) {
+      Item item;
+      {
+        std::unique_lock lock(mutex_);
+        cv_.wait(lock, [&] { return !queue_.empty() || stop_; });
+        if (stop_) {
+          return;
+        }
+        item = queue_.front();
+        queue_.pop_front();
+        busy_ = 1;
+        // Behind (a later frame waits): shown at once, to catch up (the
+        // screen keeps the newest of them).
+        if (!queue_.empty() && queue_.back().frame > item.frame) {
+          item.atNs = 0;
+        }
+      }
+      // Presented once drawn: a present ahead of its picture's drawing is
+      // shown when that ends, with the next one if it ends with it.
+      StartWatchdog();
+      presenterWatch.Set(kFence);
+      // (Not in exclusive full screen, NG2_EXCLUSIVE: there a drawing can wait
+      // for its image, freed by a later present, and the display flips one a
+      // refresh itself.)
+      static const bool exclusive = [] {
+        const char* v = std::getenv("NG2_EXCLUSIVE");
+        return v && v[0] && v[0] != '0';
+      }();
+      if (item.done && !exclusive) {
+        g_queue->waitForCommandFence(item.done);
+      }
+      // Exclusive full screen: the display flips one picture a refresh from
+      // its queue itself, so each goes at once (a timer that let the queue
+      // run dry showed a picture two or three refreshes, a double to the
+      // eye in a turn). NG2_INTERP_PACE=1 keeps the timer.
+      static const bool paced = [] {
+        const char* v = std::getenv("NG2_INTERP_PACE");
+        return v ? v[0] == '1' : !exclusive;
+      }();
+      if (!paced) {
+        item.atNs = 0;
+      }
+      presenterWatch.Set(kTimer);
+#if defined(_WIN32)
+      // Sleeps of a millisecond (the system timer at 1 ms: timeBeginPeriod)
+      // to near the time, the rest spun. (Waiting for the display's vblank,
+      // D3DKMT or DwmFlush, stalled the game in full screen.)
+      static const bool period = [] {
+        HMODULE winmm = LoadLibraryA("winmm.dll");
+        using PeriodFn = UINT(WINAPI*)(UINT);
+        auto begin = winmm ? reinterpret_cast<PeriodFn>(GetProcAddress(winmm, "timeBeginPeriod")) : nullptr;
+        return begin && begin(1) == 0;
+      }();
+      (void)period;
+      while (item.atNs - SteadyNs() > 2000000) {
+        Sleep(1);
+      }
+#endif
+      for (int64_t now = SteadyNs(); now < item.atNs; now = SteadyNs()) {
+        if (item.atNs - now > 2000000) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } else {
+          std::this_thread::yield();
+        }
+      }
+      if (item.atNs && lastId_) {
+        int64_t until = SteadyNs() + 30000000;
+        while (g_swapChain->pollPresent(lastId_) == 0 && SteadyNs() < until) {
+#if defined(_WIN32)
+          Sleep(0);
+#else
+          std::this_thread::yield();
+#endif
+        }
+      }
+      int64_t presentStart = SteadyNs();
+      presenterWatch.Set(kPresent);
+      if (!g_swapChain->present(item.index, &item.semaphore, 1)) {
+        failed = true;
+      }
+      presenterWatch.Set(kIdle);
+      lastId_ = g_swapChain->getPresentId();
+      int64_t took = SteadyNs() - presentStart;
+      presentNs += took;
+      presentMaxNs = std::max<int64_t>(presentMaxNs, took);
+      presented++;
+      {
+        std::lock_guard lock(mutex_);
+        busy_ = 0;
+      }
+      idle_.notify_all();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_, idle_;
+  std::deque<Item> queue_;
+  size_t busy_ = 0;
+  bool stop_ = false;
+  uint64_t lastId_ = 0;  // the last present's (presenter thread)
+  std::thread thread_;
+};
+Presenter g_presenter;
+
 void WaitForGPU() {
   if (RenderThreadEnabled()) {
     g_renderThread.Flush();
   }
+  g_presenter.WaitFor(0, &g_presenter.gameWatch);
   for (uint32_t i = 0; i < NUM_FRAMES; i++) {
     WaitForFrame(i);
   }
@@ -1613,6 +2030,9 @@ RenderCommandList* CommandList() {
       ForgetTexture(texture.get());
     }
     g_garbage[g_frame].clear();
+    // (its present, which ran the log again, has been submitted)
+    g_frameLogs[g_frame].Clear();
+    g_logOps = InterpEnabled();
     uint32_t frame = g_frame;
     if (RenderThreadEnabled()) {
       g_renderThread.Push([frame](RenderCommandList*) {
@@ -2105,7 +2525,9 @@ void SyncGuestMemory(uint32_t address, uint32_t size, bool always = false, bool 
     if (range.lateFrame != g_frameCount) {
       range.lateFrame = g_frameCount;
       Upload upload = Allocate(size, 16);
+      g_copyTag = bones && InterpEnabled() ? NoteInterpPalette(address, size) : -1;
       RecordGuestMemoryCopy(address, upload, size, inOrder);
+      g_copyTag = -1;
       g_frameRanges.push_back({address, size, &range, upload.data});
     }
     return;
@@ -3715,6 +4137,7 @@ struct DrawRecord {
   uint32_t drawCount = 0;
   uint32_t startVertex = 0;
   uint64_t vertexShader = 0, pixelShader = 0;  // hashes, for NG2_PROFILE=2
+  int32_t interpIndex = -1;  // in g_interp.current (NG2_INTERP)
 };
 
 // BeginVertices / BeginIndexedVertices hand the game a pointer into the
@@ -3737,6 +4160,701 @@ struct PendingDraw {
 };
 std::optional<PendingDraw> g_pendingDraw;
 
+// Frame interpolation (NG2_INTERP=1). Each draw's vertex constants are kept
+// (the registers its shader reads); at the present the frame's draws are
+// matched with the last frame's (same shaders and target shape, the closest
+// constants: the game sorts its draws anew each frame), and for each picture
+// between the two every matched draw gets its constants that part of the
+// way. A register that moved too far for motion (the game re-sorts its list
+// of lights) takes the new value. The frame's commands then run again with
+// those (the present's lambda), each picture shown in turn before the frame's.
+struct InterpDraw {
+  uint64_t group = 0;
+  std::vector<uint16_t> registers;
+  std::vector<float> constants;  // 4 a register, little-endian values
+  std::array<uint64_t, 3> pushConstants{};
+  bool submitted = false;
+  uint32_t boneAddress = 0, boneSize = 0;  // its bone palette (physical), if skinned
+  uint64_t mesh = 0;  // its vertex and index data (0: not known)
+};
+struct InterpPalette {
+  uint32_t address = 0, size = 0;
+  std::vector<uint32_t> words;  // as in guest memory (big-endian) at the frame's end
+};
+struct InterpFrames {
+  std::vector<std::vector<std::array<uint64_t, 3>>> phases;  // push constants by draw
+  std::vector<std::vector<RenderBufferReference>> copies;    // palette copies by palette
+};
+struct InterpState {
+  std::vector<InterpDraw> previous, current;
+  std::vector<InterpPalette> previousPalettes, palettes;
+  std::unordered_map<uint64_t, int32_t> paletteIndex;  // this frame's, by address and size
+  uint64_t bonesLerped = 0, bonesBytes = 0, palettesJumped = 0;
+  int64_t buildNs = 0, matchNs = 0, constantsNs = 0, bonesNs = 0;
+  uint64_t frames = 0, interpolated = 0, draws = 0, matched = 0, snapped = 0, registers = 0;
+  uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0;
+  uint32_t keptFor = 0;  // frames the last full frame was kept over (partial ones)  // draws without a match given the shared registers' values before
+};
+InterpState g_interp;
+
+bool InterpEnabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("NG2_INTERP");
+    if (!v || v[0] != '1') {
+      return false;
+    }
+    if (!RenderThreadEnabled()) {
+      REXLOG_WARN("video: NG2_INTERP needs the render thread (NG2_RENDER_THREAD=0 is set): off");
+      return false;
+    }
+    return true;
+  }();
+  return enabled;
+}
+
+// Pictures between two frames (NG2_INTERP_FRAMES, 2 by default: 180 Hz for the game's 60).
+uint32_t InterpSteps() {
+  static const uint32_t steps = [] {
+    const char* v = std::getenv("NG2_INTERP_FRAMES");
+    return std::clamp(v ? uint32_t(std::atoi(v)) : 2u, 1u, 3u);
+  }();
+  return steps;
+}
+
+int32_t CaptureInterpDraw(uint64_t group, const uint32_t* guestConstants,
+                          const uint64_t (&mask)[4]) {
+  InterpDraw draw;
+  draw.group = group;
+  for (uint32_t word = 0; word < 4; word++) {
+    for (uint64_t bits = mask[word]; bits; bits &= bits - 1) {
+      uint32_t r = word * 64 + uint32_t(__builtin_ctzll(bits));
+      if (r < 256) {
+        draw.registers.push_back(uint16_t(r));
+        for (uint32_t c = 0; c < 4; c++) {
+          draw.constants.push_back(std::bit_cast<float>(rex::byte_swap(guestConstants[r * 4 + c])));
+        }
+      }
+    }
+  }
+  g_interp.current.push_back(std::move(draw));
+  return int32_t(g_interp.current.size() - 1);
+}
+
+int32_t NoteInterpPalette(uint32_t address, uint32_t size) {
+  auto [it, added] =
+      g_interp.paletteIndex.emplace((uint64_t(address) << 32) | size, int32_t(g_interp.palettes.size()));
+  if (added) {
+    g_interp.palettes.push_back({address, size, {}});
+  }
+  return it->second;
+}
+
+void NoteInterpDraw(const DrawRecord& record) {
+  if (record.interpIndex >= 0 && size_t(record.interpIndex) < g_interp.current.size()) {
+    auto& draw = g_interp.current[record.interpIndex];
+    std::copy(std::begin(record.pushConstants), std::end(record.pushConstants),
+              draw.pushConstants.begin());
+    draw.submitted = true;
+  }
+}
+
+// How far apart two draws' constants are (the largest change, relative to
+// each register's size).
+float InterpDistance(const InterpDraw& a, const InterpDraw& b, float bound = 1e30f,
+                     const std::vector<bool>* skip = nullptr) {
+  float distance = 0;
+  for (size_t r = 0; r * 4 < a.constants.size() && distance < bound; r++) {
+    if (skip && r < skip->size() && (*skip)[r]) {
+      continue;
+    }
+    const float* x = &a.constants[r * 4];
+    const float* y = &b.constants[r * 4];
+    float size = 1.0f, change = 0;
+    for (uint32_t c = 0; c < 4; c++) {
+      size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
+      change = std::max(change, std::fabs(x[c] - y[c]));
+    }
+    float d = change / size;
+    distance = std::max(distance, std::isfinite(d) ? d : 1e9f);
+  }
+  return distance;
+}
+
+// At the present (game thread): the push constants of each picture between
+// the last frame and this one, or none (no last frame, too little matched).
+// A value that changed more than this part of its size in a frame jumped (a
+// light list sorted again, a new pose, a move to elsewhere): taken as it is
+// now. Not less: a fast turn of the camera changes the matrices that have it
+// by about half (at 30 degrees a frame), and those must go part of the way.
+// NG2_INTERP_JUMP=<part> to try others.
+static const float kInterpJump = [] {
+  const char* v = std::getenv("NG2_INTERP_JUMP");
+  return v ? float(std::atof(v)) : 0.6f;
+}();
+
+std::shared_ptr<InterpFrames> BuildInterpFrames() {
+  auto& g = g_interp;
+  int64_t startNs = SteadyNs();
+  struct Timed {
+    int64_t start;
+    ~Timed() { g_interp.buildNs += SteadyNs() - start; }
+  } timed{startNs};
+  std::shared_ptr<InterpFrames> frames;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
+  for (uint32_t i = 0; i < g.previous.size(); i++) {
+    if (g.previous[i].submitted) {
+      groups[g.previous[i].group].push_back(i);
+    }
+  }
+  // The registers several kinds of draws share this frame (the camera, the
+  // view, the light): left out of how far apart two draws are, so a turn of
+  // the camera doesn't part every draw from its last.
+  auto valueKey = [](uint16_t r, const float* y) {
+    uint64_t a, b;
+    std::memcpy(&a, y, 8);
+    std::memcpy(&b, y + 2, 8);
+    return (a * 0x9E3779B97F4A7C15ull) ^ (b + 0x632BE59BD9B4E019ull + (a << 6) + (a >> 2)) ^
+           (uint64_t(r) << 52);
+  };
+  // Only a value most draws have (the camera, the view): a light's, shared by
+  // the floor's and the walls' passes for it, still tells one light's pass
+  // from another's.
+  std::unordered_map<uint64_t, uint32_t> valueDraws;  // draws with each value
+  std::unordered_map<uint64_t, uint32_t> currentCount;  // draws of each kind this frame
+  uint32_t submittedNow = 0;
+  for (auto& d : g.current) {
+    if (!d.submitted) {
+      continue;
+    }
+    submittedNow++;
+    currentCount[d.group]++;
+    for (size_t r = 0; r < d.registers.size(); r++) {
+      valueDraws[valueKey(d.registers[r], &d.constants[r * 4])]++;
+    }
+  }
+  const uint32_t sharedDraws = std::max<uint32_t>(16, submittedNow / 4);
+  std::vector<std::vector<bool>> skips(g.current.size());
+  for (size_t i = 0; i < g.current.size(); i++) {
+    auto& d = g.current[i];
+    if (!d.submitted) {
+      continue;
+    }
+    auto& skip = skips[i];
+    skip.resize(d.registers.size());
+    for (size_t r = 0; r < d.registers.size(); r++) {
+      auto it = valueDraws.find(valueKey(d.registers[r], &d.constants[r * 4]));
+      skip[r] = it != valueDraws.end() && it->second >= sharedDraws;
+    }
+  }
+  std::vector<int32_t> match(g.current.size(), -1);
+  std::vector<float> matchDistance(g.current.size(), 0.0f);
+  std::vector<bool> used(g.previous.size());
+  std::unordered_map<uint64_t, uint32_t> occurrence;
+  uint32_t submitted = 0, matched = 0;
+  // Close enough to take without looking further: the same place among its
+  // kind, moved as things move in a frame.
+  constexpr float kClose = 0.1f;
+  // First by mesh: the same vertex and index data with the same shaders is the
+  // same thing, however far the camera turned. One of it before and now: taken
+  // unless it moved more than its size (another thing in a reused buffer);
+  // several (copies of one mesh): the nearest, as close as alike draws must be.
+  {
+    auto meshKey = [](const InterpDraw& d) { return d.mesh * 0xC2B2AE3D27D4EB4Full ^ d.group; };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> meshes, meshesNow;
+    for (uint32_t j = 0; j < g.previous.size(); j++) {
+      if (g.previous[j].submitted && g.previous[j].mesh) {
+        meshes[meshKey(g.previous[j])].push_back(j);
+      }
+    }
+    for (uint32_t i = 0; i < g.current.size(); i++) {
+      if (g.current[i].submitted && g.current[i].mesh) {
+        meshesNow[meshKey(g.current[i])].push_back(i);
+      }
+    }
+    for (auto& [key, now] : meshesNow) {
+      auto it = meshes.find(key);
+      if (it == meshes.end()) {
+        continue;
+      }
+      auto& before = it->second;
+      bool single = now.size() == 1 && before.size() == 1;
+      float bound = single ? 1.5f : (before.size() > 8 ? 0.1f : 0.3f);
+      for (uint32_t i : now) {
+        auto& d = g.current[i];
+        int32_t best = -1;
+        float bestDistance = 1e30f;
+        for (uint32_t j : before) {
+          if (used[j] || g.previous[j].constants.size() != d.constants.size()) {
+            continue;
+          }
+          float distance = InterpDistance(d, g.previous[j], bestDistance, &skips[i]);
+          if (distance < bestDistance) {
+            best = int32_t(j);
+            bestDistance = distance;
+          }
+        }
+        if (best >= 0 && bestDistance <= bound) {
+          used[best] = true;
+          match[i] = best;
+          matchDistance[i] = bestDistance;
+          matched++;
+          g.byMesh++;
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < g.current.size(); i++) {
+    auto& d = g.current[i];
+    if (!d.submitted) {
+      continue;
+    }
+    submitted++;
+    uint32_t n = occurrence[d.group]++;
+    if (match[i] >= 0) {
+      continue;  // (by its mesh)
+    }
+    auto it = groups.find(d.group);
+    if (it == groups.end()) {
+      continue;
+    }
+    auto& candidates = it->second;
+    int32_t best = -1;
+    float bestDistance = 1e30f;
+    auto consider = [&](uint32_t j) {
+      if (used[j] || g.previous[j].constants.size() != d.constants.size()) {
+        return;
+      }
+      float distance = InterpDistance(d, g.previous[j], bestDistance, &skips[i]);
+      if (distance < bestDistance) {
+        best = int32_t(j);
+        bestDistance = distance;
+      }
+    };
+    // The same place among its kind first (the order mostly holds), then the others near it.
+    if (n < candidates.size()) {
+      consider(candidates[n]);
+    }
+    for (uint32_t step = 1; bestDistance > kClose && step <= 16; step++) {
+      if (n + step < candidates.size()) {
+        consider(candidates[n + step]);
+      }
+      if (step <= n && n - step < candidates.size()) {
+        consider(candidates[n - step]);
+      }
+    }
+    // Too far apart to be the same thing a frame on (another enemy of the
+    // same kind): drawn as it is.
+    bool crowded = candidates.size() > 8;
+    bool sameCount = currentCount[d.group] == candidates.size();
+    if (best < 0 || bestDistance > (crowded ? 0.05f : 0.3f)) {
+      // As many of its kind as before, not many: the one at its place is
+      // it, moved more (a fast turn, a quick move).
+      static const bool byPlace = [] {  // NG2_INTERP_BY_PLACE=1 (it paired walls with others)
+        const char* v = std::getenv("NG2_INTERP_BY_PLACE");
+        return v && v[0] == '1';
+      }();
+      if (byPlace && sameCount && !crowded && n < candidates.size() && !used[candidates[n]] &&
+          g.previous[candidates[n]].constants.size() == d.constants.size()) {
+        float distance = InterpDistance(d, g.previous[candidates[n]], 1e30f, &skips[i]);
+        if (distance <= 1.0f) {
+          best = int32_t(candidates[n]);
+          bestDistance = distance;
+          g.byPlace++;
+        }
+      }
+    }
+    if (best >= 0 && bestDistance <= (crowded ? 0.05f : 0.3f)) {
+      used[best] = true;
+      match[i] = best;
+      matchDistance[i] = bestDistance;
+      matched++;
+    }
+  }
+  // (whether a matched draw changed at all: with the shared registers)
+  for (size_t i = 0; i < g.current.size(); i++) {
+    if (match[i] >= 0) {
+      matchDistance[i] = InterpDistance(g.current[i], g.previous[match[i]]);
+    }
+  }
+  g.frames++;
+  g.draws += submitted;
+  g.matched += matched;
+  int64_t matchedNs = SteadyNs();
+  g.matchNs += matchedNs - startNs;
+  // This frame's bone palettes, as the next frame will need them too.
+  for (auto& palette : g.palettes) {
+    palette.words.resize(palette.size / 4);
+    std::memcpy(palette.words.data(), guest::Physical(palette.address), palette.size & ~3u);
+  }
+  // A partial frame (a few passes over the last picture, the scene not drawn
+  // again: some places do it every third frame): not drawn again between,
+  // as its passes add to what is there, and the next frame goes on from the
+  // last full one (kept, for two such at most).
+  uint32_t submittedBefore = 0;
+  for (auto& d : g.previous) {
+    submittedBefore += d.submitted;
+  }
+  const bool partial = submitted && submitted * 4 < submittedBefore && g.keptFor < 2;
+  if (partial) {
+    g.partial++;
+  }
+  // A cut (another camera, a loaded room): most draws are new.
+  if (!partial && !g.previous.empty() && submitted && matched * 2 < submitted) {
+    g.cuts++;
+    static uint32_t logged = 0;
+    if (logged < 40) {
+      logged++;
+      REXLOG_INFO("video: interp: not between (a cut?): {} of {} draws matched, {} draws before", matched,
+                  submitted, g.previous.size());
+    }
+  }
+  if (!partial && !g.previous.empty() && submitted && matched * 2 >= submitted) {
+    frames = std::make_shared<InterpFrames>();
+    uint32_t steps = InterpSteps();
+    frames->phases.resize(steps);
+    // What the matched draws' registers were the frame before, by register and
+    // value now: the camera, the view, the light (the same for every draw that
+    // reads them). A draw without a match (one of many alike: particles, a new
+    // one) takes those of its registers from them, the rest as it is: drawn
+    // where it is now, seen from the camera part of the way, as the others.
+    auto sharedKey = [](uint16_t r, const float* y) {
+      uint64_t a, b;
+      std::memcpy(&a, y, 8);
+      std::memcpy(&b, y + 2, 8);
+      return (a * 0x9E3779B97F4A7C15ull) ^ (b + 0x632BE59BD9B4E019ull + (a << 6) + (a >> 2)) ^ (uint64_t(r) << 52);
+    };
+    // A matched draw one of whose own registers (not the camera's) jumped
+    // (taken as it is now while the rest went part of the way, its matrix
+    // would be half one frame's, half the other's: a double): drawn where it
+    // is now, seen from the camera part of the way, as a draw without a match.
+    std::vector<int32_t> lerpMatch = match;
+    uint64_t jumpedDraws = 0;
+    // Only the moved registers take the value now, in every draw that has
+    // that value (one light, the same in each pass); the matrices go on part
+    // of the way, so a thing lit by a light sorted again stays in one piece.
+    std::unordered_set<uint64_t> jumpedValues;
+    for (size_t i = 0; i < g.current.size(); i++) {
+      if (match[i] < 0 || matchDistance[i] == 0.0f) {
+        continue;
+      }
+      auto& d = g.current[i];
+      auto& before = g.previous[match[i]];
+      for (size_t r = 0; r < d.registers.size(); r++) {
+        if (r < skips[i].size() && skips[i][r]) {
+          continue;
+        }
+        const float* x = &before.constants[r * 4];
+        const float* y = &d.constants[r * 4];
+        float size = 1.0f, change = 0;
+        for (uint32_t c = 0; c < 4; c++) {
+          size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
+          change = std::max(change, std::fabs(x[c] - y[c]));
+        }
+        bool reordered = false;
+        if (!(change <= kInterpJump * size)) {
+          // Moved to another register (a list sorted again: the lights):
+          // not a turn, however fast, which goes part of the way.
+          for (size_t r2 = 0; r2 < d.registers.size() && !reordered; r2++) {
+            const float* x2 = &before.constants[r2 * 4];
+            bool same = r2 != r;
+            for (uint32_t c = 0; c < 4 && same; c++) {
+              same = std::fabs(x2[c] - y[c]) <= 1e-4f * std::max(1.0f, std::fabs(y[c]));
+            }
+            reordered = same;
+          }
+          reordered |= !std::isfinite(change);
+        }
+        if (reordered) {
+          jumpedValues.insert(sharedKey(d.registers[r], y));
+          jumpedDraws++;
+        }
+      }
+    }
+    g.jumped += jumpedDraws;
+    // By value, not by draw: the passes of one thing (its colour, its light,
+    // its outline, by other shaders) carry the same matrix now, and each must
+    // go the same way, or the picture between shows it twice (a ghost). A
+    // value now that a matched draw had otherwise before takes that; a value
+    // that jumped in some draw takes it as now in every draw that has it.
+    // (with the register: a common value, a white, means nothing across registers)
+    auto valueAt = [&](uint16_t r, const float* y) { return sharedKey(r, y); };
+    for (size_t i = 0; i < g.current.size(); i++) {
+      if (match[i] < 0 || lerpMatch[i] >= 0) {
+        continue;
+      }
+      auto& d = g.current[i];
+      auto& before = g.previous[match[i]];
+      for (size_t r = 0; r < d.registers.size(); r++) {
+        if (r < skips[i].size() && skips[i][r]) {
+          continue;
+        }
+        if (std::memcmp(&before.constants[r * 4], &d.constants[r * 4], 16) != 0) {
+          jumpedValues.insert(valueAt(d.registers[r], &d.constants[r * 4]));
+        }
+      }
+    }
+    std::unordered_map<uint64_t, const float*> shared;
+    for (size_t i = 0; i < g.current.size(); i++) {
+      if (lerpMatch[i] < 0 || matchDistance[i] == 0.0f) {
+        continue;
+      }
+      auto& d = g.current[i];
+      auto& before = g.previous[lerpMatch[i]];
+      for (size_t r = 0; r < d.registers.size(); r++) {
+        const float* x = &before.constants[r * 4];
+        const float* y = &d.constants[r * 4];
+        if (std::memcmp(x, y, 16) != 0) {
+          shared.emplace(valueAt(d.registers[r], y), x);
+        }
+      }
+    }
+    // Per draw: each register's value the frame before (null: as now), found
+    // once for all the pictures; none when nothing moves.
+    std::vector<std::vector<const float*>> borrowed(g.current.size());
+    std::vector<bool> notOwn(g.current.size());  // drawn without its own match's values
+    uint64_t borrowedDraws = 0;
+    for (size_t i = 0; i < g.current.size(); i++) {
+      auto& d = g.current[i];
+      if (!d.submitted) {
+        continue;
+      }
+      const bool poisoned = false;  // (moved values are taken as now one by one, below)
+      const InterpDraw* before = (!poisoned && lerpMatch[i] >= 0) ? &g.previous[lerpMatch[i]] : nullptr;
+      notOwn[i] = !before;
+      bool any = false;
+      std::vector<const float*> xs(d.registers.size(), nullptr);
+      for (size_t r = 0; r < d.registers.size(); r++) {
+        const float* y = &d.constants[r * 4];
+        const float* x = nullptr;
+        if (!jumpedValues.empty() && jumpedValues.count(valueAt(d.registers[r], y))) {
+          continue;  // (moved: as now)
+        }
+        auto it = shared.find(valueAt(d.registers[r], y));
+        if (it != shared.end() && !(poisoned && !(r < skips[i].size() && skips[i][r]))) {
+          x = it->second;  // (poisoned: the camera's only)
+        } else if (before) {
+          x = &before->constants[r * 4];
+        }
+        if (x && std::memcmp(x, y, 16) != 0) {
+          xs[r] = x;
+          any = true;
+        }
+      }
+      if (any) {
+        borrowed[i] = std::move(xs);
+        borrowedDraws += lerpMatch[i] < 0 || poisoned;
+      }
+    }
+    g.borrowed += borrowedDraws;
+    for (uint32_t k = 0; k < steps; k++) {
+      float t = float(k + 1) / float(steps + 1);
+      // NG2_INTERP_DEBUG_T=<t>: every picture between at that point (-5: five frames back, to see them).
+      static const char* debugT = std::getenv("NG2_INTERP_DEBUG_T");
+      if (debugT) {
+        t = float(std::atof(debugT));
+      }
+      auto& phase = frames->phases[k];
+      phase.resize(g.current.size());
+      for (size_t i = 0; i < g.current.size(); i++) {
+        auto& d = g.current[i];
+        phase[i] = d.pushConstants;
+        // NG2_INTERP_DEBUG=1: the draws without their own match left out of
+        // the pictures between (their constants all zero), to see which they are.
+        static const bool hideNotOwn = [] {
+          const char* v = std::getenv("NG2_INTERP_DEBUG");
+          return v && v[0] == '1';
+        }();
+        if (hideNotOwn && notOwn[i] && d.submitted) {
+          Upload zeros = Allocate(d.registers.empty() ? 16 : (d.registers.back() + 1u) * 16u);
+          std::memset(zeros.data, 0, d.registers.empty() ? 16 : (d.registers.back() + 1u) * 16u);
+          phase[i][0] = zeros.address;
+          continue;
+        }
+        if (borrowed[i].empty()) {
+          continue;  // (as now)
+        }
+        // Up to the last register the shader reads (the registers ascend).
+        Upload upload = Allocate(d.registers.empty() ? 16 : (d.registers.back() + 1u) * 16u);
+        auto* out = reinterpret_cast<float*>(upload.data);
+        for (size_t r = 0; r < d.registers.size(); r++) {
+          const float* y = &d.constants[r * 4];
+          const float* x = borrowed[i][r] ? borrowed[i][r] : y;
+          float size = 1.0f, change = 0;
+          for (uint32_t c = 0; c < 4; c++) {
+            size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
+            change = std::max(change, std::fabs(x[c] - y[c]));
+          }
+          bool snap = !std::isfinite(change);  // (a turn, however fast, goes part of the way)
+          if (k == 0) {
+            g.registers++;
+            g.snapped += snap;
+          }
+          float v[4];
+          for (uint32_t c = 0; c < 4; c++) {
+            v[c] = snap ? y[c] : x[c] + (y[c] - x[c]) * t;
+          }
+          std::memcpy(out + d.registers[r] * 4, v, sizeof(v));  // (write-combined: written once)
+        }
+        phase[i][0] = upload.address;
+      }
+    }
+    int64_t mixedNs = SteadyNs();
+    g.constantsNs += mixedNs - matchedNs;
+    // Bone palettes: as the draws that read them were matched.
+    std::unordered_map<uint64_t, int32_t> previousIndex;
+    for (int32_t i = 0; i < int32_t(g.previousPalettes.size()); i++) {
+      auto& palette = g.previousPalettes[i];
+      previousIndex.emplace((uint64_t(palette.address) << 32) | palette.size, i);
+    }
+    std::vector<int32_t> pairs(g.palettes.size(), -1);
+    for (size_t i = 0; i < g.current.size(); i++) {
+      auto& d = g.current[i];
+      if (match[i] < 0 || !d.boneSize) {
+        continue;
+      }
+      auto& before = g.previous[match[i]];
+      auto now = g.paletteIndex.find((uint64_t(d.boneAddress) << 32) | d.boneSize);
+      auto then = previousIndex.find((uint64_t(before.boneAddress) << 32) | before.boneSize);
+      if (now != g.paletteIndex.end() && then != previousIndex.end() && pairs[now->second] < 0 &&
+          g.previousPalettes[then->second].words.size() == g.palettes[now->second].words.size()) {
+        pairs[now->second] = then->second;
+      }
+    }
+    // Each palette once for all the pictures: a row (four floats, big-endian
+    // as the fetch reads them) unchanged copied, a row that jumped taken as it
+    // is now, the others part of the way, written straight to each picture's
+    // upload.
+    float ts[4] = {};
+    for (uint32_t k = 0; k < steps; k++) {
+      ts[k] = float(k + 1) / float(steps + 1);
+      static const char* debugT = std::getenv("NG2_INTERP_DEBUG_T");
+      if (debugT) {
+        ts[k] = float(std::atof(debugT));
+      }
+    }
+    frames->copies.assign(steps, std::vector<RenderBufferReference>(g.palettes.size()));
+    for (size_t i = 0; i < g.palettes.size(); i++) {
+      if (pairs[i] < 0) {
+        continue;
+      }
+      auto& now = g.palettes[i];
+      auto& then = g.previousPalettes[pairs[i]];
+      // NG2_INTERP_BONES=0: poses as they are now (to tell what a double is)
+      static const bool bones = [] {
+        const char* v = std::getenv("NG2_INTERP_BONES");
+        return !v || v[0] != '0';
+      }();
+      if (!bones || now.words == then.words) {
+        continue;  // (still: the frame's own copy)
+      }
+      // A row that jumped (a fast turn, a new pose): the whole palette as it
+      // is now, not some of its bones part of the way and some not.
+      bool jumped = false;
+      for (size_t w = 0; w + 4 <= now.words.size() && !jumped; w += 4) {
+        float size = 1.0f, change = 0;
+        bool finite = true;
+        for (size_t c = 0; c < 4; c++) {
+          float fx = std::bit_cast<float>(rex::byte_swap(then.words[w + c]));
+          float fy = std::bit_cast<float>(rex::byte_swap(now.words[w + c]));
+          finite &= std::isfinite(fx) && std::isfinite(fy);
+          size = std::max({size, std::fabs(fx), std::fabs(fy)});
+          change = std::max(change, std::fabs(fx - fy));
+        }
+        (void)change;
+        (void)size;
+        jumped = false;
+      }
+      if (jumped) {
+        g.palettesJumped++;
+        continue;
+      }
+      uint32_t* outs[4] = {};
+      for (uint32_t k = 0; k < steps; k++) {
+        Upload upload = Allocate(now.size, 16);
+        outs[k] = reinterpret_cast<uint32_t*>(upload.data);
+        frames->copies[k][i] = RenderBufferReference(upload.buffer, upload.offset);
+      }
+      g.bonesBytes += now.size;
+      size_t words = now.size / 4;
+      const uint32_t* x = then.words.data();
+      const uint32_t* y = now.words.data();
+      for (size_t w = 0; w < words; w += 4) {
+        size_t n = std::min<size_t>(4, words - w);
+        if (std::memcmp(x + w, y + w, n * 4) == 0) {
+          for (uint32_t k = 0; k < steps; k++) {
+            std::memcpy(outs[k] + w, y + w, n * 4);
+          }
+          continue;
+        }
+        float fx[4], fy[4], size = 1.0f, change = 0;
+        bool finite = true;
+        for (size_t c = 0; c < n; c++) {
+          fx[c] = std::bit_cast<float>(rex::byte_swap(x[w + c]));
+          fy[c] = std::bit_cast<float>(rex::byte_swap(y[w + c]));
+          finite &= std::isfinite(fx[c]) && std::isfinite(fy[c]);
+          size = std::max({size, std::fabs(fx[c]), std::fabs(fy[c])});
+          change = std::max(change, std::fabs(fx[c] - fy[c]));
+        }
+        if (!finite) {
+          for (uint32_t k = 0; k < steps; k++) {
+            std::memcpy(outs[k] + w, y + w, n * 4);
+          }
+          continue;
+        }
+        for (uint32_t k = 0; k < steps; k++) {
+          uint32_t v[4];
+          for (size_t c = 0; c < n; c++) {
+            v[c] = rex::byte_swap(std::bit_cast<uint32_t>(fx[c] + (fy[c] - fx[c]) * ts[k]));
+          }
+          std::memcpy(outs[k] + w, v, n * 4);
+        }
+      }
+      g.bonesLerped++;
+    }
+    g.bonesNs += SteadyNs() - mixedNs;
+    g.interpolated++;
+  }
+  if (g.frames == 600) {
+    REXLOG_INFO("video: interp: ms a frame: matching {:.2f}, constants {:.2f}, bones {:.2f}",
+                double(g.matchNs) / 600e6, double(g.constantsNs) / 600e6, double(g.bonesNs) / 600e6);
+    g.matchNs = g.constantsNs = g.bonesNs = 0;
+    REXLOG_INFO("video: interp: {}/{} frames interpolated, {:.1f}% of draws matched, {:.1f}% "
+                "given the camera only, {:.2f}% of registers snapped",
+                g.interpolated, g.frames, 100.0 * double(g.matched) / double(std::max<uint64_t>(g.draws, 1)),
+                100.0 * double(g.borrowed) / double(std::max<uint64_t>(g.draws, 1)),
+                100.0 * double(g.snapped) / double(std::max<uint64_t>(g.registers, 1)));
+    REXLOG_INFO("video: interp: {} frames taken for cuts, {:.1f}% of draws matched by their mesh, {} "
+                "registers taken as now (sorted again)",
+                g.cuts, 100.0 * double(g.byMesh) / double(std::max<uint64_t>(g.draws, 1)), g.jumped);
+    REXLOG_INFO("video: interp: {} partial frames (the last full one kept)", g.partial);
+    g.borrowed = g.cuts = g.byPlace = g.byMesh = g.jumped = g.partial = 0;
+    REXLOG_INFO("video: interp: {:.1f} bone palettes a frame part of the way ({:.0f} KB), {:.2f} ms "
+                "a frame matching and mixing",
+                double(g.bonesLerped) / 600.0, double(g.bonesBytes) / 600.0 / 1024.0,
+                double(g.buildNs) / 600.0 / 1e6);
+    REXLOG_INFO("video: interp: {:.2f} bone palettes a frame taken as now (a row jumped)",
+                double(g.palettesJumped) / 600.0);
+    g.bonesBytes = g.palettesJumped = 0;
+    g.buildNs = 0;
+    g.frames = g.interpolated = g.draws = g.matched = g.snapped = g.registers = 0;
+    g.bonesLerped = 0;
+  }
+  if (partial) {
+    g.keptFor++;
+    g.current.clear();
+    g.palettes.clear();
+    g.paletteIndex.clear();
+    return frames;
+  }
+  g.keptFor = 0;
+  g.previous.swap(g.current);
+  g.current.clear();
+  g.previousPalettes.swap(g.palettes);
+  g.palettes.clear();
+  g.paletteIndex.clear();
+  return frames;
+}
+
 void SubmitDraw(DrawRecord& record) {
   BindFramebuffer(record.targets, record.targetCount, record.depth);
   auto* commandList = CommandList();
@@ -3746,7 +4864,10 @@ void SubmitDraw(DrawRecord& record) {
   commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
   commandList->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
   commandList->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+  NoteInterpDraw(record);
+  g_drawTag = record.interpIndex;
   commandList->setGraphicsPushConstants(0, record.pushConstants, 0, sizeof(record.pushConstants));
+  g_drawTag = -1;
   // Plume gives a pipeline one viewport per color target.
   RenderViewport viewports[4];
   RenderRect scissors[4];
@@ -3904,6 +5025,176 @@ void FlushPendingDraw() {
     pending.record.indexed = true;
   }
   SubmitDraw(pending.record);
+}
+
+// NG2_INTERP_PROBE=1: how alike two frames' draws are, once a second (for
+// frame interpolation: a frame between two drawn again from the second's
+// draws with their constants between the two). Draws are matched by
+// shaders, first target and their count so far in the frame.
+struct ProbeDraw {
+  uint64_t group;  // shaders and target shape
+  uint64_t vertexShader;
+  bool memExport;
+  std::vector<uint16_t> registers;  // the vertex shader's registers it reads
+  std::vector<float> constants;     // their values, 4 a register
+};
+struct ProbeCounts {
+  uint64_t frames = 0, draws = 0, matched = 0, same = 0, small = 0, sameOrder = 0,
+           memExports = 0, maxDraws = 0;
+  double sumDiff = 0;
+  uint32_t jumps[256] = {};  // matched draws whose register moved by more than 10%
+};
+struct ProbeState {
+  std::vector<ProbeDraw> previous, current;
+  ProbeCounts counts;
+  std::vector<uint32_t> history;  // draws in each frame of the second
+};
+ProbeState g_probe;
+bool InterpProbe() {
+  static const bool on = std::getenv("NG2_INTERP_PROBE") != nullptr;
+  return on;
+}
+
+void ProbeDrawCaptured(uint64_t vsHash, uint64_t psHash, uint64_t target, bool memExport,
+                       const uint32_t* guestConstants, const uint64_t (&mask)[4]) {
+  ProbeDraw draw{vsHash * 0x9E3779B97F4A7C15ull ^ psHash * 31 ^ target, vsHash, memExport, {}, {}};
+  // From the guest's copy: the upload buffer is write-combined, slow to read.
+  for (uint32_t word = 0; word < 4; word++) {
+    for (uint64_t bits = mask[word]; bits; bits &= bits - 1) {
+      uint32_t r = word * 64 + uint32_t(__builtin_ctzll(bits));
+      if (r < 256) {
+        draw.registers.push_back(uint16_t(r));
+        for (uint32_t c = 0; c < 4; c++) {
+          draw.constants.push_back(std::bit_cast<float>(rex::byte_swap(guestConstants[r * 4 + c])));
+        }
+      }
+    }
+  }
+  g_probe.current.push_back(std::move(draw));
+}
+
+// The largest change of one constant, relative to its size (at least 1).
+float ProbeDiff(const ProbeDraw& a, const ProbeDraw& b) {
+  float maxDiff = 0;
+  for (size_t c = 0; c < a.constants.size(); c++) {
+    float x = a.constants[c], y = b.constants[c];
+    if (x != y) {
+      float diff = std::fabs(x - y) / std::max(1.0f, std::max(std::fabs(x), std::fabs(y)));
+      maxDiff = std::max(maxDiff, std::isfinite(diff) ? diff : 1e9f);
+    }
+  }
+  return maxDiff;
+}
+
+// Each draw is matched to the closest unmatched draw of the last frame with
+// the same shaders and target (the game sorts its draws anew each frame).
+void ProbeFrameEnd() {
+  auto& p = g_probe;
+  auto& n = p.counts;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
+  for (uint32_t i = 0; i < p.previous.size(); i++) {
+    groups[p.previous[i].group].push_back(i);
+  }
+  std::vector<bool> used(p.previous.size());
+  bool order = p.previous.size() == p.current.size();
+  for (size_t i = 0; i < p.current.size(); i++) {
+    auto& d = p.current[i];
+    n.memExports += d.memExport;
+    if (order && p.previous[i].group != d.group) {
+      order = false;
+    }
+    auto it = groups.find(d.group);
+    if (it == groups.end()) {
+      continue;
+    }
+    int best = -1;
+    float bestDiff = 0;
+    uint32_t tried = 0;
+    for (uint32_t j : it->second) {
+      if (used[j] || p.previous[j].constants.size() != d.constants.size()) {
+        continue;
+      }
+      float diff = ProbeDiff(d, p.previous[j]);
+      if (best < 0 || diff < bestDiff) {
+        best = int(j);
+        bestDiff = diff;
+      }
+      if (diff == 0 || ++tried == 256) {
+        break;
+      }
+    }
+    if (best < 0) {
+      continue;
+    }
+    used[best] = true;
+    n.matched++;
+    if (bestDiff == 0) {
+      n.same++;
+    } else if (bestDiff < 0.1f) {
+      n.small++;
+    } else {
+      auto& before = p.previous[best];
+      for (size_t r = 0; r < d.registers.size(); r++) {
+        for (uint32_t c = 0; c < 4; c++) {
+          float x = d.constants[r * 4 + c], y = before.constants[r * 4 + c];
+          float diff = std::fabs(x - y) / std::max(1.0f, std::max(std::fabs(x), std::fabs(y)));
+          if (!(diff < 0.1f)) {
+            n.jumps[d.registers[r]]++;
+            // A few examples a second: the register before and after.
+            static uint64_t loggedFrame = 0;
+            static uint32_t logged = 0;
+            if (loggedFrame != g_frameCount) {
+              loggedFrame = g_frameCount;
+              logged = 0;
+            }
+            if (g_frameCount % 60 == 0 && logged++ < 6) {
+              const float* a = &before.constants[r * 4];
+              const float* b = &d.constants[r * 4];
+              REXLOG_INFO("video: interp probe: vs {:016X} c{}: {:.4g} {:.4g} {:.4g} {:.4g} -> "
+                          "{:.4g} {:.4g} {:.4g} {:.4g}",
+                          d.vertexShader, d.registers[r], a[0], a[1], a[2], a[3], b[0], b[1],
+                          b[2], b[3]);
+            }
+            break;
+          }
+        }
+      }
+    }
+    n.sumDiff += std::min(bestDiff, 10.0f);
+  }
+  n.frames++;
+  p.history.push_back(uint32_t(p.current.size()));
+  n.draws += p.current.size();
+  n.sameOrder += order;
+  n.maxDraws = std::max<uint64_t>(n.maxDraws, p.current.size());
+  if (n.frames == 60) {
+    double draws = double(std::max<uint64_t>(n.draws, 1));
+    double matched = double(std::max<uint64_t>(n.matched, 1));
+    REXLOG_INFO("video: interp probe: {:.0f} draws a frame (max {}), {:.1f}% matched the last "
+                "frame's, of those {:.1f}% same constants, {:.1f}% close (<10%), mean max diff "
+                "{:.3f}; same order {}/60; {:.0f} memexport draws a frame",
+                draws / 60, n.maxDraws, 100.0 * double(n.matched) / draws,
+                100.0 * double(n.same) / matched, 100.0 * double(n.small) / matched,
+                n.sumDiff / matched, n.sameOrder, double(n.memExports) / 60);
+    std::vector<std::pair<uint32_t, uint32_t>> jumps;
+    for (uint32_t r = 0; r < 256; r++) {
+      if (n.jumps[r]) {
+        jumps.emplace_back(n.jumps[r], r);
+      }
+    }
+    std::sort(jumps.rbegin(), jumps.rend());
+    std::string line;
+    for (size_t i = 0; i < jumps.size() && i < 10; i++) {
+      line += fmt::format(" c{}:{}", jumps[i].second, jumps[i].first);
+    }
+    if (!line.empty()) {
+      REXLOG_INFO("video: interp probe: registers that jumped (draws):{}", line);
+    }
+    p.history.clear();
+    n = ProbeCounts{};
+  }
+  p.previous.swap(p.current);
+  p.current.clear();
 }
 
 // Captures a draw from the device state; records it now, or keeps it for
@@ -4087,6 +5378,18 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 
   // Vertex data the shader reads (inline data is synced when it has been
   // written).
+  uint32_t interpBoneAddress = 0, interpBoneSize = 0;  // the bone palette (NG2_INTERP)
+  // Which mesh this is (NG2_INTERP): its vertex and index data and range, the
+  // same a frame on whatever the camera did (0: inline data, not known).
+  uint64_t interpMesh = 0;
+  if (!inlineData) {
+    interpMesh = (uint64_t(startVertex) << 32 | count) * 0x9E3779B97F4A7C15ull ^ startIndex;
+    if (indexed) {
+      if (uint32_t indexBuffer = guest::Load32(device + 0x308C)) {
+        interpMesh = interpMesh * 0x100000001B3ull ^ guest::Load32(indexBuffer + 24);
+      }
+    }
+  }
   for (uint32_t i = 0; i < (inlineData ? 95u : 96u); i++) {
     if (!(fetchMask[i / 32] & (1u << (i % 32)))) {
       continue;
@@ -4098,8 +5401,15 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     }
     uint32_t address = word0 & 0xFFFFFFFC;
     uint32_t size = word1 & 0x3FFFFFC;  // size in dwords at bit 2: bytes
+    if (interpMesh && i != 94) {
+      interpMesh = (interpMesh ^ (uint64_t(i) << 32 | address)) * 0x100000001B3ull;
+    }
     if (size && size <= (16u << 20)) {
       SyncGuestMemory(address & 0x1FFFFFFF, size, false, i == 94);
+      if (i == 94) {
+        interpBoneAddress = address & 0x1FFFFFFF;
+        interpBoneSize = size;
+      }
     }
   }
 
@@ -4182,6 +5492,24 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   copyConstants(vsConstants.data, vsSource, vs->entry->floatConstantMask, 256);
   if (ps) {
     copyConstants(psConstants.data, psSource, ps->entry->floatConstantMask, 224);
+  }
+  int32_t interpIndex = -1;
+  if (InterpEnabled()) {
+    const HostTexture* shape = target ? target : depth;
+    uint64_t group = vs->entry->hash * 0x9E3779B97F4A7C15ull ^ (ps ? ps->entry->hash : 0) * 31 ^
+                     (uint64_t(shape->width) << 40) ^ (uint64_t(shape->height) << 16) ^
+                     uint64_t(shape->format) ^ (target ? 0 : 1ull << 63);
+    interpIndex = CaptureInterpDraw(group, vsSource, vs->entry->floatConstantMask);
+    g_interp.current[interpIndex].boneAddress = interpBoneAddress;
+    g_interp.current[interpIndex].boneSize = interpBoneSize;
+    g_interp.current[interpIndex].mesh = interpMesh;
+  }
+  if (InterpProbe()) {
+    const HostTexture* shape = target ? target : depth;
+    ProbeDrawCaptured(vs->entry->hash, ps ? ps->entry->hash : 0,
+                      (uint64_t(shape->width) << 40) ^ (uint64_t(shape->height) << 16) ^
+                          uint64_t(shape->format) ^ (target ? 0 : 1ull << 63),
+                      memExport, vsSource, vs->entry->floatConstantMask);
   }
   Upload sharedUpload = Allocate(sizeof(shared));
   std::memcpy(sharedUpload.data, &shared, sizeof(shared));
@@ -4310,6 +5638,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   record.vertexShader = vs->entry->hash;
   record.pixelShader = ps ? ps->entry->hash : 0;
   record.memExport = memExport;
+  record.interpIndex = interpIndex;
   g_frameMemExport |= memExport;
   std::copy(targets, targets + targetCount, record.targets);
   record.targetCount = targetCount;
@@ -4344,6 +5673,277 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
 }
 
 // Present ---------------------------------------------------------------------
+
+// F8 (NG2_INTERP): every picture shown for 5 s, a 640x360 crop of the guest
+// picture's middle at full size, raw, to interp_record/ with a list of what
+// each is (the frame, the picture of it). A ring of readback buffers, written
+// by a thread 150 ms after each was copied (done on the GPU by then).
+struct InterpRecord {
+  static constexpr uint32_t kRing = 96, kWidth = 640, kHeight = 360;
+  struct Slot {
+    std::unique_ptr<RenderBuffer> buffer;
+    int64_t atNs = 0;
+    uint64_t seq = 0, frame = 0;
+    uint32_t picture = 0;
+    std::atomic<bool> full{false};
+  } slots[kRing];
+  bool on = false;
+  int64_t untilNs = 0;
+  uint64_t seq = 0, skipped = 0;
+  uint32_t texel = 4;
+  bool wide = false;
+  std::thread writer;
+  std::atomic<bool> writing{false};
+};
+InterpRecord g_interpRecord;
+
+void InterpRecordWriter() {
+  auto& r = g_interpRecord;
+#if defined(_WIN32)
+  CreateDirectoryA("interp_record", nullptr);
+#else
+  mkdir("interp_record", 0755);
+#endif
+  FILE* list = std::fopen("interp_record/list.txt", "w");
+  uint64_t next = 0;
+  while (r.writing.load() || next < r.seq) {
+    auto& slot = r.slots[next % InterpRecord::kRing];
+    if (!slot.full.load() || slot.seq != next || SteadyNs() - slot.atNs < 150000000) {
+      if (!r.writing.load() && next >= r.seq) {
+        break;
+      }
+      if (slot.full.load() && slot.seq > next) {
+        next = slot.seq;  // (skipped ones)
+        continue;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      continue;
+    }
+    const auto* data = static_cast<const uint8_t*>(slot.buffer->map());
+    if (data) {
+      std::string path = fmt::format("interp_record/{:05}.rgb", next);
+      if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::vector<uint8_t> gray(InterpRecord::kWidth * InterpRecord::kHeight * 3);
+        for (uint32_t i = 0; i < InterpRecord::kWidth * InterpRecord::kHeight; i++) {
+          const uint8_t* at = data + size_t(i) * r.texel;
+          for (uint32_t c = 0; c < 3; c++) {
+            gray[i * 3 + c] = r.wide ? at[c * 2 + 1] : at[c];
+          }
+        }
+        std::fwrite(gray.data(), 1, gray.size(), f);
+        std::fclose(f);
+      }
+      slot.buffer->unmap();
+    }
+    if (list) {
+      std::fprintf(list, "%llu %llu %u %.3f\n", (unsigned long long)next, (unsigned long long)slot.frame,
+                   slot.picture, double(slot.atNs) / 1e9);
+    }
+    slot.full = false;
+    next++;
+  }
+  if (list) {
+    std::fclose(list);
+  }
+  REXLOG_INFO("video: interp: recorded {} pictures ({} skipped)", r.seq, r.skipped);
+}
+
+// (render thread) a picture to record, when recording
+void RecordInterpPicture(RenderCommandList* l, const HostTexture* source, uint64_t frame, uint32_t picture) {
+  auto& r = g_interpRecord;
+  if (!r.on) {
+    if (!g_recordRequest.exchange(false) || r.writing.load() || !source) {
+      return;
+    }
+    if (source->format != RenderFormat::R8G8B8A8_UNORM && source->format != RenderFormat::R16G16B16A16_UNORM) {
+      return;
+    }
+    r.wide = source->format == RenderFormat::R16G16B16A16_UNORM;
+    r.texel = r.wide ? 8 : 4;
+    for (auto& slot : r.slots) {
+      if (!slot.buffer) {
+        slot.buffer = g_device->createBuffer(
+            RenderBufferDesc::ReadbackBuffer(uint64_t(InterpRecord::kWidth) * InterpRecord::kHeight * 8));
+      }
+      slot.full = false;
+    }
+    r.on = true;
+    r.seq = 0;
+    r.skipped = 0;
+    r.untilNs = SteadyNs() + 5'000'000'000;
+    if (r.writer.joinable()) {
+      r.writer.join();
+    }
+    r.writing = true;
+    r.writer = std::thread(InterpRecordWriter);
+    REXLOG_INFO("video: interp: recording 5 s of pictures");
+  }
+  if (SteadyNs() > r.untilNs) {
+    r.on = false;
+    r.writing = false;
+    return;
+  }
+  if (!source || source->width < InterpRecord::kWidth || source->height < InterpRecord::kHeight) {
+    return;
+  }
+  auto& slot = r.slots[r.seq % InterpRecord::kRing];
+  if (slot.full.load()) {
+    r.skipped++;  // the writer is behind: a gap
+    r.seq++;
+    return;
+  }
+  uint32_t x = (source->width - InterpRecord::kWidth) / 2, y = (source->height - InterpRecord::kHeight) / 2;
+  RenderBox box(int32_t(x), int32_t(y), int32_t(x + InterpRecord::kWidth), int32_t(y + InterpRecord::kHeight));
+  l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source->texture.get(), RenderTextureLayout::COPY_SOURCE));
+  l->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(slot.buffer.get(), source->format, InterpRecord::kWidth,
+                                                                   InterpRecord::kHeight, 1, InterpRecord::kWidth),
+                       RenderTextureCopyLocation::Subresource(source->texture.get()), 0, 0, 0, &box);
+  l->barriers(RenderBarrierStage::GRAPHICS,
+              RenderTextureBarrier(source->texture.get(), RenderTextureLayout::SHADER_READ));
+  slot.seq = r.seq++;
+  slot.frame = frame;
+  slot.picture = picture;
+  slot.atNs = SteadyNs();
+  slot.full = true;
+}
+
+// NG2_INTERP_SHOTS=<seconds>: every so often, a frame's pictures between and
+// its own (the guest picture before the blit), to look at side by side.
+struct InterpShots {
+  int64_t everyNs = 0, nextNs = 0;
+  uint32_t count = 0;
+  struct Shot {
+    std::unique_ptr<RenderBuffer> buffer;
+    uint64_t size = 0;
+  } shots[40];  // 4 a frame, NG2_INTERP_SHOT_FRAMES (2..10) in a row
+  uint32_t base = 0;  // the first buffer of this frame's (0, then 4 for the next frame)
+  uint32_t left = 0;  // frames in a row still to capture after this one
+  bool armed = false;  // this frame is captured (render thread)
+  uint32_t width = 0, height = 0, rowWidth = 0;
+  RenderFormat format = RenderFormat::UNKNOWN;
+};
+InterpShots g_interpShots;
+
+// (render thread) whether this frame is one, and its buffers made
+bool ArmInterpShots(const HostTexture* source) {
+  auto& g = g_interpShots;
+  g.armed = false;
+  if (!g.everyNs) {
+    static const char* v = std::getenv("NG2_INTERP_SHOTS");
+    if (!v) {
+      return false;
+    }
+    g.everyNs = int64_t(std::atof(v) * 1e9);
+    g.nextNs = SteadyNs() + g.everyNs;
+  }
+  if (g.left && source) {
+    g.left--;
+    g.base += 4;
+    g.armed = true;
+    return true;
+  }
+  if (!source || SteadyNs() < g.nextNs || source->samples != RenderSampleCount::COUNT_1 ||
+      (source->format != RenderFormat::R8G8B8A8_UNORM && source->format != RenderFormat::R16G16B16A16_UNORM)) {
+    return false;
+  }
+  g.nextNs = SteadyNs() + g.everyNs;
+  uint32_t texel = source->format == RenderFormat::R16G16B16A16_UNORM ? 8 : 4;
+  g.rowWidth = (source->width + 63) & ~63u;
+  g.width = source->width, g.height = source->height, g.format = source->format;
+  uint64_t size = uint64_t(g.rowWidth) * source->height * texel;
+  static const uint32_t burst = [] {
+    const char* v = std::getenv("NG2_INTERP_SHOT_FRAMES");
+    return std::clamp(v ? uint32_t(std::atoi(v)) : 2u, 1u, 10u);
+  }();
+  for (uint32_t b = 0; b < burst * 4; b++) {
+    auto& shot = g.shots[b];
+    if (b % 4 == 3) {
+      continue;
+    }
+    if (!shot.buffer || shot.size < size) {
+      shot.buffer = g_device->createBuffer(RenderBufferDesc::ReadbackBuffer(size));
+      shot.size = shot.buffer ? size : 0;
+    }
+    if (!shot.buffer) {
+      return false;
+    }
+  }
+  g.armed = true;
+  g.base = 0;
+  static const uint32_t frames = [] {
+    const char* v = std::getenv("NG2_INTERP_SHOT_FRAMES");
+    return std::clamp(v ? uint32_t(std::atoi(v)) : 2u, 1u, 10u);
+  }();
+  g.left = frames - 1;
+  return true;
+}
+
+void CaptureInterpShot(RenderCommandList* l, const HostTexture* source, uint32_t k) {
+  auto& g = g_interpShots;
+  if (!g.armed || k >= 4) {
+    return;
+  }
+  k += g.base;
+  l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source->texture.get(), RenderTextureLayout::COPY_SOURCE));
+  l->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(g.shots[k].buffer.get(), g.format, g.width,
+                                                                   g.height, 1, g.rowWidth),
+                       RenderTextureCopyLocation::Subresource(source->texture.get()));
+  l->barriers(RenderBarrierStage::GRAPHICS,
+              RenderTextureBarrier(source->texture.get(), RenderTextureLayout::SHADER_READ));
+}
+
+// (render thread, after the frame's submit) written once the GPU is surely done
+void WriteInterpShots(uint32_t pictures) {
+  auto& g = g_interpShots;
+  if (!g.armed) {
+    return;
+  }
+  g.armed = false;
+  if (g.left) {
+    return;  // (written with the last frame's)
+  }
+  uint32_t n = g.count++;
+  pictures += g.base;
+  std::thread([n, pictures] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    auto& g = g_interpShots;
+    bool wide = g.format == RenderFormat::R16G16B16A16_UNORM;
+    uint32_t texel = wide ? 8 : 4;
+#if defined(_WIN32)
+    CreateDirectoryA("interp_shots", nullptr);
+#else
+    mkdir("interp_shots", 0755);
+#endif
+    for (uint32_t k = 0; k < pictures && k < 40; k++) {
+      if (k % 4 == 3) {
+        continue;  // (unused)
+      }
+      const auto* data = static_cast<const uint8_t*>(g.shots[k].buffer->map());
+      std::string path = fmt::format("interp_shots/shot-{:03}-{}.ppm", n, k);
+      FILE* file = data ? std::fopen(path.c_str(), "wb") : nullptr;
+      if (file) {
+        constexpr uint32_t kStep = 2;
+        uint32_t width = g.width / kStep, height = g.height / kStep;
+        fmt::print(file, "P6\n{} {}\n255\n", width, height);
+        std::vector<uint8_t> row(width * 3);
+        for (uint32_t y = 0; y < height; y++) {
+          for (uint32_t x = 0; x < width; x++) {
+            const uint8_t* at = data + (size_t(y * kStep) * g.rowWidth + x * kStep) * texel;
+            for (uint32_t c = 0; c < 3; c++) {
+              row[x * 3 + c] = wide ? at[c * 2 + 1] : at[c];
+            }
+          }
+          std::fwrite(row.data(), 1, row.size(), file);
+        }
+        std::fclose(file);
+      }
+      if (data) {
+        g.shots[k].buffer->unmap();
+      }
+    }
+    REXLOG_INFO("video: interp: shot {} written ({} pictures)", n, pictures);
+  }).detach();
+}
 
 // F7's pictures: the front buffer copied to a readback buffer, written once
 // the GPU is done with it (at the next present).
@@ -4562,6 +6162,9 @@ void Present(HostTexture* frontBuffer) {
   StageTimer timer(Stage::kPresent);
   auto* commandList = CommandList();
   FinishGuestMemory();
+  if (InterpProbe()) {
+    ProbeFrameEnd();
+  }
   // NG2_TRACE_FILE=<file>: as F7 when the file appears (for test runs).
   static const char* traceFile = std::getenv("NG2_TRACE_FILE");
   if (traceFile && g_frameCount % 30 == 0 && !g_traceFile) {
@@ -4595,6 +6198,17 @@ void Present(HostTexture* frontBuffer) {
                                            : ng2::aspect::Aspect();
   uint32_t gamma = g_gammaTable ? g_gammaTable->descriptor : 0u;
   uint32_t frame = g_frame;
+  // The pictures between the last frame and this one (NG2_INTERP); not for a
+  // movie the presenter draws itself.
+  std::shared_ptr<InterpFrames> interp;
+  if (InterpEnabled()) {
+    interp = BuildInterpFrames();
+    if (source != frontBuffer || !sourceDescriptor) {
+      interp.reset();
+    }
+  }
+  g_logOps = false;
+  OpArena* frameLog = &g_frameLogs[frame];
   g_boundFramebuffer = nullptr;
   g_recording = false;
   (void)commandList;
@@ -4631,6 +6245,12 @@ void Present(HostTexture* frontBuffer) {
   // The swapchain's part, with the frame's real command list.
   OnRenderThread([=](RenderCommandList* list) mutable {
     static int32_t loggedMode = -1;
+    // NG2_INTERP: the presenter shows a picture each refresh itself; mailbox
+    // presents don't block (a FIFO present in full screen may wait for the
+    // screen holding the queue, and the frame's submit with it).
+    if (InterpEnabled() && mode != 0) {
+      mode = 2;
+    }
     bool supported = g_swapChain->setPresentMode(RenderPresentMode(std::clamp(mode, 0, 3)));
     if (mode != loggedMode) {
       loggedMode = mode;
@@ -4657,13 +6277,12 @@ void Present(HostTexture* frontBuffer) {
       list->begin();
     }
 
-    uint32_t index = 0;
     // (waits that keep timing out: a compositor that doesn't report the
     // screen, as a hidden window may; Low is left off
     // for 5 s then, and tried again)
     static int timeouts = 0;
     static auto pausedUntil = std::chrono::steady_clock::time_point{};
-    if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 && !UnderGamescope() &&
+    if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 && !UnderGamescope() && !interp &&
         std::chrono::steady_clock::now() >= pausedUntil) {
       auto start = std::chrono::steady_clock::now();
       g_swapChain->wait();
@@ -4680,14 +6299,10 @@ void Present(HostTexture* frontBuffer) {
         pausedUntil = std::chrono::steady_clock::now() + std::chrono::seconds(5);
       }
     }
-    if (g_swapChainValid) {
-      g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &index);
-    }
-    while (g_renderSemaphores.size() < g_swapChain->getTextureCount()) {
-      g_renderSemaphores.push_back(g_device->createCommandSemaphore());
-    }
 
-    if (g_swapChainValid) {
+    // The frame's picture into a swapchain image: index and the semaphore
+    // its acquire signals.
+    auto blit = [&](RenderCommandList* l, uint32_t index) {
       g_swapChainFramebuffers.resize(g_swapChain->getTextureCount());
       RenderTexture* target = g_swapChain->getTexture(index);
       auto& framebuffer = g_swapChainFramebuffers[index];
@@ -4698,11 +6313,10 @@ void Present(HostTexture* frontBuffer) {
         desc.colorAttachmentsCount = 1;
         framebuffer = g_device->createFramebuffer(desc);
       }
-      WriteGpuMark(list, frame, presentMark);
-      list->barriers(RenderBarrierStage::GRAPHICS,
+      l->barriers(RenderBarrierStage::GRAPHICS,
                      RenderTextureBarrier(target, RenderTextureLayout::COLOR_WRITE));
-      list->setFramebuffer(framebuffer.get());
-      list->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+      l->setFramebuffer(framebuffer.get());
+      l->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
 
       if (sourceDescriptor) {
         // Fit the guest picture into the window at the chosen aspect ratio
@@ -4716,29 +6330,164 @@ void Present(HostTexture* frontBuffer) {
                                 height);
         RenderRect scissor(0, 0, int32_t(windowWidth), int32_t(windowHeight));
         uint32_t constants[3] = {sourceDescriptor, SAMPLER_LINEAR_CLAMP, gamma};
-        list->setGraphicsPipelineLayout(g_pipelineLayout.get());
-        list->setPipeline(g_presentPipeline.get());
-        list->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
-        list->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
-        list->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
-        list->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
-        list->setGraphicsPushConstants(0, constants, 0, sizeof(constants));
-        list->setViewports(&viewport, 1);
-        list->setScissors(&scissor, 1);
-        list->drawInstanced(3, 1, 0, 0);
+        l->setGraphicsPipelineLayout(g_pipelineLayout.get());
+        l->setPipeline(g_presentPipeline.get());
+        l->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 0);
+        l->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 1);
+        l->setGraphicsDescriptorSet(g_textureDescriptorSet.get(), 2);
+        l->setGraphicsDescriptorSet(g_samplerDescriptorSet.get(), 3);
+        l->setGraphicsPushConstants(0, constants, 0, sizeof(constants));
+        l->setViewports(&viewport, 1);
+        l->setScissors(&scissor, 1);
+        l->drawInstanced(3, 1, 0, 0);
       }
-      list->barriers(RenderBarrierStage::GRAPHICS,
+      l->barriers(RenderBarrierStage::GRAPHICS,
                      RenderTextureBarrier(target, RenderTextureLayout::PRESENT));
+    };
+
+    // Images in the order they are shown: the pictures between, then the
+    // frame's (drawn first: its commands have run).
+    constexpr uint32_t kMaxPictures = 4;
+    static std::unique_ptr<RenderCommandSemaphore> interpAcquire[NUM_FRAMES][kMaxPictures - 1];
+    uint32_t indices[kMaxPictures] = {};
+    uint32_t pictures = 0;
+    uint32_t frameIndex = 0;
+    // At most a frame's pictures waiting to be shown (the swapchain's images
+    // last; plume's acquire lets go of the swapchain between short waits).
+    if (interp || InterpEnabled()) {
+      g_presenter.WaitFor(3, &g_presenter.renderWatch);
+      if (g_presenter.failed.exchange(false)) {
+        g_swapChainValid = false;
+      }
+    }
+    // The game's frame interval, from these presents (the pictures between are spread over it).
+    static int64_t lastPresentNs = 0;
+    static double intervalNs = 1e9 / 60.0;
+    int64_t presentNs = SteadyNs();
+    if (lastPresentNs) {
+      double gap = double(presentNs - lastPresentNs);
+      if (gap > 5e6 && gap < 70e6) {
+        intervalNs += (gap - intervalNs) * 0.1;
+      }
+    }
+    lastPresentNs = presentNs;
+    auto growSemaphores = [] {
+      while (g_renderSemaphores.size() < g_swapChain->getTextureCount()) {
+        g_renderSemaphores.push_back(g_device->createCommandSemaphore());
+      }
+    };
+    // Each picture between in a list and submit of its own, before the
+    // frame's (so its drawing's end is its own, and what the next frame finds
+    // is the frame's): the frame's commands again, its draws part of the way
+    // from the last frame's.
+    static std::unique_ptr<RenderCommandList> interpLists[NUM_FRAMES][kMaxPictures - 1];
+    static std::unique_ptr<RenderCommandFence> interpFences[NUM_FRAMES][kMaxPictures - 1];
+    RenderCommandSemaphore* signalSemaphores[kMaxPictures] = {};
+    RenderCommandFence* doneFences[kMaxPictures] = {};
+    if (g_swapChainValid && interp) {
+      if (prologue && PrologueMode() == 2) {
+        // (the frame's submit runs it too: copies of the same memory)
+        const RenderCommandList* lists[] = {g_prologueLists[frame].get()};
+        g_queue->executeCommandLists(lists, 1);
+      }
+      ArmInterpShots(source);
+      for (size_t k = 0; k < interp->phases.size() && k + 1 < kMaxPictures; k++) {
+        auto& semaphore = interpAcquire[frame][k];
+        auto& interpList = interpLists[frame][k];
+        auto& fence = interpFences[frame][k];
+        if (!semaphore) {
+          semaphore = g_device->createCommandSemaphore();
+          interpList = g_queue->createCommandList();
+          fence = g_device->createCommandFence();
+        }
+        uint32_t index = 0;
+        int64_t acquireStart = SteadyNs();
+      g_presenter.renderWatch.Set(Presenter::kAcquire);
+        if (!g_swapChain->acquireTexture(semaphore.get(), &index)) {
+          break;
+        }
+        NoteAcquire(SteadyNs() - acquireStart);
+      g_presenter.renderWatch.Set(Presenter::kIdle);
+        growSemaphores();
+        interpList->begin();
+        g_replayConstants = &interp->phases[k];
+        g_replayCopies = k < interp->copies.size() ? &interp->copies[k] : nullptr;
+        frameLog->RunKeep(interpList.get());
+        g_replayConstants = nullptr;
+        g_replayCopies = nullptr;
+        CaptureInterpShot(interpList.get(), source, uint32_t(k));
+        RecordInterpPicture(interpList.get(), source, g_frameCount, uint32_t(k));
+        blit(interpList.get(), index);
+        interpList->end();
+        RenderCommandSemaphore* wait = semaphore.get();
+        RenderCommandSemaphore* signal = g_renderSemaphores[index].get();
+        const RenderCommandList* lists[] = {interpList.get()};
+        g_queue->executeCommandLists(lists, 1, &wait, 1, &signal, 1, fence.get());
+        indices[pictures] = index;
+        signalSemaphores[pictures] = signal;
+        doneFences[pictures] = fence.get();
+        pictures++;
+      }
+    }
+    if (g_swapChainValid) {
+      int64_t acquireStart = SteadyNs();
+      g_presenter.renderWatch.Set(Presenter::kAcquire);
+      g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &frameIndex);
+      NoteAcquire(SteadyNs() - acquireStart);
+      g_presenter.renderWatch.Set(Presenter::kIdle);
+    }
+    growSemaphores();
+    if (g_swapChainValid) {
+      WriteGpuMark(list, frame, presentMark);
+      uint32_t shotIndex = interp ? uint32_t(std::min<size_t>(interp->phases.size(), 3)) : 0;
+      CaptureInterpShot(list, source, shotIndex);
+      if (InterpEnabled()) {
+        RecordInterpPicture(list, source, g_frameCount, 9);  // (9: the frame's own)
+      }
+      blit(list, frameIndex);
+      if (g_interpShots.armed) {
+        WriteInterpShots(shotIndex + 1);
+      }
     }
     WriteGpuMark(list, frame, endMark);
 
     list->end();
     if (g_swapChainValid) {
-      RenderCommandSemaphore* waitSemaphores[] = {g_acquireSemaphores[frame].get()};
-      RenderCommandSemaphore* signalSemaphores[] = {g_renderSemaphores[index].get()};
-      submit(list, waitSemaphores, 1, signalSemaphores, 1);
+      RenderCommandSemaphore* waits[] = {g_acquireSemaphores[frame].get()};
+      RenderCommandSemaphore* signals[] = {g_renderSemaphores[frameIndex].get()};
+      int64_t submitStart = SteadyNs();
+      submit(list, waits, 1, signals, 1);
+      static int64_t submitNs = 0, submitMaxNs = 0;
+      int64_t took = SteadyNs() - submitStart;
+      submitNs += took;
+      submitMaxNs = std::max(submitMaxNs, took);
       FrameSubmitted();
-      g_swapChainValid = g_swapChain->present(index, signalSemaphores, 1);
+      indices[pictures] = frameIndex;
+      signalSemaphores[pictures] = signals[0];
+      pictures++;
+      static uint64_t presents = 0;
+      if (InterpEnabled()) {
+        // One at a time, a part of the frame interval apart (Presenter).
+        int64_t firstNs = SteadyNs();
+        for (uint32_t i = 0; i < pictures; i++) {
+          g_presenter.Push({indices[i], signalSemaphores[i],
+                            firstNs + int64_t(intervalNs * (i + 1) / pictures), presents,
+                            doneFences[i]});
+        }
+      } else {
+        g_swapChainValid = g_swapChain->present(indices[0], &signalSemaphores[0], 1);
+      }
+      if (++presents == 600) {
+        REXLOG_INFO("video: interp: {} pictures shown for 600 frames; present {:.2f} ms each (max "
+                    "{:.1f}), the frame's submit {:.2f} ms (max {:.1f})",
+                    g_presenter.presented.load(),
+                    double(g_presenter.presentNs.exchange(0)) / 1e6 /
+                        double(std::max<uint64_t>(g_presenter.presented.exchange(0), 1)),
+                    double(g_presenter.presentMaxNs.exchange(0)) / 1e6, double(submitNs) / 600e6,
+                    double(submitMaxNs) / 1e6);
+        submitNs = submitMaxNs = 0;
+        presents = 0;
+      }
       ReportLatency();
       if (inputNs) {
         if (uint64_t id = g_swapChain->getPresentId()) {
@@ -4751,7 +6500,6 @@ void Present(HostTexture* frontBuffer) {
       FrameSubmitted();
     }
   });
-
   g_commandListPending[frame] = true;
   g_submitTicket[frame] = ++g_framesQueued;
   if (RenderThreadEnabled()) {
@@ -5137,7 +6885,10 @@ bool CreateHostDevice() {
     g_acquireSemaphores[i] = g_device->createCommandSemaphore();
   }
 
-  g_swapChain = g_queue->createSwapChain(renderWindow, 3, BACKBUFFER_FORMAT, 1);
+  g_swapChain = g_queue->createSwapChain(renderWindow, InterpEnabled() ? 8u : 3, BACKBUFFER_FORMAT, 1);
+  if (InterpEnabled()) {
+    g_presenter.StartWatchdog();
+  }
   if (g_device->getCapabilities().presentWait) {
     g_displayRun.store(true);
     g_displayThread = new std::thread([] {

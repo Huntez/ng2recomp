@@ -1,0 +1,55 @@
+From 926080081ecd63c6e9612c1a2ce119dbead68350 Mon Sep 17 00:00:00 2001
+From: Huntez <osigor5464@gmail.com>
+Date: Sat, 7 Nov 2026 13:47:07 +0100
+Subject: [PATCH 13/13] acquireTexture: in short waits, the swapchain's lock
+ let go between them
+
+A present from another thread (which frees an image) isn't held up by an
+acquire waiting for one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plume_vulkan.cpp | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index fa036aa..b73d014 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -13,6 +13,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <climits>
++#include <thread>
+ #include <unordered_map>
+ 
+ #if DLSS_ENABLED
+@@ -2698,11 +2699,23 @@ namespace plume {
+     }
+ 
+     bool VulkanSwapChain::acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) {
+-        const std::scoped_lock lock(vkMutex);
+         assert(signalSemaphore != nullptr);
+ 
++        // In short waits, the swapchain's lock let go between them: a present
++        // from another thread (which frees an image) isn't held up by an
++        // acquire waiting for one.
+         VulkanCommandSemaphore *interfaceSemaphore = static_cast<VulkanCommandSemaphore *>(signalSemaphore);
+-        VkResult res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, UINT64_MAX, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
++        VkResult res;
++        while (true) {
++            {
++                const std::scoped_lock lock(vkMutex);
++                res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, 2000000, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
++            }
++            if ((res != VK_TIMEOUT) && (res != VK_NOT_READY)) {
++                break;
++            }
++            std::this_thread::yield();
++        }
+         if ((res != VK_SUCCESS) && (res != VK_SUBOPTIMAL_KHR)) {
+             return false;
+         }
+-- 
+2.54.0
+
