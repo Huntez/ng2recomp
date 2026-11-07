@@ -4189,7 +4189,7 @@ struct InterpState {
   std::vector<InterpDraw> previous, current;
   std::vector<InterpPalette> previousPalettes, palettes;
   std::unordered_map<uint64_t, int32_t> paletteIndex;  // this frame's, by address and size
-  uint64_t bonesLerped = 0, bonesBytes = 0, palettesJumped = 0;
+  uint64_t bonesLerped = 0, bonesBytes = 0, palettesJumped = 0, bonesSnapped = 0;
   int64_t buildNs = 0, matchNs = 0, constantsNs = 0, bonesNs = 0;
   uint64_t frames = 0, interpolated = 0, draws = 0, matched = 0, snapped = 0, registers = 0;
   uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0;
@@ -4291,6 +4291,14 @@ static const float kInterpJump = [] {
   const char* v = std::getenv("NG2_INTERP_JUMP");
   return v ? float(std::atof(v)) : 0.6f;
 }();
+
+static bool g_interpDumpDetail = false;
+// How far a bone may move in a frame and be mixed (NG2_INTERP_BONE_TELEPORT):
+// more, it is as now (made just now, or given elsewhere for a frame).
+static const float kBoneTeleport = [] {
+  const char* v = std::getenv("NG2_INTERP_BONE_TELEPORT");
+  return v ? float(std::atof(v)) : 8.0f;
+}();  // (F9's detailed frames: palettes logged too)
 
 // How far most of a palette's bones may move in a frame and still be its
 // own (NG2_INTERP_BONE_JUMP to try others): more, another thing's bones.
@@ -4819,22 +4827,57 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
       if (!bones || now.words == then.words) {
         continue;  // (still: the frame's own copy)
       }
-      // A row that jumped (a fast turn, a new pose): the whole palette as it
-      // is now, not some of its bones part of the way and some not.
-      bool jumped = false;
-      for (size_t w = 0; w + 4 <= now.words.size() && !jumped; w += 4) {
-        float size = 1.0f, change = 0;
-        bool finite = true;
+      // Another thing's bones (one of several alike: bodies of one kind of
+      // enemy, each with its bones elsewhere in the buffer, matched with
+      // another's): most bones far from where they were, which mixed would
+      // stretch it towards the other (a spike). A pose of its own moves most
+      // bones little in a frame, however fast one (the sword) goes: by the
+      // mean of each row's largest change (where its last value is, the row
+      // order of the matrices unknown).
+      // (the largest move logged in F9's detailed frames)
+      double moved = 0;
+      size_t rows = 0, worstRow = 0;
+      float worst = 0;
+      bool finite = true;
+      size_t farRows = 0;
+      for (size_t w = 0; w + 4 <= now.words.size(); w += 4, rows++) {
+        float move = 0;
+        if (!(then.words[w] | then.words[w + 1] | then.words[w + 2] | then.words[w + 3]) ||
+            !(now.words[w] | now.words[w + 1] | now.words[w + 2] | now.words[w + 3])) {
+          continue;  // (a bone left zero: taken as now, below)
+        }
         for (size_t c = 0; c < 4; c++) {
           float fx = std::bit_cast<float>(rex::byte_swap(then.words[w + c]));
           float fy = std::bit_cast<float>(rex::byte_swap(now.words[w + c]));
           finite &= std::isfinite(fx) && std::isfinite(fy);
-          size = std::max({size, std::fabs(fx), std::fabs(fy)});
-          change = std::max(change, std::fabs(fx - fy));
+          move = std::max(move, std::fabs(fx - fy));
         }
-        (void)change;
-        (void)size;
-        jumped = false;
+        moved += move;
+        farRows += move > 2.0f;
+        if (move > worst) {
+          worst = move, worstRow = rows;
+        }
+      }
+      bool jumped = !finite || (rows && !(moved / double(rows) <= kPaletteJump));
+      // Every bone that moved far, with the frame (F8's list.txt has it): what
+      // a spike in the pictures between came from (the first 400 a run).
+      static uint32_t bigMovesLogged = 0;
+      static uint64_t lastLogged = 0;  // (the same row seen through another window of the buffer: once)
+      uint64_t seen = (uint64_t(g_frameCount) << 32) ^ then.words[worstRow * 4 + 3] ^ (uint64_t(now.words[worstRow * 4 + 3]) << 16);
+      if (((g_interpDumpDetail && worst > 0.5f) || (worst > 2.0f && bigMovesLogged < 3000)) && seen != lastLogged) {
+        lastLogged = seen;
+        bigMovesLogged++;
+        auto value = [](const std::vector<uint32_t>& words, size_t row, size_t c) {
+          return std::bit_cast<float>(rex::byte_swap(words[row * 4 + c]));
+        };
+        REXLOG_INFO("video: interp: frame {} palette {:x} (was {:x}) {} rows ({} far): mean move {:.3f}, row {} moved {:.3f}: "
+                    "{} {} {} {} -> {} {} {} {}{}{}",
+                    g_frameCount, now.address, then.address, rows, farRows, rows ? moved / double(rows) : 0.0, worstRow, worst,
+                    value(then.words, worstRow, 0), value(then.words, worstRow, 1), value(then.words, worstRow, 2),
+                    value(then.words, worstRow, 3), value(now.words, worstRow, 0), value(now.words, worstRow, 1),
+                    value(now.words, worstRow, 2), value(now.words, worstRow, 3), jumped ? " (as now)" : "",
+                    std::fabs(value(then.words, worstRow, 3) - value(now.words, worstRow, 3)) > kBoneTeleport
+                        ? " (that bone as now)" : "");
       }
       if (jumped) {
         g.palettesJumped++;
@@ -4850,9 +4893,41 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
       size_t words = now.size / 4;
       const uint32_t* x = then.words.data();
       const uint32_t* y = now.words.data();
+      // A bone left all zero in one of the frames (the game writes some only
+      // every other frame: a cut-off part's), its matrix (three rows of four)
+      // as it is now: half of one and none of the other would draw its
+      // vertices halfway to the world's middle (a spike).
+      auto zeroRow = [&](const uint32_t* p, size_t row) {
+        return row * 4 + 4 <= words && !(p[row * 4] | p[row * 4 + 1] | p[row * 4 + 2] | p[row * 4 + 3]);
+      };
+      // Likewise a bone whose place (each row's last value) moved further
+      // than any moves in a frame: one just made (all 1 0 0 0 at the world's
+      // middle the frame before), or given for one frame where it is on its
+      // own (the place near 0) and back: mixed, its vertices would go halfway.
+      auto teleported = [&](size_t r) {
+        if (r * 4 + 4 > words) {
+          return false;
+        }
+        float px = std::bit_cast<float>(rex::byte_swap(x[r * 4 + 3]));
+        float py = std::bit_cast<float>(rex::byte_swap(y[r * 4 + 3]));
+        return !(std::fabs(px - py) <= kBoneTeleport);
+      };
+      auto boneZero = [&](size_t row) {
+        size_t first = row / 3 * 3;
+        for (size_t r = first; r < first + 3; r++) {
+          if (zeroRow(x, r) || zeroRow(y, r) || teleported(r)) {
+            return true;
+          }
+        }
+        return false;
+      };
       for (size_t w = 0; w < words; w += 4) {
         size_t n = std::min<size_t>(4, words - w);
-        if (std::memcmp(x + w, y + w, n * 4) == 0) {
+        bool sameRow = std::memcmp(x + w, y + w, n * 4) == 0;
+        if (!sameRow && (w / 4) % 3 == 0 && boneZero(w / 4)) {
+          g.bonesSnapped++;
+        }
+        if (sameRow || boneZero(w / 4)) {
           for (uint32_t k = 0; k < steps; k++) {
             std::memcpy(outs[k] + w, y + w, n * 4);
           }
@@ -4904,9 +4979,10 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
                 "a frame matching and mixing",
                 double(g.bonesLerped) / 600.0, double(g.bonesBytes) / 600.0 / 1024.0,
                 double(g.buildNs) / 600.0 / 1e6);
-    REXLOG_INFO("video: interp: {:.2f} bone palettes a frame taken as now (a row jumped)",
-                double(g.palettesJumped) / 600.0);
-    g.bonesBytes = g.palettesJumped = 0;
+    REXLOG_INFO("video: interp: {:.2f} bone palettes a frame taken as now (a row jumped), {} bones taken as "
+                "now (left zero or moved far)",
+                double(g.palettesJumped) / 600.0, g.bonesSnapped);
+    g.bonesBytes = g.palettesJumped = g.bonesSnapped = 0;
     g.buildNs = 0;
     g.frames = g.interpolated = g.draws = g.matched = g.snapped = g.registers = 0;
     g.bonesLerped = 0;
