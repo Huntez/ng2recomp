@@ -83,8 +83,8 @@ devices, and none of the player's settings or saves.
   presents are flipped by the display instead of composed by DWM, which drops pictures at high refresh
   rates. Needs `fullscreen` and `exclusive_fullscreen` on in ng2.toml; `2` leaves it to the driver.
 - Frame Interpolation (RECOMP SETTINGS, Display; `frame_interpolation` 0 off, 1 a picture each refresh,
-  2 each second; switched live), or `NG2_INTERP=1`/`0` over it: each frame's draws drawn again with their
-  constants and bone palettes part of the way from the last frame's, a picture for each refresh of the
+  2 each second, each one below 120 Hz; switched live), or `NG2_INTERP=1`/`0` over it: each frame's draws
+  drawn again with their constants and bone palettes part of the way from the last frame's, a picture for each refresh of the
   display, as far along as when it is shown (`NG2_INTERP_DIVIDER=<n>`: each n-th refresh;
   `NG2_INTERP_REFRESH=<Hz>`: paced as for that display, for tests; `NG2_INTERP_FRAMES=1..3`: that many
   pictures between instead, the older way). Draws are matched by mesh, then by shaders and constants; stats
