@@ -4913,7 +4913,23 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
   for (auto& d : g.previous) {
     submittedBefore += d.submitted;
   }
-  const bool partial = submitted && submitted * 4 < submittedBefore && g.keptFor < 2;
+  // Or fewer draws than before, all the same as they were (Game Over draws
+  // its scene 15 times a second and between only its passes again over it):
+  // the next frame, which draws the scene, matched to this one would be most
+  // draws new, a cut, and not one picture between.
+  bool repeat = submitted && submitted < submittedBefore && g.keptFor < 2;
+  uint32_t unmatchedNow = 0;
+  for (size_t i = 0; repeat && i < g.current.size(); i++) {
+    if (!g.current[i].submitted) {
+      continue;
+    }
+    if (match[i] < 0) {
+      repeat = ++unmatchedNow <= 2;
+    } else if (matchDistance[i] != 0.0f) {
+      repeat = false;
+    }
+  }
+  const bool partial = submitted && (submitted * 4 < submittedBefore || repeat) && g.keptFor < 2;
   if (partial) {
     g.partial++;
   }
