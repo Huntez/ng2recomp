@@ -148,7 +148,20 @@ namespace ng2::video {
 
 namespace {
 
-constexpr size_t NUM_FRAMES = 2;
+// Frame slots: the game is at most this many frames ahead of the GPU. Two;
+// three with NG2_INTERP (FrameSlots): the pictures between are made after the
+// frame and drawn before it, so with two the game waited for the build and
+// three draws of the scene (in a crowd, 25 ms frames); a third lets each go
+// on at once (the game, the build, the GPU), each within a frame.
+constexpr size_t NUM_FRAMES = 3;
+bool InterpEnabled();
+uint32_t FrameSlots() {
+  static const uint32_t slots = [] {
+    const char* v = std::getenv("NG2_INTERP_SLOTS");  // (2 to compare)
+    return InterpEnabled() ? (v && v[0] == '2' ? 2u : 3u) : 2u;
+  }();
+  return slots;
+}
 constexpr RenderFormat BACKBUFFER_FORMAT = RenderFormat::B8G8R8A8_UNORM;
 // Bindless heaps, laid out as the translated shaders expect (docs/shaders.md).
 constexpr uint32_t TEXTURE_DESCRIPTOR_COUNT = 65536;
@@ -7141,7 +7154,7 @@ void Present(HostTexture* frontBuffer) {
   if (RenderThreadEnabled()) {
     g_renderThread.Send();
   }
-  g_frame = (g_frame + 1) % NUM_FRAMES;
+  g_frame = (g_frame + 1) % FrameSlots();
   g_frameCount++;
 }
 
