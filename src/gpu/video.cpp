@@ -4955,7 +4955,9 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       // several, apart; more on a slow screen so as not to pass what the
       // swapchain's images allow), each refresh in (B, B + window] gets a
       // picture that far along; one at the end is the frame's own.
-      const int64_t window = g.slow && span ? span : int64_t(g.intervalNs);
+      // (the time since the last full frame: a partial one between, near
+      // fire every third, is not shown, so this one's pictures cover both)
+      const int64_t window = span > 0 && span < 4 * int64_t(g.intervalNs) ? span : int64_t(g.intervalNs);
       const int64_t cap = std::min<int64_t>(kInterpMaxPictures, g_interpPictureCap.load());
       int64_t per = std::max<int64_t>(InterpDivider(),
                                       int64_t(std::ceil(double(window) / double(refresh) / double(cap) - 0.05)));
@@ -5712,6 +5714,10 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     }
     frames->partial = true;
     frames->slow = g.slow;
+    // Paced by the display: not shown either (the last full frame's pictures
+    // go on by the clock; shown at once it cut them short: a jump, near fire
+    // every third frame, seen as a double).
+    frames->paced = InterpPacedByDisplay() && InterpRefreshNs() > 0 && InterpRefreshNs() < 16'000'000;
     g.current.clear();
     g.palettes.clear();
     g.paletteIndex.clear();
@@ -7333,7 +7339,7 @@ void Present(HostTexture* frontBuffer) {
     constexpr uint32_t kMaxPictures = kInterpMaxPictures;
     // A slow screen's partial frame: the last picture again, not shown (the
     // last full frame's pictures are still being shown by the clock).
-    const bool hide = interp && interp->partial && interp->slow;
+    const bool hide = interp && interp->partial && (interp->slow || interp->paced);
     const bool ownHidden = hide || (interp && interp->paced && !interp->ownShown);
     if (!hide && InterpEnabled()) {
       g_presenter.Hurry(&g_presenter.renderWatch);
