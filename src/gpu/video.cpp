@@ -1206,12 +1206,12 @@ OpArena g_frameLogs[NUM_FRAMES];
 bool g_logOps = false;     // game thread: commands are being kept
 int32_t g_drawTag = -1;    // game thread: the draw whose push constants come next
 // Render thread: while a log runs again, each tagged draw's push constants.
-const std::vector<std::array<uint64_t, 3>>* g_replayConstants = nullptr;
+thread_local const std::vector<std::array<uint64_t, 3>>* g_replayConstants = nullptr;
 // Bone palettes (fetch slot 94, in guest memory): the copy that fills one is
 // tagged with its index in the frame, and filled from elsewhere when the log
 // runs again (g_replayCopies, by palette; ref null = as it was).
 int32_t g_copyTag = -1;
-const std::vector<RenderBufferReference>* g_replayCopies = nullptr;
+thread_local const std::vector<RenderBufferReference>* g_replayCopies = nullptr;
 int32_t NoteInterpPalette(uint32_t address, uint32_t size);
 
 class RenderThread {
@@ -6826,7 +6826,16 @@ void Present(HostTexture* frontBuffer) {
   uint32_t endMark = AllocGpuMark(GpuMark::kFrameEnd);  // (each written once: see the resize path)
   // The swapchain's part, with the frame's real command list.
   OnRenderThread([=](RenderCommandList* list) mutable {
+    // (render thread timing, NG2_INTERP: what a frame's pictures waited on)
+    static int64_t jobWaitNs = 0, jobWaitMaxNs = 0, replayNs = 0, replayMaxNs = 0, roomWaitNs = 0,
+                   roomWaitMaxNs = 0;
+    int64_t jobStart = SteadyNs();
     std::shared_ptr<InterpFrames> interp = interpJob.valid() ? interpJob.get() : nullptr;
+    if (interpJob.valid()) {
+      int64_t took = SteadyNs() - jobStart;
+      jobWaitNs += took;
+      jobWaitMaxNs = std::max(jobWaitMaxNs, took);
+    }
     if (!interpWanted) {
       interp.reset();
     }
@@ -6938,10 +6947,55 @@ void Present(HostTexture* frontBuffer) {
     uint32_t indices[kMaxPictures] = {};
     uint32_t pictures = 0;
     uint32_t frameIndex = 0;
+    // Each picture between in a list and submit of its own, before the
+    // frame's (so its drawing's end is its own, and what the next frame finds
+    // is the frame's): the frame's commands again, its draws part of the way
+    // from the last frame's. Recorded first, all at once (each list on a
+    // thread: in a crowd one took about as long as the game's frame), before
+    // waiting for the presenter to have room.
+    static std::unique_ptr<RenderCommandList> interpLists[NUM_FRAMES][kMaxPictures - 1];
+    static std::unique_ptr<RenderCommandFence> interpFences[NUM_FRAMES][kMaxPictures - 1];
+    size_t recorded = 0;
+    if (g_swapChainValid && interp) {
+      recorded = std::min<size_t>(interp->phases.size(), kMaxPictures - 1);
+      int64_t replayStart = SteadyNs();
+      auto record = [&](size_t k) {
+        g_replayConstants = &interp->phases[k];
+        g_replayCopies = k < interp->copies.size() ? &interp->copies[k] : nullptr;
+        frameLog->RunKeep(interpLists[frame][k].get());
+        g_replayConstants = nullptr;
+        g_replayCopies = nullptr;
+      };
+      std::future<void> others[kMaxPictures];
+      for (size_t k = 0; k < recorded; k++) {
+        if (!interpAcquire[frame][k]) {
+          interpAcquire[frame][k] = g_device->createCommandSemaphore();
+          interpLists[frame][k] = g_queue->createCommandList();
+          interpFences[frame][k] = g_device->createCommandFence();
+        }
+        interpLists[frame][k]->begin();
+        if (k + 1 < recorded) {
+          others[k] = std::async(std::launch::async, record, k);
+        }
+      }
+      if (recorded) {
+        record(recorded - 1);
+      }
+      for (size_t k = 0; k + 1 < recorded; k++) {
+        others[k].get();
+      }
+      int64_t took = SteadyNs() - replayStart;
+      replayNs += took;
+      replayMaxNs = std::max(replayMaxNs, took);
+    }
     // At most a frame's pictures waiting to be shown (the swapchain's images
     // last; plume's acquire lets go of the swapchain between short waits).
     if (interp || InterpEnabled()) {
+      int64_t roomStart = SteadyNs();
       g_presenter.WaitFor(3, &g_presenter.renderWatch);
+      int64_t took = SteadyNs() - roomStart;
+      roomWaitNs += took;
+      roomWaitMaxNs = std::max(roomWaitMaxNs, took);
       if (g_presenter.failed.exchange(false)) {
         g_swapChainValid = false;
       }
@@ -6962,12 +7016,6 @@ void Present(HostTexture* frontBuffer) {
         g_renderSemaphores.push_back(g_device->createCommandSemaphore());
       }
     };
-    // Each picture between in a list and submit of its own, before the
-    // frame's (so its drawing's end is its own, and what the next frame finds
-    // is the frame's): the frame's commands again, its draws part of the way
-    // from the last frame's.
-    static std::unique_ptr<RenderCommandList> interpLists[NUM_FRAMES][kMaxPictures - 1];
-    static std::unique_ptr<RenderCommandFence> interpFences[NUM_FRAMES][kMaxPictures - 1];
     RenderCommandSemaphore* signalSemaphores[kMaxPictures] = {};
     RenderCommandFence* doneFences[kMaxPictures] = {};
     if (g_swapChainValid && interp) {
@@ -6977,15 +7025,11 @@ void Present(HostTexture* frontBuffer) {
         g_queue->executeCommandLists(lists, 1);
       }
       ArmInterpShots(source);
-      for (size_t k = 0; k < interp->phases.size() && k + 1 < kMaxPictures; k++) {
+      size_t k = 0;
+      for (; k < recorded; k++) {
         auto& semaphore = interpAcquire[frame][k];
         auto& interpList = interpLists[frame][k];
         auto& fence = interpFences[frame][k];
-        if (!semaphore) {
-          semaphore = g_device->createCommandSemaphore();
-          interpList = g_queue->createCommandList();
-          fence = g_device->createCommandFence();
-        }
         uint32_t index = 0;
         int64_t acquireStart = SteadyNs();
       g_presenter.renderWatch.Set(Presenter::kAcquire);
@@ -6995,12 +7039,6 @@ void Present(HostTexture* frontBuffer) {
         NoteAcquire(SteadyNs() - acquireStart);
       g_presenter.renderWatch.Set(Presenter::kIdle);
         growSemaphores();
-        interpList->begin();
-        g_replayConstants = &interp->phases[k];
-        g_replayCopies = k < interp->copies.size() ? &interp->copies[k] : nullptr;
-        frameLog->RunKeep(interpList.get());
-        g_replayConstants = nullptr;
-        g_replayCopies = nullptr;
         CaptureInterpShot(interpList.get(), source, uint32_t(k));
         RecordInterpPicture(interpList.get(), source, g_frameCount, uint32_t(k), gamma);
         blit(interpList.get(), index);
@@ -7013,6 +7051,13 @@ void Present(HostTexture* frontBuffer) {
         signalSemaphores[pictures] = signal;
         doneFences[pictures] = fence.get();
         pictures++;
+      }
+      for (; k < recorded; k++) {
+        interpLists[frame][k]->end();  // (recorded, not shown: no image)
+      }
+    } else if (recorded) {
+      for (size_t k = 0; k < recorded; k++) {
+        interpLists[frame][k]->end();
       }
     }
     if (g_swapChainValid) {
@@ -7064,15 +7109,20 @@ void Present(HostTexture* frontBuffer) {
         g_swapChainValid = g_swapChain->present(indices[0], &signalSemaphores[0], 1);
       }
       if (++presents == 600) {
+        uint64_t shown = g_presenter.presented.exchange(0);  // (once: the order arguments are read in isn't set)
         REXLOG_INFO("video: interp: {} pictures shown for 600 frames; present {:.2f} ms each (max "
                     "{:.1f}), the frame's submit {:.2f} ms (max {:.1f})",
-                    g_presenter.presented.load(),
-                    double(g_presenter.presentNs.exchange(0)) / 1e6 /
-                        double(std::max<uint64_t>(g_presenter.presented.exchange(0), 1)),
+                    shown,
+                    double(g_presenter.presentNs.exchange(0)) / 1e6 / double(std::max<uint64_t>(shown, 1)),
                     double(g_presenter.presentMaxNs.exchange(0)) / 1e6, double(submitNs) / 600e6,
                     double(submitMaxNs) / 1e6);
         submitNs = submitMaxNs = 0;
         presents = 0;
+        REXLOG_INFO("video: interp: render thread ms a frame: waiting for the build {:.2f} (max {:.1f}), "
+                    "recording the pictures {:.2f} (max {:.1f}), waiting for the presenter {:.2f} (max {:.1f})",
+                    double(jobWaitNs) / 600e6, double(jobWaitMaxNs) / 1e6, double(replayNs) / 600e6,
+                    double(replayMaxNs) / 1e6, double(roomWaitNs) / 600e6, double(roomWaitMaxNs) / 1e6);
+        jobWaitNs = jobWaitMaxNs = replayNs = replayMaxNs = roomWaitNs = roomWaitMaxNs = 0;
       }
       ReportLatency();
       if (inputNs) {
