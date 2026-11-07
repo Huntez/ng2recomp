@@ -4698,7 +4698,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       behind = 0;
       buildAvg = 0;
       double without = pausedCount ? pausedSum / pausedCount : 0;
-      if (pausedCount >= 10 && without > gapBefore * 0.85) {
+      if (pausedCount >= 10 && without > gapBefore * 0.95) {
         ownRate = gapBefore;  // (no faster without them: its own rate)
         holdNs = 0;
         REXLOG_INFO("video: interp: on again: the game is at {:.0f} fps without the pictures too", 1e9 / without);
@@ -4708,16 +4708,18 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
     } else if (autoPause) {
       buildAvg += (double(g.lastBuildNs) - buildAvg) * 0.1;
-      if (ownRate && gapAvg < 18'000'000) {
+      if (ownRate && gapAvg < 17'000'000) {
         ownRate = 0;  // (back at 60)
       }
-      const double late = ownRate ? ownRate * 1.15 : 18'500'000.0;
-      if (gapValid && double(gap) > late && buildAvg > 3e6) {
+      // On the average, not each frame's: at 55 a slow frame of 33 ms comes
+      // once in ten among ones of 16.7, which each frame's count never added up.
+      const double late = ownRate ? ownRate * 1.08 : 17'500'000.0;
+      if (gapValid && gapAvg > late && buildAvg > 3e6) {
         behind++;
-      } else if (gapValid && double(gap) < (ownRate ? ownRate * 1.05 : 17'500'000.0)) {
+      } else if (gapValid && gapAvg < (ownRate ? ownRate * 1.02 : 17'000'000.0)) {
         behind = behind > 2 ? behind - 2 : 0;
       }
-      if (behind >= 20) {
+      if (behind >= 45) {
         holdNs = resumedNs && holdNs && presentNs - resumedNs < 10'000'000'000
                      ? std::min<int64_t>(holdNs * 2, 24'000'000'000)
                      : 1'500'000'000;
