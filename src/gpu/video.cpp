@@ -4176,6 +4176,12 @@ struct InterpDraw {
   bool submitted = false;
   uint32_t boneAddress = 0, boneSize = 0;  // its bone palette (physical), if skinned
   uint64_t mesh = 0;  // its vertex and index data (0: not known)
+  // The pixel shader's registers it reads and their values: the lights, in
+  // the camera's space, must turn with the camera part of the way too.
+  std::vector<uint16_t> psRegisters;
+  std::vector<float> psConstants;
+  uint16_t targetWidth = 0, targetHeight = 0;  // (F9's dump: what it draws to)
+  bool depthOnly = false;
 };
 struct InterpPalette {
   uint32_t address = 0, size = 0;
@@ -4192,7 +4198,7 @@ struct InterpState {
   uint64_t bonesLerped = 0, bonesBytes = 0, palettesJumped = 0, bonesSnapped = 0;
   int64_t buildNs = 0, matchNs = 0, constantsNs = 0, bonesNs = 0;
   uint64_t frames = 0, interpolated = 0, draws = 0, matched = 0, snapped = 0, registers = 0;
-  uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0;
+  uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0, psDraws = 0, timeStill = 0;
   uint32_t keptFor = 0;  // frames the last full frame was kept over (partial ones)  // draws without a match given the shared registers' values before
 };
 InterpState g_interp;
@@ -4222,9 +4228,23 @@ uint32_t InterpSteps() {
 }
 
 int32_t CaptureInterpDraw(uint64_t group, const uint32_t* guestConstants,
-                          const uint64_t (&mask)[4]) {
+                          const uint64_t (&mask)[4], const uint32_t* psConstants = nullptr,
+                          const uint64_t (*psMask)[4] = nullptr) {
   InterpDraw draw;
   draw.group = group;
+  if (psConstants && psMask) {
+    for (uint32_t word = 0; word < 4; word++) {
+      for (uint64_t bits = (*psMask)[word]; bits; bits &= bits - 1) {
+        uint32_t r = word * 64 + uint32_t(__builtin_ctzll(bits));
+        if (r < 224) {
+          draw.psRegisters.push_back(uint16_t(r));
+          for (uint32_t c = 0; c < 4; c++) {
+            draw.psConstants.push_back(std::bit_cast<float>(rex::byte_swap(psConstants[r * 4 + c])));
+          }
+        }
+      }
+    }
+  }
   for (uint32_t word = 0; word < 4; word++) {
     for (uint64_t bits = mask[word]; bits; bits &= bits - 1) {
       uint32_t r = word * 64 + uint32_t(__builtin_ctzll(bits));
@@ -4732,6 +4752,96 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
     }
     // Per draw: each register's value the frame before (null: as now), found
     // once for all the pictures; none when nothing moves.
+    // Per kind of draw (its shaders and target), a register with one value in
+    // all its draws, before and now (that shader's own camera: a billboard's
+    // view, which no other kind has): what a draw of it without a match (a
+    // particle, in data written anew each frame) takes the value before from.
+    struct Common {
+      const float* x = nullptr;
+      const float* y = nullptr;
+      uint32_t nx = 0, ny = 0;
+      bool xSame = true, ySame = true;
+    };
+    std::unordered_map<uint64_t, std::vector<Common>> common;
+    auto noteCommon = [&](const InterpDraw& d, bool now) {
+      auto& c = common[d.group];
+      if (c.empty()) {
+        c.resize(d.registers.size());
+      }
+      if (c.size() != d.registers.size()) {
+        return;
+      }
+      for (size_t r = 0; r < c.size(); r++) {
+        const float* v = &d.constants[r * 4];
+        const float*& at = now ? c[r].y : c[r].x;
+        bool& same = now ? c[r].ySame : c[r].xSame;
+        if (!at) {
+          at = v;
+        } else if (same && std::memcmp(at, v, 16) != 0) {
+          same = false;
+        }
+        (now ? c[r].ny : c[r].nx)++;
+      }
+    };
+    for (size_t i = 0; i < g.current.size(); i++) {
+      if (g.current[i].submitted && lerpMatch[i] < 0) {
+        common[g.current[i].group];  // (only the kinds with a draw without a match)
+      }
+    }
+    for (auto& d : g.previous) {
+      if (d.submitted && common.count(d.group)) {
+        noteCommon(d, false);
+      }
+    }
+    for (auto& d : g.current) {
+      if (d.submitted && common.count(d.group)) {
+        noteCommon(d, true);
+      }
+    }
+    // The pixel shader's registers, by the draw's own match: part of the way,
+    // but a light list sorted again taken as now from the first moved one
+    // on (its run of registers), as the vertex shader's.
+    std::vector<std::vector<uint8_t>> psLerp(g.current.size());  // 1: part of the way
+    uint64_t psDraws = 0;
+    for (size_t i = 0; i < g.current.size(); i++) {
+      auto& d = g.current[i];
+      if (!d.submitted || lerpMatch[i] < 0 || d.psConstants.empty()) {
+        continue;
+      }
+      auto& before = g.previous[lerpMatch[i]];
+      if (before.psRegisters != d.psRegisters ||
+          std::memcmp(before.psConstants.data(), d.psConstants.data(), d.psConstants.size() * 4) == 0) {
+        continue;
+      }
+      std::vector<uint8_t> lerp(d.psRegisters.size(), 0), psMoved(d.psRegisters.size(), 0);
+      for (size_t r = 0; r < d.psRegisters.size(); r++) {
+        const float* x = &before.psConstants[r * 4];
+        const float* y = &d.psConstants[r * 4];
+        float size = 1.0f, change = 0;
+        for (uint32_t c = 0; c < 4; c++) {
+          size = std::max({size, std::fabs(x[c]), std::fabs(y[c])});
+          change = std::max(change, std::fabs(x[c] - y[c]));
+        }
+        if (change == 0.0f) {
+          continue;
+        }
+        if (!std::isfinite(change)) {
+          continue;  // (as now)
+        }
+        lerp[r] = 1;
+        psMoved[r] = InterpMovedFromAnother(before.psConstants.data(), d.psConstants.data(), d.psRegisters.size(), r);
+      }
+      std::vector<uint8_t> asNow;
+      InterpRunsFrom(psMoved, d.psRegisters, asNow);
+      for (size_t r = 0; r < d.psRegisters.size(); r++) {
+        if (asNow[r]) {
+          lerp[r] = 0;
+        }
+      }
+      psLerp[i] = std::move(lerp);
+      psDraws++;
+    }
+    g.psDraws += psDraws;
     std::vector<std::vector<const float*>> borrowed(g.current.size());
     std::vector<bool> notOwn(g.current.size());  // drawn without its own match's values
     uint64_t borrowedDraws = 0;
@@ -4751,11 +4861,31 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
         if (!jumpedValues.empty() && jumpedValues.count(valueAt(d.registers[r], y))) {
           continue;  // (moved: as now)
         }
-        auto it = shared.find(valueAt(d.registers[r], y));
-        if (it != shared.end() && !(poisoned && !(r < skips[i].size() && skips[i][r]))) {
-          x = it->second;  // (poisoned: the camera's only)
-        } else if (before) {
+        // Its own match's value first; another draw's (by the value now) only
+        // for a draw without one, and not one that jumped there (that draw's
+        // jump spread to every draw with the value: a spike across the
+        // pictures between).
+        auto it = before ? shared.end() : shared.find(valueAt(d.registers[r], y));
+        if (it != shared.end()) {
+          const float* other = it->second;
+          float size = 1.0f, change = 0;
+          for (uint32_t c = 0; c < 4; c++) {
+            size = std::max({size, std::fabs(other[c]), std::fabs(y[c])});
+            change = std::max(change, std::fabs(other[c] - y[c]));
+          }
+          if (!(change <= kInterpJump * size)) {
+            it = shared.end();
+          }
+        }
+        if (before) {
           x = &before->constants[r * 4];
+        } else if (it != shared.end()) {
+          x = it->second;
+        } else if (auto c = common.find(d.group); c != common.end() && r < c->second.size()) {
+          auto& one = c->second[r];
+          if (one.nx >= 2 && one.ny >= 2 && one.xSame && one.ySame) {
+            x = one.x;  // (the kind's own camera)
+          }
         }
         if (x && std::memcmp(x, y, 16) != 0) {
           xs[r] = x;
@@ -4780,6 +4910,49 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
       for (size_t i = 0; i < g.current.size(); i++) {
         auto& d = g.current[i];
         phase[i] = d.pushConstants;
+        // A pass into a small target given the frame's time (1/60: the eye's
+        // adaptation to the scene's brightness, kept in a texture from frame to
+        // frame): with no time in the pictures between, or each would adapt
+        // once more and the brightness jump from one to the next.
+        bool timeStill = false;
+        if (d.targetWidth * d.targetHeight <= 64 * 64) {
+          for (float v : d.psConstants) {
+            if (std::fabs(v - 1.0f / 60.0f) < 1e-6f || std::fabs(v - 1.0f / 30.0f) < 1e-6f) {
+              timeStill = true;
+              break;
+            }
+          }
+        }
+        if (timeStill && d.submitted) {
+          Upload upload = Allocate((d.psRegisters.back() + 1u) * 16u);
+          auto* out = reinterpret_cast<float*>(upload.data);
+          for (size_t r = 0; r < d.psRegisters.size(); r++) {
+            float v[4];
+            for (uint32_t c = 0; c < 4; c++) {
+              float y = d.psConstants[r * 4 + c];
+              v[c] = (std::fabs(y - 1.0f / 60.0f) < 1e-6f || std::fabs(y - 1.0f / 30.0f) < 1e-6f) ? 0.0f : y;
+            }
+            std::memcpy(out + d.psRegisters[r] * 4, v, sizeof(v));  // (write-combined: written once)
+          }
+          phase[i][1] = upload.address;
+          if (k == 0) {
+            g.timeStill++;
+          }
+        } else if (!psLerp[i].empty()) {
+          auto& before = g.previous[lerpMatch[i]];
+          Upload upload = Allocate((d.psRegisters.back() + 1u) * 16u);
+          auto* out = reinterpret_cast<float*>(upload.data);
+          for (size_t r = 0; r < d.psRegisters.size(); r++) {
+            const float* x = &before.psConstants[r * 4];
+            const float* y = &d.psConstants[r * 4];
+            float v[4];
+            for (uint32_t c = 0; c < 4; c++) {
+              v[c] = psLerp[i][r] ? x[c] + (y[c] - x[c]) * t : y[c];
+            }
+            std::memcpy(out + d.psRegisters[r] * 4, v, sizeof(v));  // (write-combined: written once)
+          }
+          phase[i][1] = upload.address;
+        }
         // NG2_INTERP_DEBUG=1: the draws without their own match left out of
         // the pictures between (their constants all zero), to see which they are.
         static const bool hideNotOwn = [] {
@@ -5015,8 +5188,10 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
     REXLOG_INFO("video: interp: {} frames taken for cuts, {:.1f}% of draws matched by their mesh, {} "
                 "registers taken as now (sorted again)",
                 g.cuts, 100.0 * double(g.byMesh) / double(std::max<uint64_t>(g.draws, 1)), g.jumped);
-    REXLOG_INFO("video: interp: {} partial frames (the last full one kept)", g.partial);
-    g.borrowed = g.cuts = g.byPlace = g.byMesh = g.jumped = g.partial = 0;
+    REXLOG_INFO("video: interp: {} partial frames (the last full one kept), {:.1f}% of draws with pixel "
+                "shader constants part of the way, {} passes given no time", g.partial,
+                100.0 * double(g.psDraws) / double(std::max<uint64_t>(g.draws, 1)), g.timeStill);
+    g.borrowed = g.cuts = g.byPlace = g.byMesh = g.jumped = g.partial = g.psDraws = g.timeStill = 0;
     REXLOG_INFO("video: interp: {:.1f} bone palettes a frame part of the way ({:.0f} KB), {:.2f} ms "
                 "a frame matching and mixing",
                 double(g.bonesLerped) / 600.0, double(g.bonesBytes) / 600.0 / 1024.0,
@@ -5689,10 +5864,14 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     uint64_t group = vs->entry->hash * 0x9E3779B97F4A7C15ull ^ (ps ? ps->entry->hash : 0) * 31 ^
                      (uint64_t(shape->width) << 40) ^ (uint64_t(shape->height) << 16) ^
                      uint64_t(shape->format) ^ (target ? 0 : 1ull << 63);
-    interpIndex = CaptureInterpDraw(group, vsSource, vs->entry->floatConstantMask);
+    interpIndex = CaptureInterpDraw(group, vsSource, vs->entry->floatConstantMask, ps ? psSource : nullptr,
+                                    ps ? &ps->entry->floatConstantMask : nullptr);
     g_interp.current[interpIndex].boneAddress = interpBoneAddress;
     g_interp.current[interpIndex].boneSize = interpBoneSize;
     g_interp.current[interpIndex].mesh = interpMesh;
+    g_interp.current[interpIndex].targetWidth = uint16_t(shape->width);
+    g_interp.current[interpIndex].targetHeight = uint16_t(shape->height);
+    g_interp.current[interpIndex].depthOnly = !target;
   }
   if (InterpProbe()) {
     const HostTexture* shape = target ? target : depth;
