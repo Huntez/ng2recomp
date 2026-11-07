@@ -4381,7 +4381,8 @@ struct InterpState {
   int64_t prepNs = 0, meshNs = 0, worstNs = 0;  // (worst: the slowest frame's whole build)
   uint64_t drawsSeen = 0, drawsWorst = 0;
   uint64_t frames = 0, interpolated = 0, draws = 0, matched = 0, snapped = 0, registers = 0;
-  uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0, psDraws = 0, timeStill = 0;
+  uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0, psDraws = 0, timeStill = 0,
+           teleported = 0;
   uint32_t keptFor = 0;  // frames the last full frame was kept over (partial ones)
   int64_t lastFullNs = 0;  // the last full frame's present (game thread's clock)
   int64_t lastPresentNs = 0;
@@ -5032,6 +5033,37 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     // is now, seen from the camera part of the way, as a draw without a match.
     std::vector<int32_t> lerpMatch = match;
     uint64_t jumpedDraws = 0;
+    // A thing without bones whose place (a register of x, y, z, 1) moved more
+    // than this in a frame was put elsewhere, not moved: as now. (Some places
+    // draw the broken pieces on the floor all at one spot for a frame, then
+    // back: gone halfway, they'd fly across the floor and back.)
+    static const float kTeleport = [] {
+      const char* v = std::getenv("NG2_INTERP_TELEPORT");
+      return v ? float(std::atof(v)) : 3.0f;
+    }();
+    for (size_t i = 0; i < g.current.size(); i++) {
+      if (match[i] < 0 || matchDistance[i] == 0.0f || g.current[i].boneSize) {
+        continue;
+      }
+      auto& d = g.current[i];
+      auto& before = g.previous[match[i]];
+      for (size_t r = 0; r < d.registers.size(); r++) {
+        if (r < skips[i].size() && skips[i][r]) {
+          continue;
+        }
+        const float* x = &before.constants[r * 4];
+        const float* y = &d.constants[r * 4];
+        if (x[3] != 1.0f || y[3] != 1.0f) {
+          continue;
+        }
+        float dx = x[0] - y[0], dy = x[1] - y[1], dz = x[2] - y[2];
+        if (!(dx * dx + dy * dy + dz * dz <= kTeleport * kTeleport)) {
+          lerpMatch[i] = -1;
+          g.teleported++;
+          break;
+        }
+      }
+    }
     // Only the moved registers take the value now, in every draw that has
     // that value (one light, the same in each pass); the matrices go on part
     // of the way, so a thing lit by a light sorted again stays in one piece.
@@ -5689,12 +5721,12 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
                 100.0 * double(g.borrowed) / double(std::max<uint64_t>(g.draws, 1)),
                 100.0 * double(g.snapped) / double(std::max<uint64_t>(g.registers, 1)));
     REXLOG_INFO("video: interp: {} frames taken for cuts, {:.1f}% of draws matched by their mesh, {} "
-                "registers taken as now (sorted again)",
-                g.cuts, 100.0 * double(g.byMesh) / double(std::max<uint64_t>(g.draws, 1)), g.jumped);
+                "registers taken as now (sorted again), {} draws put elsewhere (as now)",
+                g.cuts, 100.0 * double(g.byMesh) / double(std::max<uint64_t>(g.draws, 1)), g.jumped, g.teleported);
     REXLOG_INFO("video: interp: {} partial frames (the last full one kept), {:.1f}% of draws with pixel "
                 "shader constants part of the way, {} passes given no time", g.partial,
                 100.0 * double(g.psDraws) / double(std::max<uint64_t>(g.draws, 1)), g.timeStill);
-    g.borrowed = g.cuts = g.byPlace = g.byMesh = g.jumped = g.partial = g.psDraws = g.timeStill = 0;
+    g.borrowed = g.cuts = g.byPlace = g.byMesh = g.jumped = g.partial = g.psDraws = g.timeStill = g.teleported = 0;
     REXLOG_INFO("video: interp: {:.1f} bone palettes a frame part of the way ({:.0f} KB), {:.2f} ms "
                 "a frame matching and mixing",
                 double(g.bonesLerped) / 600.0, double(g.bonesBytes) / 600.0 / 1024.0,

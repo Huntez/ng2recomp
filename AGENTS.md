@@ -93,7 +93,8 @@ devices, and none of the player's settings or saves.
   960x540) to `interp_record/`, F9 with the matching of those frames to `interp_dump/`;
   `NG2_INTERP_SHOTS=<s>`: a frame's pictures every so often to `interp_shots/`.
   `NG2_INTERP_DEBUG=1` leaves out the draws without their own match; `NG2_INTERP_DEBUG_T=<t>` draws every
-  picture between at that point; `NG2_INTERP_BONES=0`, `NG2_INTERP_JUMP`, `NG2_INTERP_BY_PLACE`,
+  picture between at that point; `NG2_INTERP_BONES=0`, `NG2_INTERP_JUMP`, `NG2_INTERP_TELEPORT=<units>` (3: a thing moved more in a
+  frame is drawn as now), `NG2_INTERP_BY_PLACE`,
   `NG2_INTERP_PACE` are switches for comparisons. `NG2_INTERP_PROBE=1`: how alike frames are, logged.
 - `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).
   `--async_file_reads=false`: reads the game asks to be asynchronous block its thread again.
