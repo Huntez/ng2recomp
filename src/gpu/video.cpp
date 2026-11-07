@@ -4203,6 +4203,8 @@ struct InterpState {
   std::unordered_map<uint64_t, int32_t> paletteIndex;  // this frame's, by address and size
   uint64_t bonesLerped = 0, bonesBytes = 0, palettesJumped = 0, bonesSnapped = 0;
   int64_t buildNs = 0, matchNs = 0, constantsNs = 0, bonesNs = 0;
+  int64_t prepNs = 0, meshNs = 0, worstNs = 0;  // (worst: the slowest frame's whole build)
+  uint64_t drawsSeen = 0, drawsWorst = 0;
   uint64_t frames = 0, interpolated = 0, draws = 0, matched = 0, snapped = 0, registers = 0;
   uint64_t borrowed = 0, byPlace = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0, psDraws = 0, timeStill = 0;
   uint32_t keptFor = 0;  // frames the last full frame was kept over (partial ones)  // draws without a match given the shared registers' values before
@@ -4376,8 +4378,14 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
   int64_t startNs = SteadyNs();
   struct Timed {
     int64_t start;
-    ~Timed() { g_interp.buildNs += SteadyNs() - start; }
+    ~Timed() {
+      int64_t ns = SteadyNs() - start;
+      g_interp.buildNs += ns;
+      g_interp.worstNs = std::max(g_interp.worstNs, ns);
+    }
   } timed{startNs};
+  g.drawsSeen += g.current.size();
+  g.drawsWorst = std::max<uint64_t>(g.drawsWorst, g.current.size());
   std::shared_ptr<InterpFrames> frames;
   std::unordered_map<uint64_t, std::vector<uint32_t>> groups;
   for (uint32_t i = 0; i < g.previous.size(); i++) {
@@ -4439,6 +4447,12 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
   // several (copies of one mesh): the nearest, as close as alike draws must be.
   {
     auto meshKey = [](const InterpDraw& d) { return d.mesh * 0xC2B2AE3D27D4EB4Full ^ d.group; };
+    int64_t meshStartNs = SteadyNs();
+    g.prepNs += meshStartNs - startNs;
+    struct MeshTimed {
+      int64_t start;
+      ~MeshTimed() { g_interp.meshNs += SteadyNs() - start; }
+    } meshTimed{meshStartNs};
     std::unordered_map<uint64_t, std::vector<uint32_t>> meshes, meshesNow;
     for (uint32_t j = 0; j < g.previous.size(); j++) {
       if (g.previous[j].submitted && g.previous[j].mesh) {
@@ -5258,9 +5272,13 @@ std::shared_ptr<InterpFrames> BuildInterpFrames() {
     g.interpolated++;
   }
   if (g.frames == 600) {
-    REXLOG_INFO("video: interp: ms a frame: matching {:.2f}, constants {:.2f}, bones {:.2f}",
-                double(g.matchNs) / 600e6, double(g.constantsNs) / 600e6, double(g.bonesNs) / 600e6);
-    g.matchNs = g.constantsNs = g.bonesNs = 0;
+    REXLOG_INFO("video: interp: ms a frame: matching {:.2f} (setup {:.2f}, by mesh {:.2f}), constants {:.2f}, "
+                "bones {:.2f}; slowest frame {:.2f} ms; draws {:.0f} a frame, {} at most",
+                double(g.matchNs) / 600e6, double(g.prepNs) / 600e6, double(g.meshNs) / 600e6,
+                double(g.constantsNs) / 600e6, double(g.bonesNs) / 600e6, double(g.worstNs) / 1e6,
+                double(g.drawsSeen) / 600.0, g.drawsWorst);
+    g.matchNs = g.constantsNs = g.bonesNs = g.prepNs = g.meshNs = g.worstNs = 0;
+    g.drawsSeen = g.drawsWorst = 0;
     REXLOG_INFO("video: interp: {}/{} frames interpolated, {:.1f}% of draws matched, {:.1f}% "
                 "given the camera only, {:.2f}% of registers snapped",
                 g.interpolated, g.frames, 100.0 * double(g.matched) / double(std::max<uint64_t>(g.draws, 1)),
