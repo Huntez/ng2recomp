@@ -5193,20 +5193,64 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
     }
     frames->copies.assign(steps, std::vector<RenderBufferReference>(g.palettes.size()));
-    for (size_t i = 0; i < g.palettes.size(); i++) {
-      if (pairs[i] < 0) {
-        continue;
+    // NG2_INTERP_BONES=0: poses as they are now (to tell what a double is)
+    static const bool bones = [] {
+      const char* v = std::getenv("NG2_INTERP_BONES");
+      return !v || v[0] != '0';
+    }();
+    // Each palette on its own (a crowd's took 3 ms a frame of the build, the
+    // render thread waiting): first whether it jumped, then mixed, both
+    // spread over a few threads; what's shared (uploads, the log) between.
+    struct PaletteJob {
+      bool skip = true;  // (no pair, still, or the bones off)
+      bool jumped = false, finite = true;
+      double moved = 0;
+      size_t rows = 0, worstRow = 0, farRows = 0;
+      float worst = 0;
+      uint32_t* outs[4] = {};
+      uint64_t snapped = 0;
+    };
+    std::vector<PaletteJob> jobs(g.palettes.size());
+    static const uint32_t workers = [] {
+      const char* v = std::getenv("NG2_INTERP_WORKERS");
+      uint32_t n = v ? uint32_t(std::atoi(v)) : std::min(4u, std::max(1u, std::thread::hardware_concurrency() / 4));
+      return std::max(1u, n);
+    }();
+    auto spread = [&](auto&& body) {
+      size_t count = jobs.size();
+      uint32_t n = uint32_t(std::min<size_t>(workers, count));
+      if (n <= 1) {
+        for (size_t i = 0; i < count; i++) {
+          body(i);
+        }
+        return;
+      }
+      std::atomic<size_t> next{0};
+      auto run = [&] {
+        for (size_t i; (i = next.fetch_add(1)) < count;) {
+          body(i);
+        }
+      };
+      std::future<void> others[8];
+      for (uint32_t t = 1; t < n && t < 8; t++) {
+        others[t] = std::async(std::launch::async, run);
+      }
+      run();
+      for (uint32_t t = 1; t < n && t < 8; t++) {
+        others[t].get();
+      }
+    };
+    spread([&](size_t i) {
+      auto& job = jobs[i];
+      if (pairs[i] < 0 || !bones) {
+        return;
       }
       auto& now = g.palettes[i];
       auto& then = g.previousPalettes[pairs[i]];
-      // NG2_INTERP_BONES=0: poses as they are now (to tell what a double is)
-      static const bool bones = [] {
-        const char* v = std::getenv("NG2_INTERP_BONES");
-        return !v || v[0] != '0';
-      }();
-      if (!bones || now.words == then.words) {
-        continue;  // (still: the frame's own copy)
+      if (now.words == then.words) {
+        return;  // (still: the frame's own copy)
       }
+      job.skip = false;
       // Another thing's bones (one of several alike: bodies of one kind of
       // enemy, each with its bones elsewhere in the buffer, matched with
       // another's): most bones far from where they were, which mixed would
@@ -5214,13 +5258,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       // bones little in a frame, however fast one (the sword) goes: by the
       // mean of each row's largest change (where its last value is, the row
       // order of the matrices unknown).
-      // (the largest move logged in F9's detailed frames)
-      double moved = 0;
-      size_t rows = 0, worstRow = 0;
-      float worst = 0;
-      bool finite = true;
-      size_t farRows = 0;
-      for (size_t w = 0; w + 4 <= now.words.size(); w += 4, rows++) {
+      for (size_t w = 0; w + 4 <= now.words.size(); w += 4, job.rows++) {
         float move = 0;
         if (!(then.words[w] | then.words[w + 1] | then.words[w + 2] | then.words[w + 3]) ||
             !(now.words[w] | now.words[w + 1] | now.words[w + 2] | now.words[w + 3])) {
@@ -5229,20 +5267,30 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         for (size_t c = 0; c < 4; c++) {
           float fx = std::bit_cast<float>(rex::byte_swap(then.words[w + c]));
           float fy = std::bit_cast<float>(rex::byte_swap(now.words[w + c]));
-          finite &= std::isfinite(fx) && std::isfinite(fy);
+          job.finite &= std::isfinite(fx) && std::isfinite(fy);
           move = std::max(move, std::fabs(fx - fy));
         }
-        moved += move;
-        farRows += move > 2.0f;
-        if (move > worst) {
-          worst = move, worstRow = rows;
+        job.moved += move;
+        job.farRows += move > 2.0f;
+        if (move > job.worst) {
+          job.worst = move, job.worstRow = job.rows;
         }
       }
-      bool jumped = !finite || (rows && !(moved / double(rows) <= kPaletteJump));
+      job.jumped = !job.finite || (job.rows && !(job.moved / double(job.rows) <= kPaletteJump));
+    });
+    for (size_t i = 0; i < jobs.size(); i++) {
+      auto& job = jobs[i];
+      if (job.skip) {
+        continue;
+      }
+      auto& now = g.palettes[i];
+      auto& then = g.previousPalettes[pairs[i]];
       // Every bone that moved far, with the frame (F8's list.txt has it): what
       // a spike in the pictures between came from (the first 400 a run).
       static uint32_t bigMovesLogged = 0;
       static uint64_t lastLogged = 0;  // (the same row seen through another window of the buffer: once)
+      size_t worstRow = job.worstRow;
+      float worst = job.worst;
       uint64_t seen = (uint64_t(frameCount) << 32) ^ then.words[worstRow * 4 + 3] ^ (uint64_t(now.words[worstRow * 4 + 3]) << 16);
       if (((g_interpDumpDetail && worst > 0.5f) || (worst > 2.0f && bigMovesLogged < 3000)) && seen != lastLogged) {
         lastLogged = seen;
@@ -5252,24 +5300,35 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         };
         REXLOG_INFO("video: interp: frame {} palette {:x} (was {:x}) {} rows ({} far): mean move {:.3f}, row {} moved {:.3f}: "
                     "{} {} {} {} -> {} {} {} {}{}{}",
-                    frameCount, now.address, then.address, rows, farRows, rows ? moved / double(rows) : 0.0, worstRow, worst,
+                    frameCount, now.address, then.address, job.rows, job.farRows,
+                    job.rows ? job.moved / double(job.rows) : 0.0, worstRow, worst,
                     value(then.words, worstRow, 0), value(then.words, worstRow, 1), value(then.words, worstRow, 2),
                     value(then.words, worstRow, 3), value(now.words, worstRow, 0), value(now.words, worstRow, 1),
-                    value(now.words, worstRow, 2), value(now.words, worstRow, 3), jumped ? " (as now)" : "",
+                    value(now.words, worstRow, 2), value(now.words, worstRow, 3), job.jumped ? " (as now)" : "",
                     std::fabs(value(then.words, worstRow, 3) - value(now.words, worstRow, 3)) > kBoneTeleport
                         ? " (that bone as now)" : "");
       }
-      if (jumped) {
+      if (job.jumped) {
         g.palettesJumped++;
+        job.skip = true;
         continue;
       }
-      uint32_t* outs[4] = {};
       for (uint32_t k = 0; k < steps; k++) {
         Upload upload = Allocate(now.size, 16);
-        outs[k] = reinterpret_cast<uint32_t*>(upload.data);
+        job.outs[k] = reinterpret_cast<uint32_t*>(upload.data);
         frames->copies[k][i] = RenderBufferReference(upload.buffer, upload.offset);
       }
       g.bonesBytes += now.size;
+      g.bonesLerped++;
+    }
+    spread([&](size_t i) {
+      auto& job = jobs[i];
+      if (job.skip) {
+        return;
+      }
+      auto& now = g.palettes[i];
+      auto& then = g.previousPalettes[pairs[i]];
+      uint32_t* const* outs = job.outs;
       size_t words = now.size / 4;
       const uint32_t* x = then.words.data();
       const uint32_t* y = now.words.data();
@@ -5301,26 +5360,31 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         }
         return false;
       };
+      size_t boneOf = SIZE_MAX;  // (the bone the rows are in: tested once for its three)
+      bool zero = false;
       for (size_t w = 0; w < words; w += 4) {
         size_t n = std::min<size_t>(4, words - w);
-        bool sameRow = std::memcmp(x + w, y + w, n * 4) == 0;
-        if (!sameRow && (w / 4) % 3 == 0 && boneZero(w / 4)) {
-          g.bonesSnapped++;
+        size_t row = w / 4;
+        if (row / 3 != boneOf) {
+          boneOf = row / 3;
+          zero = boneZero(row);
         }
-        if (sameRow || boneZero(w / 4)) {
+        bool sameRow = std::memcmp(x + w, y + w, n * 4) == 0;
+        if (!sameRow && row % 3 == 0 && zero) {
+          job.snapped++;
+        }
+        if (sameRow || zero) {
           for (uint32_t k = 0; k < steps; k++) {
             std::memcpy(outs[k] + w, y + w, n * 4);
           }
           continue;
         }
-        float fx[4], fy[4], size = 1.0f, change = 0;
+        float fx[4], fy[4];
         bool finite = true;
         for (size_t c = 0; c < n; c++) {
           fx[c] = std::bit_cast<float>(rex::byte_swap(x[w + c]));
           fy[c] = std::bit_cast<float>(rex::byte_swap(y[w + c]));
           finite &= std::isfinite(fx[c]) && std::isfinite(fy[c]);
-          size = std::max({size, std::fabs(fx[c]), std::fabs(fy[c])});
-          change = std::max(change, std::fabs(fx[c] - fy[c]));
         }
         if (!finite) {
           for (uint32_t k = 0; k < steps; k++) {
@@ -5336,7 +5400,9 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           std::memcpy(outs[k] + w, v, n * 4);
         }
       }
-      g.bonesLerped++;
+    });
+    for (auto& job : jobs) {
+      g.bonesSnapped += job.snapped;
     }
     g.bonesNs += SteadyNs() - mixedNs;
     g.interpolated++;
