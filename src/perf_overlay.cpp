@@ -7,6 +7,7 @@
 // (sub_822F0EF8, which empties them).
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -55,8 +56,9 @@ uint32_t g_resource = 0;  // the item sprite's
 // The version in the title menu's bottom right corner, the same kind of item.
 uint32_t g_versionItem = 0;
 uint32_t g_versionResource = 0;
-uint64_t g_frameNumber = 0;
-uint64_t g_titleMenuFrame = ~0ull;  // the last frame the title menu updated in
+// (atomic: the title menu's update may run on another thread than the frame start)
+std::atomic<uint64_t> g_frameNumber{0};
+std::atomic<uint64_t> g_titleMenuFrame{~0ull};  // the last frame the title menu updated in
 constexpr float kVersionX = 1150.0f - 953.0f, kVersionY = 684.0f - 650.0f;
 std::chrono::steady_clock::time_point g_last;
 double g_seconds = 0.0;  // frame times since the text last changed
@@ -179,7 +181,8 @@ void QueueText(PPCContext& ctx, uint8_t* base, uint32_t item, uint32_t* resource
 
 // The version, while the title menu is up.
 void VersionFrame(PPCContext& ctx, uint8_t* base) {
-  if (g_titleMenuFrame + 1 < g_frameNumber || g_titleMenuFrame == ~0ull) {
+  uint64_t menu = g_titleMenuFrame.load(std::memory_order_relaxed);
+  if (menu == ~0ull || menu + 1 < g_frameNumber.load(std::memory_order_relaxed)) {
     return;
   }
   if (!g_versionItem) {
@@ -197,7 +200,7 @@ void VersionFrame(PPCContext& ctx, uint8_t* base) {
 // From the title menu's per-frame update (recomp_settings.cpp's hook of
 // sub_8366FBC0): the version is shown while it runs.
 void TitleMenuFrame() {
-  g_titleMenuFrame = g_frameNumber;
+  g_titleMenuFrame.store(g_frameNumber.load(std::memory_order_relaxed), std::memory_order_relaxed);
 }
 
 void CheatsFrame();  // cheats.cpp
@@ -233,7 +236,7 @@ REX_HOOK_RAW(sub_822F0EF8) {
     }
   }
   g_last = now;
-  g_frameNumber++;
+  g_frameNumber.fetch_add(1, std::memory_order_relaxed);
   VersionFrame(ctx, base);
   // In gameplay only (the HUD up), not on loading screens and menus.
   if (!REXCVAR_GET(show_fps) || !ng2::aspect::HudShown() || (!g_item && !MakeItem(ctx, base))) {
