@@ -242,6 +242,29 @@ struct TaggedPresent {
 std::mutex g_taggedMutex;
 TaggedPresent g_tagged[64];
 
+int64_t SteadyNs();
+// (NG2_LATENCY_LOG) which: 0 the frame's first picture, 1 its own (the last)
+void NotePadToPresent(int64_t ns, int which) {
+  static std::mutex mutex;
+  static double sum[2] = {}, worst[2] = {};
+  static uint64_t count[2] = {};
+  static int64_t logAt = 0;
+  std::lock_guard lock(mutex);
+  double ms = double(ns) / 1e6;
+  sum[which] += ms, worst[which] = std::max(worst[which], ms), count[which]++;
+  int64_t now = SteadyNs();
+  if (!logAt) {
+    logAt = now;
+  }
+  if (now - logAt > 10'000'000'000) {
+    REXLOG_INFO("latency pad to present: first picture {:.1f} ms (worst {:.1f}), the frame's own "
+                "{:.1f} ms (worst {:.1f}); {} frames",
+                count[0] ? sum[0] / double(count[0]) : 0.0, worst[0],
+                count[1] ? sum[1] / double(count[1]) : 0.0, worst[1], count[1]);
+    sum[0] = sum[1] = worst[0] = worst[1] = 0, count[0] = count[1] = 0, logAt = now;
+  }
+}
+
 int64_t SteadyNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -1777,6 +1800,8 @@ class Presenter {
     int64_t atNs;
     uint64_t frame;                     // the game's frame it shows
     RenderCommandFence* done = nullptr;  // its drawing's (a picture between)
+    int64_t inputNs = 0;                 // the frame's pad read (NG2_LATENCY_LOG)
+    uint8_t order = 0;                   // 1: the frame's first picture, 2: its own, 3: both
   };
 
   ~Presenter() {
@@ -1897,6 +1922,18 @@ class Presenter {
       }
       presenterWatch.Set(kIdle);
       lastId_ = g_swapChain->getPresentId();
+      if (item.inputNs) {
+        if (item.order & 1) {
+          NotePadToPresent(SteadyNs() - item.inputNs, 0);
+          if (lastId_) {
+            std::lock_guard lock(g_taggedMutex);
+            g_tagged[lastId_ % 64] = {lastId_, item.inputNs, SteadyNs()};
+          }
+        }
+        if (item.order & 2) {
+          NotePadToPresent(SteadyNs() - item.inputNs, 1);
+        }
+      }
       int64_t took = SteadyNs() - presentStart;
       presentNs += took;
       presentMaxNs = std::max<int64_t>(presentMaxNs, took);
@@ -7116,10 +7153,15 @@ void Present(HostTexture* frontBuffer) {
         for (uint32_t i = 0; i < pictures; i++) {
           g_presenter.Push({indices[i], signalSemaphores[i],
                             firstNs + int64_t(intervalNs * (i + 1) / pictures), presents,
-                            doneFences[i]});
+                            doneFences[i], inputNs,
+                            uint8_t((i == 0 ? 1 : 0) | (i + 1 == pictures ? 2 : 0))});
         }
       } else {
         g_swapChainValid = g_swapChain->present(indices[0], &signalSemaphores[0], 1);
+        if (inputNs) {
+          NotePadToPresent(SteadyNs() - inputNs, 0);
+          NotePadToPresent(SteadyNs() - inputNs, 1);
+        }
       }
       if (++presents == 600) {
         uint64_t shown = g_presenter.presented.exchange(0);  // (once: the order arguments are read in isn't set)
@@ -7138,7 +7180,7 @@ void Present(HostTexture* frontBuffer) {
         jobWaitNs = jobWaitMaxNs = replayNs = replayMaxNs = roomWaitNs = roomWaitMaxNs = 0;
       }
       ReportLatency();
-      if (inputNs) {
+      if (inputNs && !InterpEnabled()) {
         if (uint64_t id = g_swapChain->getPresentId()) {
           std::lock_guard lock(g_taggedMutex);
           g_tagged[id % 64] = {id, inputNs, SteadyNs()};
@@ -7375,8 +7417,9 @@ void NoteInputToScreen(int64_t inputNs, int64_t presentNs, int64_t shownNs) {
   }
   if (shownNs - logAt > 10'000'000'000 && count) {
     REXLOG_INFO("latency pad to present {:.1f} ms, pad to screen {:.1f} ms (best {:.1f}, worst "
-                "{:.1f}; {} frames)",
-                toPresent / double(count), toScreen / double(count), best, worst, count);
+                "{:.1f}; {} frames; present to screen {:.1f})",
+                toPresent / double(count), toScreen / double(count), best, worst, count,
+                (toScreen - toPresent) / double(count));
     toPresent = toScreen = worst = 0, best = 1e9, count = 0, logAt = shownNs;
   }
 }
@@ -7534,7 +7577,12 @@ bool CreateHostDevice() {
     g_acquireSemaphores[i] = g_device->createCommandSemaphore();
   }
 
-  g_swapChain = g_queue->createSwapChain(renderWindow, InterpEnabled() ? 8u : 3, BACKBUFFER_FORMAT, 1);
+  uint32_t images = 3;
+  if (InterpEnabled()) {
+    const char* v = std::getenv("NG2_INTERP_IMAGES");
+    images = v && std::atoi(v) >= 3 ? uint32_t(std::atoi(v)) : 8u;
+  }
+  g_swapChain = g_queue->createSwapChain(renderWindow, images, BACKBUFFER_FORMAT, 1);
   if (InterpEnabled()) {
     g_presenter.StartWatchdog();
   }
