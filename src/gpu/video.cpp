@@ -229,6 +229,10 @@ int64_t SteadyNs() {
 std::vector<std::unique_ptr<RenderFramebuffer>> g_swapChainFramebuffers;
 bool g_swapChainValid = false;
 uint32_t g_frame = 0;
+// Frames that stayed an extra refresh on the display in the last whole second
+// (the display clock's thread; read by the Input Latency Low wait).
+std::atomic<int> g_repeatsLastSecond{0};  // frames that stayed an extra refresh, the last whole second
+std::atomic<int> g_lowRelaxations{0};     // times Input Latency Low queued a frame (its log line)
 bool g_recording = false;
 
 std::unique_ptr<RenderDescriptorSet> g_textureDescriptorSet;
@@ -4709,6 +4713,43 @@ void Present(HostTexture* frontBuffer) {
     static auto pausedUntil = std::chrono::steady_clock::time_point{};
     if (g_swapChainValid && REXCVAR_GET(input_latency) == 1 && !UnderGamescope() &&
         std::chrono::steady_clock::now() >= pausedUntil) {
+      // Low leaves a frame one refresh to be ready, and a scene whose frames
+      // take about that long shows many of them twice for minutes (#36,
+      // #46: 20-30% of the frames). While frames repeat, one frame is left
+      // queued, as Standard does, and Low comes back once they stop for a
+      // while. NG2_TEST_LOW_ADAPT=0 keeps the plain wait.
+      // A scene that stays heavy would have Low return and relax every few
+      // seconds, a latency step each time: a relaxation soon after a return
+      // holds twice as long as the last, up to a minute.
+      static const bool adapt = !TestSwitch("NG2_TEST_LOW_ADAPT", "0");
+      static bool relaxed = false;
+      static auto relaxedUntil = std::chrono::steady_clock::time_point{};
+      static auto returnedAt = std::chrono::steady_clock::time_point{};
+      static std::chrono::seconds hold{5};
+      auto now = std::chrono::steady_clock::now();
+      int repeating = g_repeatsLastSecond.load();
+      if (adapt && repeating >= 3) {
+        if (!relaxed) {
+          relaxed = true;
+          bool soon = returnedAt != std::chrono::steady_clock::time_point{} &&
+                      now - returnedAt < std::chrono::seconds(15);
+          hold = soon ? std::min(hold * 2, std::chrono::seconds(60)) : std::chrono::seconds(5);
+          g_swapChain->setMaxFrameLatency(2);
+          int count = ++g_lowRelaxations;
+          if (count <= 5) {
+            REXLOG_INFO("video: Input Latency Low: {} frames stayed an extra refresh in the last "
+                        "second, one frame queued for {} s", repeating, hold.count());
+          }
+        }
+        relaxedUntil = std::max(relaxedUntil, now + hold);
+      } else if (relaxed && now >= relaxedUntil && repeating == 0) {
+        relaxed = false;
+        returnedAt = now;
+        g_swapChain->setMaxFrameLatency(1);
+        if (g_lowRelaxations <= 5) {
+          REXLOG_INFO("video: Input Latency Low: frames no longer repeat, no frame queued again");
+        }
+      }
       auto start = std::chrono::steady_clock::now();
       g_swapChain->wait();
       bool timedOut = std::chrono::steady_clock::now() - start > std::chrono::milliseconds(90);
@@ -5036,6 +5077,8 @@ void DisplayClockThread() {
   uint64_t next = 0;
   int64_t last = 0, runStart = 0, logAt = 0;
   uint64_t runUnits = 0, uneven = 0, repeats = 0, frames = 0;
+  uint64_t secondRepeats = 0;
+  int64_t secondStart = 0;
   double period = 1e9 / 60.0;
   while (g_displayRun.load()) {
     RenderSwapChain* swapChain = g_swapChain.get();
@@ -5072,12 +5115,15 @@ void DisplayClockThread() {
     int64_t dt = t - last;
     if (!last || dt > 250'000'000) {
       runStart = t, runUnits = 0, uneven = 0;
+      secondRepeats = 0, secondStart = t;  // (a stall: not a second of repeats)
+      g_repeatsLastSecond.store(0);
       g_displaySteady.store(false);
     } else if (dt > period / 4) {  // (another present shown at the same refresh: none)
       uint64_t k = std::max<uint64_t>(1, uint64_t(double(dt) / period + 0.5));
       double residual = double(dt) - double(k) * period;
       uneven += std::abs(residual) > period * 0.2 ? 1 : 0;
       repeats += k - 1, frames++;
+      secondRepeats += k - 1;
       runUnits += k;
       if (runUnits >= 60) {
         period = double(t - runStart) / double(runUnits);
@@ -5088,10 +5134,16 @@ void DisplayClockThread() {
       g_displaySteady.store(steady);
     }
     last = t;
+    if (t - secondStart > 1'000'000'000) {
+      g_repeatsLastSecond.store(secondStart ? int(secondRepeats) : 0);
+      secondRepeats = 0, secondStart = t;
+    }
     if (t - logAt > 10'000'000'000) {
       if (logAt) {
-        REXLOG_INFO("video: display {:.3f} Hz{}, {} frames shown, {} stayed an extra refresh",
-                    1e9 / period, g_displaySteady.load() ? " (steady)" : "", frames, repeats);
+        int relaxations = g_lowRelaxations.load();
+        REXLOG_INFO("video: display {:.3f} Hz{}, {} frames shown, {} stayed an extra refresh{}",
+                    1e9 / period, g_displaySteady.load() ? " (steady)" : "", frames, repeats,
+                    relaxations ? fmt::format(", Low queued a frame {} times", relaxations) : "");
       }
       logAt = t, frames = 0, repeats = 0;
     }
