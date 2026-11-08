@@ -1366,6 +1366,10 @@ class QueuedCommandList final : public RenderCommandList {
   void setPipeline(const RenderPipeline* p) override {
     Op([=](RenderCommandList* l) { l->setPipeline(p); });
   }
+  void setBlendConstants(const float constants[4]) override {
+    std::array<float, 4> c = {constants[0], constants[1], constants[2], constants[3]};
+    Op([=](RenderCommandList* l) { l->setBlendConstants(c.data()); });
+  }
   void setGraphicsPipelineLayout(const RenderPipelineLayout* p) override {
     Op([=](RenderCommandList* l) { l->setGraphicsPipelineLayout(p); });
   }
@@ -3184,6 +3188,19 @@ float RegisterFloat(uint32_t device, uint32_t index) {
   return value;
 }
 
+// Whether a target's blend reads the blend constants (RB_BLEND_RED..ALPHA):
+// the game fades a frozen picture out over a cut with them (#58).
+bool UsesBlendConstants(uint32_t blendControl) {
+  reg::RB_BLENDCONTROL blend;
+  blend.value = blendControl;
+  auto constant = [](xenos::BlendFactor f) {
+    return f == xenos::BlendFactor::kConstantColor || f == xenos::BlendFactor::kOneMinusConstantColor ||
+           f == xenos::BlendFactor::kConstantAlpha || f == xenos::BlendFactor::kOneMinusConstantAlpha;
+  };
+  return constant(blend.color_srcblend) || constant(blend.color_destblend) ||
+         constant(blend.alpha_srcblend) || constant(blend.alpha_destblend);
+}
+
 RenderBlend ConvertBlend(xenos::BlendFactor factor) {
   switch (factor) {
     case xenos::BlendFactor::kZero: return RenderBlend::ZERO;
@@ -3198,8 +3215,8 @@ RenderBlend ConvertBlend(xenos::BlendFactor factor) {
     case xenos::BlendFactor::kOneMinusDstAlpha: return RenderBlend::INV_DEST_ALPHA;
     case xenos::BlendFactor::kConstantColor: return RenderBlend::BLEND_FACTOR;
     case xenos::BlendFactor::kOneMinusConstantColor: return RenderBlend::INV_BLEND_FACTOR;
-    case xenos::BlendFactor::kConstantAlpha: return RenderBlend::BLEND_FACTOR;
-    case xenos::BlendFactor::kOneMinusConstantAlpha: return RenderBlend::INV_BLEND_FACTOR;
+    case xenos::BlendFactor::kConstantAlpha: return RenderBlend::BLEND_FACTOR_ALPHA;
+    case xenos::BlendFactor::kOneMinusConstantAlpha: return RenderBlend::INV_BLEND_FACTOR_ALPHA;
     case xenos::BlendFactor::kSrcAlphaSaturate: return RenderBlend::SRC_ALPHA_SAT;
   }
   return RenderBlend::ONE;
@@ -3432,6 +3449,9 @@ std::unique_ptr<RenderPipeline> MakePipeline(const PipelineKey& key, RenderShade
           target.blendOp == RenderBlendOperation::ADD &&
           target.srcBlendAlpha == RenderBlend::ONE && target.dstBlendAlpha == RenderBlend::ZERO &&
           target.blendOpAlpha == RenderBlendOperation::ADD);
+    if (target.blendEnabled && UsesBlendConstants(key.blendControls[i])) {
+      desc.dynamicBlendConstantsEnabled = true;  // RB_BLEND_RED..ALPHA, set with each draw
+    }
     target.renderTargetWriteMask = uint8_t((key.colorMask >> (i * 4)) & 0xF);
   }
   desc.depthTargetFormat = RenderFormat(key.depthFormat);
@@ -3766,6 +3786,8 @@ struct DrawRecord {
   RenderViewport viewport;
   RenderRect scissor;
   uint64_t pushConstants[3] = {};
+  bool blendConstants = false;  // the pipeline takes them per draw
+  float blendColor[4] = {};     // RB_BLEND_RED, GREEN, BLUE, ALPHA
   bool indexed = false;
   std::optional<RenderIndexBufferView> indexView;
   uint32_t drawCount = 0;
@@ -3811,6 +3833,9 @@ void SubmitDraw(DrawRecord& record) {
   std::fill_n(scissors, viewportCount, record.scissor);
   commandList->setViewports(viewports, viewportCount);
   commandList->setScissors(scissors, viewportCount);
+  if (record.blendConstants) {
+    commandList->setBlendConstants(record.blendColor);
+  }
   if (g_profile.perDraw) {
     if (uint32_t mark = AllocGpuMark(GpuMark::kDraw); mark != UINT32_MAX) {
       g_gpuTiming[g_frame].drawShaders.emplace_back(record.vertexShader, record.pixelShader);
@@ -4363,6 +4388,15 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   }
   DrawRecord record;
   record.pipeline = pipeline;
+  for (uint32_t i = 0; i < targetCount; i++) {
+    record.blendConstants |= UsesBlendConstants(key.blendControls[i]);
+  }
+  if (record.blendConstants) {
+    for (uint32_t i = 0; i < 4; i++) {
+      uint32_t bits = Register(device, 0x2105 + i);
+      std::memcpy(&record.blendColor[i], &bits, sizeof(bits));
+    }
+  }
   record.vertexShader = vs->entry->hash;
   record.pixelShader = ps ? ps->entry->hash : 0;
   record.memExport = memExport;
