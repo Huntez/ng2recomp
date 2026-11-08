@@ -5401,6 +5401,17 @@ int64_t DisplayClockNow() {
 
 bool CreateHostDevice() {
   std::lock_guard lock(g_mutex);
+#if defined(_WIN32)
+  // Window Mode Fullscreen (fullscreen and exclusive_fullscreen): the
+  // swapchain takes the display too (VK_EXT_full_screen_exclusive, plume patch
+  // 0016), its presents flipped by the display instead of composed by DWM,
+  // which spoils frame interpolation's pacing. NG2_EXCLUSIVE set says otherwise
+  // (0: not). As the game starts: a change in the menu at the next start.
+  if (!std::getenv("NG2_EXCLUSIVE") && rex::cvar::Query<bool>("fullscreen") &&
+      rex::cvar::Query<bool>("exclusive_fullscreen")) {
+    _putenv_s("NG2_EXCLUSIVE", "1");
+  }
+#endif
   g_resolutionScale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 8));
   g_antialiasing = AntialiasingSetting();
   RenderWindow renderWindow{};
