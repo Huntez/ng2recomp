@@ -4667,13 +4667,15 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       return !v || v[0] != '0';
     }();
     static int64_t pausedUntil = 0, holdNs = 0, resumedNs = 0, lastNs = 0;
-    static double buildAvg = 0, gapAvg = 1e9 / 60.0, gapBefore = 0, ownRate = 0, pausedSum = 0;
-    static uint32_t behind = 0, pausedCount = 0;
+    static double buildAvg = 0, gapAvg = 1e9 / 60.0, gapFast = 1e9 / 60.0, gapBefore = 0, ownRate = 0,
+                  pausedSum = 0;
+    static uint32_t behind = 0, pausedCount = 0, sharpRun = 0;
     int64_t gap = lastNs ? presentNs - lastNs : 0;
     lastNs = presentNs;
     const bool gapValid = gap > 0 && gap < 150'000'000;
     if (gapValid) {
       gapAvg += (double(gap) - gapAvg) * 0.1;
+      gapFast += (double(gap) - gapFast) * 0.3;
     }
     if (pausedUntil) {
       if (gapValid) {
@@ -4719,7 +4721,13 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       } else if (gapValid && gapAvg < (ownRate ? ownRate * 1.02 : 17'000'000.0)) {
         behind = behind > 2 ? behind - 2 : 0;
       }
-      if (behind >= 45) {
+      // A sharp drop (under 45 fps, or well under the game's own rate, for 6
+      // frames in a row on a quick average): at once, not after the 45 above
+      // (a dip to 72 on the screen came and went before they added up).
+      const double sharp = ownRate ? ownRate * 1.3 : 1e9 / 45.0;
+      sharpRun = gapValid && gapFast > sharp && buildAvg > 3e6 ? sharpRun + 1 : 0;
+      if (behind >= 45 || sharpRun >= 6) {
+        sharpRun = 0;
         holdNs = resumedNs && holdNs && presentNs - resumedNs < 10'000'000'000
                      ? std::min<int64_t>(holdNs * 2, 24'000'000'000)
                      : 1'500'000'000;
