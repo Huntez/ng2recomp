@@ -2277,6 +2277,15 @@ const ShaderCacheEntry* FindShaderCacheEntry(uint64_t hash) {
 
 // Vertex shaders ask for round toward zero (docs/shaders.md); a GPU without
 // it gets them without: the capability, its extension and the mode removed.
+// NG2_RTZ=0 removes it everywhere (a test switch for #18, Intel Arc).
+bool RoundTowardZero() {
+  static const bool on = [] {
+    const char* v = std::getenv("NG2_RTZ");
+    return g_device->getCapabilities().roundingModeRTZ && !(v && v[0] == '0');
+  }();
+  return on;
+}
+
 void DropRoundTowardZero(std::vector<uint8_t>& spirv) {
   constexpr uint32_t kOpExtension = 10, kOpExecutionMode = 16, kOpCapability = 17;
   constexpr uint32_t kRoundingModeRTZ = 4463, kCapabilityRTZ = 4468;
@@ -2329,7 +2338,7 @@ RenderShader* HostShader(const ShaderCacheEntry* entry) {
     std::vector<uint8_t> spirv(size);
     if (smolv::Decode(encoded, encodedSize, spirv.data(), size)) {
       MakeTimer made(g_frameStats.shaders, g_frameStats.shaderNs);
-      if (!g_device->getCapabilities().roundingModeRTZ) {
+      if (!RoundTowardZero()) {
         DropRoundTowardZero(spirv);
       }
       host = g_device->createShader(spirv.data(), spirv.size(), "main", RenderShaderFormat::SPIRV);
@@ -5129,6 +5138,9 @@ void DisplayClockThread() {
   uint64_t next = 0;
   int64_t last = 0, runStart = 0, logAt = 0;
   uint64_t runUnits = 0, uneven = 0, repeats = 0, frames = 0;
+  uint64_t windowUnits = 0, windowUneven = 0;
+  bool steady = false;
+  int steadyChanges = 0;
   uint64_t secondRepeats = 0;
   int64_t secondStart = 0;
   double period = 1e9 / 60.0;
@@ -5167,20 +5179,38 @@ void DisplayClockThread() {
     int64_t dt = t - last;
     if (!last || dt > 250'000'000) {
       runStart = t, runUnits = 0, uneven = 0;
+      windowUnits = 0, windowUneven = 0, steady = false;
       secondRepeats = 0, secondStart = t;  // (a stall: not a second of repeats)
       g_repeatsLastSecond.store(0);
       g_displaySteady.store(false);
     } else if (dt > period / 4) {  // (another present shown at the same refresh: none)
       uint64_t k = std::max<uint64_t>(1, uint64_t(double(dt) / period + 0.5));
       double residual = double(dt) - double(k) * period;
-      uneven += std::abs(residual) > period * 0.2 ? 1 : 0;
+      uint64_t off = std::abs(residual) > period * 0.2 ? 1 : 0;
+      uneven += off, windowUneven += off;
       repeats += k - 1, frames++;
       secondRepeats += k - 1;
-      runUnits += k;
+      runUnits += k, windowUnits += k;
       if (runUnits >= 60) {
         period = double(t - runStart) / double(runUnits);
       }
-      bool steady = runUnits >= 120 && uneven * 20 < runUnits;
+      // Steady: fewer than 1 in 20 refreshes off their expected time, judged
+      // over the first 5 s, then over each 5 s; once steady, lost only past
+      // 1 in 4 (a busy GPU makes the reports jitter, #46: judged over the
+      // whole run, steady was lost for good after a while, and Frame Pacing
+      // Auto went back to the guest's own timer, which drifts from the display).
+      bool was = steady;
+      if (runUnits < 300) {
+        steady = runUnits >= 120 && uneven * 20 < runUnits;
+      } else if (windowUnits >= 300) {
+        steady = steady ? windowUneven * 4 <= windowUnits : windowUneven * 20 < windowUnits;
+        if (steady != was && steadyChanges < 20) {
+          steadyChanges++;
+          REXLOG_INFO("video: display clock {} ({} of {} refreshes off time)",
+                      steady ? "steady again" : "no longer steady", windowUneven, windowUnits);
+        }
+        windowUnits = 0, windowUneven = 0;
+      }
       g_displayPeriodNs.store(int64_t(period));
       g_displayRefreshNs.store(t);
       g_displaySteady.store(steady);
@@ -5351,7 +5381,9 @@ bool CreateHostDevice() {
   REXLOG_INFO("video: wait for the screen (Input Latency Low): {}",
               g_device->getCapabilities().presentWait ? "yes" : "no (VK_KHR_present_wait missing)");
   REXLOG_INFO("video: vertex shaders round toward zero: {}",
-              g_device->getCapabilities().roundingModeRTZ ? "yes" : "no (the GPU can't)");
+              RoundTowardZero()                          ? "yes"
+              : g_device->getCapabilities().roundingModeRTZ ? "no (NG2_RTZ=0)"
+                                                            : "no (the GPU can't)");
   // plume always returns an object; one that failed (no surface, no present
   // support, format not offered) has no images.
   if (!g_swapChain || g_swapChain->getTextureCount() == 0) {
