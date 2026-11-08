@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <filesystem>
 #include <future>
 #include <thread>
@@ -1688,6 +1689,90 @@ void WaitForFrame(uint32_t frame) {
     }
   }
 }
+
+// Frame interpolation's threads: the build of a frame's pictures, its palettes
+// and constants, the recording of the pictures. A few made once, at the first
+// job, instead of a thread for each job each frame. Never destroyed (left
+// to run at exit, as the other workers: a job may be waiting for the GPU).
+class WorkerPool {
+ public:
+  // Runs job on one of the threads.
+  void Post(std::function<void()> job) {
+    {
+      std::lock_guard lock(mutex_);
+      Start();
+      queue_.push_back(std::move(job));
+    }
+    cv_.notify_one();
+  }
+
+  // body(i) for each i below count, on this thread and on as many of the
+  // pool's as are free (at most helpers); returns when all are done. This
+  // thread takes items too, so it never waits for a job that hasn't started
+  // (a job of the pool's may call it).
+  template <typename Body>
+  void ForEach(size_t count, uint32_t helpers, Body&& body) {
+    if (count <= 1 || helpers == 0) {
+      for (size_t i = 0; i < count; i++) {
+        body(i);
+      }
+      return;
+    }
+    struct Shared {
+      std::atomic<size_t> next{0}, done{0};
+      std::mutex mutex;
+      std::condition_variable cv;
+    };
+    auto shared = std::make_shared<Shared>();
+    auto* function = &body;  // (read only for an item taken: the caller is still waiting then)
+    auto work = [shared, count, function] {
+      for (size_t i; (i = shared->next.fetch_add(1)) < count;) {
+        (*function)(i);
+        if (shared->done.fetch_add(1) + 1 == count) {
+          std::lock_guard lock(shared->mutex);
+          shared->cv.notify_all();
+        }
+      }
+    };
+    for (size_t h = 0; h < std::min<size_t>(helpers, count - 1); h++) {
+      Post(work);
+    }
+    work();
+    std::unique_lock lock(shared->mutex);
+    shared->cv.wait(lock, [&] { return shared->done.load() == count; });
+  }
+
+ private:
+  void Start() {  // (mutex_ held)
+    if (!threads_.empty()) {
+      return;
+    }
+    uint32_t count = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
+    for (uint32_t i = 0; i < count; i++) {
+      threads_.emplace_back([this] {
+#if defined(__linux__)
+        pthread_setname_np(pthread_self(), "Interpolation");
+#endif
+        while (true) {
+          std::function<void()> job;
+          {
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock, [&] { return !queue_.empty(); });
+            job = std::move(queue_.front());
+            queue_.pop_front();
+          }
+          job();
+        }
+      });
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> queue_;
+  std::vector<std::thread> threads_;
+};
+WorkerPool& g_interpPool = *new WorkerPool;
 
 // NG2_INTERP: a frame's pictures are presented one at a time, a part of
 // the frame interval apart, by a thread of their own (presents queued
@@ -5668,20 +5753,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         phase[i][0] = upload.address;
       }
     };
-    if (steps > 1 && submitted >= 200) {
-      std::vector<std::future<void>> others;
-      for (uint32_t k = 1; k < steps; k++) {
-        others.push_back(std::async(std::launch::async, picture, k));
-      }
-      picture(0);
-      for (auto& other : others) {
-        other.get();
-      }
-    } else {
-      for (uint32_t k = 0; k < steps; k++) {
-        picture(k);
-      }
-    }
+    g_interpPool.ForEach(steps, submitted >= 200 ? steps - 1 : 0, [&](size_t k) { picture(uint32_t(k)); });
     int64_t mixedNs = SteadyNs();
     g.constantsNs += mixedNs - matchedNs;
     // Bone palettes: as the draws that read them were matched.
@@ -5727,30 +5799,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
     };
     std::vector<PaletteJob> jobs(g.palettes.size());
     static const uint32_t workers = std::min(4u, std::max(1u, std::thread::hardware_concurrency() / 4));
-    auto spread = [&](auto&& body) {
-      size_t count = jobs.size();
-      uint32_t n = uint32_t(std::min<size_t>(workers, count));
-      if (n <= 1) {
-        for (size_t i = 0; i < count; i++) {
-          body(i);
-        }
-        return;
-      }
-      std::atomic<size_t> next{0};
-      auto run = [&] {
-        for (size_t i; (i = next.fetch_add(1)) < count;) {
-          body(i);
-        }
-      };
-      std::future<void> others[8];
-      for (uint32_t t = 1; t < n && t < 8; t++) {
-        others[t] = std::async(std::launch::async, run);
-      }
-      run();
-      for (uint32_t t = 1; t < n && t < 8; t++) {
-        others[t].get();
-      }
-    };
+    auto spread = [&](auto&& body) { g_interpPool.ForEach(jobs.size(), workers - 1, body); };
     spread([&](size_t i) {
       auto& job = jobs[i];
       if (pairs[i] < 0) {
@@ -7065,9 +7114,10 @@ void Present(HostTexture* frontBuffer) {
     capture.paletteIndex.clear();
     uint64_t frameCount = g_frameCount;
     int64_t presentNs = SteadyNs();
-    interpJob = std::async(std::launch::async, [frame, frameCount, presentNs] {
-                  return BuildInterpFrames(frame, frameCount, presentNs);
-                }).share();
+    auto build = std::make_shared<std::packaged_task<std::shared_ptr<InterpFrames>()>>(
+        [frame, frameCount, presentNs] { return BuildInterpFrames(frame, frameCount, presentNs); });
+    interpJob = build->get_future().share();
+    g_interpPool.Post([build] { (*build)(); });
     lastJob = interpJob;
   }
   g_logOps = false;
@@ -7340,7 +7390,6 @@ void Present(HostTexture* frontBuffer) {
         g_replayConstants = nullptr;
         g_replayCopies = nullptr;
       };
-      std::future<void> others[kMaxPictures];
       for (size_t k = 0; k < recorded; k++) {
         if (!interpAcquire[frame][k]) {
           interpAcquire[frame][k] = g_device->createCommandSemaphore();
@@ -7348,16 +7397,8 @@ void Present(HostTexture* frontBuffer) {
           interpFences[frame][k] = g_device->createCommandFence();
         }
         interpLists[frame][k]->begin();
-        if (k + 1 < recorded) {
-          others[k] = std::async(std::launch::async, record, k);
-        }
       }
-      if (recorded) {
-        record(recorded - 1);
-      }
-      for (size_t k = 0; k + 1 < recorded; k++) {
-        others[k].get();
-      }
+      g_interpPool.ForEach(recorded, uint32_t(recorded) - 1, record);
       int64_t took = SteadyNs() - replayStart;
       parts.record += took;
       replayNs += took;
