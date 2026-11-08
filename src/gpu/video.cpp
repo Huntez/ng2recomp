@@ -137,7 +137,8 @@ REXCVAR_DEFINE_INT32(input_latency, 0, "Video", "0: standard, 1: low (needs VK_K
 // again, part of the way from the last frame's), one for each refresh of the
 // display, or each second one; switched live. NG2_INTERP=1/0 overrides.
 REXCVAR_DEFINE_INT32(frame_interpolation, 0, "Video",
-                     "0: off, 1: a picture each refresh, 2: each second refresh (each one below 120 Hz)");
+                     "0: off, 1: a picture each refresh, 2: each second refresh (each one below 120 Hz), "
+                     "3: 2x (one picture between the game's frames)");
 REXCVAR_DEFINE_INT32(anisotropic_filtering, -1, "Video",
                      "Anisotropic filtering for mipmapped textures: -1 as the game asks, "
                      "0 off, 1-5 for 1x, 2x, 4x, 8x, 16x")
@@ -5452,6 +5453,20 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         frames->times.push_back(g.gridNs);
         frames->fractions.push_back(f);
         g.gridNs += step;
+      }
+      // 2x: one picture between the game's frames, not one each refresh: of
+      // the refreshes in the window, the one nearest halfway and the last
+      // (at 180 Hz shown one refresh, then two: each drawn as far along as
+      // when it is shown, so the motion keeps its speed).
+      if (REXCVAR_GET(frame_interpolation) == 3 && frames->times.size() > 2) {
+        size_t half = 0;
+        for (size_t k = 1; k + 1 < frames->times.size(); k++) {
+          if (std::fabs(frames->fractions[k] - 0.5f) < std::fabs(frames->fractions[half] - 0.5f)) {
+            half = k;
+          }
+        }
+        frames->times = {frames->times[half], frames->times.back()};
+        frames->fractions = {frames->fractions[half], frames->fractions.back()};
       }
       frames->paced = true;
       frames->ownShown = !frames->fractions.empty() && frames->fractions.back() >= 0.999f;
