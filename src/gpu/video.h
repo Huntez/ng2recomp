@@ -10,6 +10,10 @@
 
 #include <cstdint>
 
+namespace rex::ui {
+class WindowedAppContext;
+}
+
 namespace ng2::video {
 
 // True unless NG2_RENDERER=xenos: no GPU plugin, this renderer draws.
@@ -67,6 +71,11 @@ bool DrainRequested();
 // The display's last refresh and period (steady_clock ns), from the
 // presents reaching the screen; false unless steady and recent.
 bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs);
+// With V-Sync FIFO, the display's queue has run dry: the last half second's
+// swapchain acquires didn't block (native_gpu.cpp's timer refills it).
+bool PresentQueueDrained();
+// The app's window context, for the display queries that must run on its thread.
+void SetAppContext(rex::ui::WindowedAppContext* context);
 int64_t DisplayClockNow();
 // NG2_LATENCY_LOG: the main thread read the pad; the render thread took the
 // frame (the handoff).

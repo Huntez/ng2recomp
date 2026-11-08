@@ -62,6 +62,7 @@ class Ng2App : public rex::ReXApp {
     ng2::video::SetPipelineListPath(paths.config_path.parent_path() / "ng2-pipelines.bin");
     ng2::recomp_settings::SetAppContext(&app_context());
     ng2::controls::SetAppContext(&app_context());
+    ng2::video::SetAppContext(&app_context());
   }
 
   // Game-specific defaults, unless the user set them: the game reads the

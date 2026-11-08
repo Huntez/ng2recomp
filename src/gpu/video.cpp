@@ -46,6 +46,7 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+#include <rex/ui/windowed_app_context.h>
 #if defined(__linux__)
 #include <unistd.h>
 #endif
@@ -233,6 +234,13 @@ uint32_t g_frame = 0;
 // (the display clock's thread; read by the Input Latency Low wait).
 std::atomic<int> g_repeatsLastSecond{0};  // frames that stayed an extra refresh, the last whole second
 std::atomic<int> g_lowRelaxations{0};     // times Input Latency Low queued a frame (its log line)
+// Swapchain acquires in a row that didn't block (under 1.5 ms): with FIFO
+// they block once the display's queue is full, so a long run means the
+// queue has run dry and every frame reaches the screen as soon as it's
+// ready, with the game thread's jitter (#36: choppy after a hitch until a
+// V-Sync change). PresentQueueDrained reads it.
+std::atomic<int> g_acquireFreeRun{0};
+int64_t g_blockedNs = 0;  // (render thread) the frame's acquire wait, until its present adds its own
 bool g_recording = false;
 
 std::unique_ptr<RenderDescriptorSet> g_textureDescriptorSet;
@@ -4766,7 +4774,9 @@ void Present(HostTexture* frontBuffer) {
       }
     }
     if (g_swapChainValid) {
+      int64_t acquireStart = SteadyNs();
       g_swapChainValid = g_swapChain->acquireTexture(g_acquireSemaphores[frame].get(), &index);
+      g_blockedNs = SteadyNs() - acquireStart;  // (the present's wait is added below)
     }
     while (g_renderSemaphores.size() < g_swapChain->getTextureCount()) {
       g_renderSemaphores.push_back(g_device->createCommandSemaphore());
@@ -4825,7 +4835,15 @@ void Present(HostTexture* frontBuffer) {
       submit(list, waitSemaphores, 1, signalSemaphores, 1);
       FrameSubmitted();
       EvenOutPresent();
+      int64_t presentStart = SteadyNs();
       g_swapChainValid = g_swapChain->present(index, signalSemaphores, 1);
+      // A full FIFO queue blocks the acquire (AMD, Mesa) or the present
+      // (NVIDIA): either counts.
+      if (g_blockedNs + SteadyNs() - presentStart >= 1'500'000) {
+        g_acquireFreeRun.store(0, std::memory_order_relaxed);
+      } else if (g_acquireFreeRun.load(std::memory_order_relaxed) < 1000) {
+        g_acquireFreeRun.fetch_add(1, std::memory_order_relaxed);
+      }
       // (timed at the present itself, on the thread that makes it)
       ReportPresentGaps(std::chrono::steady_clock::now());
       ReportLatency();
@@ -5182,6 +5200,53 @@ bool DrainRequested() {
   return g_drainRequest.exchange(false, std::memory_order_relaxed);
 }
 
+// The rate of the display the window is on, as SDL reports it (0 unknown):
+// sampled on the UI thread (SDL's display queries belong there), asked for
+// every 5 s from the vsync thread (the window may move to another display).
+rex::ui::WindowedAppContext* g_appContext = nullptr;
+std::atomic<double> g_displayModeHz{0.0};
+std::atomic<bool> g_displayModeQueued{false};
+std::atomic<bool> g_presentDrainCheck{false};  // off before the swapchain goes
+
+void SetAppContext(rex::ui::WindowedAppContext* context) {
+  g_appContext = context;
+}
+
+void RequestDisplayRate() {
+  if (!g_appContext || g_displayModeQueued.exchange(true)) {
+    return;
+  }
+  g_appContext->CallInUIThreadDeferred([] {
+    int count = 0;
+    SDL_Window** windows = SDL_GetWindows(&count);
+    SDL_Window* window = (windows && count > 0) ? windows[0] : nullptr;
+    SDL_free(windows);
+    const SDL_DisplayMode* mode =
+        window ? SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window)) : nullptr;
+    g_displayModeHz.store(mode ? double(mode->refresh_rate) : 0.0);
+    g_displayModeQueued.store(false);
+  });
+}
+
+bool PresentQueueDrained() {
+  // (FIFO as created, not Mailbox, which never blocks; not Low, which empties
+  // the queue on purpose; a display near 60 Hz: a faster one or a variable
+  // one never holds a frame at 60 fps, so there's nothing to refill)
+  if (!g_presentDrainCheck.load() || !REXCVAR_GET(vsync) || REXCVAR_GET(input_latency) == 1 ||
+      UnderGamescope() || !g_swapChain->isVsyncEnabled() ||
+      g_acquireFreeRun.load(std::memory_order_relaxed) < 30) {
+    return false;
+  }
+  static int64_t askedNs = 0;
+  int64_t now = SteadyNs();
+  if (!askedNs || now - askedNs > 5'000'000'000) {
+    askedNs = now;
+    RequestDisplayRate();
+  }
+  double rate = g_displayModeHz.load();
+  return rate >= 59.0 && rate <= 61.0;
+}
+
 bool UnderGamescope() {
   static const bool under = [] {
     const char* v = std::getenv("GAMESCOPE_WAYLAND_DISPLAY");
@@ -5238,6 +5303,7 @@ bool CreateHostDevice() {
   }
 
   g_swapChain = g_queue->createSwapChain(renderWindow, 3, BACKBUFFER_FORMAT, 1);
+  g_presentDrainCheck.store(g_swapChain != nullptr);
   if (g_device->getCapabilities().presentWait) {
     g_displayRun.store(true);
     g_displayThread = new std::thread([] {
@@ -5631,6 +5697,7 @@ void ApplyResolveReadbacks(uint32_t frame) {
 }  // namespace
 
 void DestroyHostDevice() {
+  g_presentDrainCheck.store(false);
   StopDrawWorker();
   if (g_displayThread) {
     g_displayRun.store(false);
