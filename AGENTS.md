@@ -97,20 +97,10 @@ devices, and none of the player's settings or saves.
   2 each second, each one below 120 Hz, 3 2x: one picture between the game's frames; experimental,
   off by default; switched live), or `NG2_INTERP=1`/`0` over it: each frame's draws
   drawn again with their constants and bone palettes part of the way from the last frame's, a picture for each refresh of the
-  display, as far along as when it is shown (`NG2_INTERP_DIVIDER=<n>`: each n-th refresh;
-  `NG2_INTERP_REFRESH=<Hz>`: paced as for that display, for tests; `NG2_INTERP_FRAMES=1..3`: that many
-  pictures between instead, the older way). Draws are matched by mesh, then by shaders and constants; stats
-  every 600 frames. Best with `NG2_EXCLUSIVE=1`. `NG2_INTERP_SLOTS=2`, `NG2_INTERP_IMAGES=<n>` (8),
-  `NG2_INTERP_THREAD=0`, `NG2_INTERP_WORKERS=<n>` for comparisons. With `NG2_INTERP_KEYS=1`, F8: every
-  picture for 5 s (made 960x540) to `interp_record/`, F9 with the matching of those frames to
-  `interp_dump/` (`NG2_INTERP_DUMP_FULL=1`: every register of each);
-  `NG2_INTERP_SHOTS=<s>`: a frame's pictures every so often to `interp_shots/`.
-  `NG2_INTERP_DEBUG=1` leaves out the draws without their own match; `NG2_INTERP_DEBUG_T=<t>` draws every
-  picture between at that point; `NG2_INTERP_BONES=0`, `NG2_INTERP_JUMP`, `NG2_INTERP_TELEPORT=<units>` (off: a thing without bones moved more in
-  a frame is drawn as now; it took walls for such in a turn), `NG2_INTERP_SWAPS=1` (a value another draw had
-  the frame before taken as now: a light list's entry; not yet by default), `NG2_INTERP_AUTOPAUSE=0` (paused for a while when
-  building the pictures takes the game below 60, as on the Steam Deck in a big fight), `NG2_INTERP_BY_PLACE`,
-  `NG2_INTERP_PACE` are switches for comparisons. `NG2_INTERP_PROBE=1`: how alike frames are, logged.
+  display, as far along as when it is shown (`NG2_INTERP_REFRESH=<Hz>`: paced as for that display, for tests).
+  Draws are matched by mesh, then by shaders and constants; stats every 600 frames. When building the pictures
+  takes the game below 60 (a big fight on a slow CPU) it drops to half rate, then pauses them for a while.
+  Best with `NG2_EXCLUSIVE=1`. `NG2_INTERP_DEBUG=1` leaves out the draws without their own match.
 - `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).
   `--async_file_reads=false`: reads the game asks to be asynchronous block its thread again.
   `--test_read_delay_us_per_mb=12000`: slow every read to about SD card speed, to measure loading
