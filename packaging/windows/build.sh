@@ -98,12 +98,12 @@ build=$repo/out/build/windows-x64
 build_avx2=$repo/out/build/windows-x64-avx2
 cmake -S "$repo" -B "$build" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$toolchain" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$sdk/out/install/windows-x64" \
-    -DNG2_FFMPEG_DIR="$deps/ffmpeg" >"$out/configure.log"
+    -DNG2_FFMPEG_DIR="$deps/ffmpeg" ${NG2_CMAKE_ARGS:-} >"$out/configure.log"
 cmake --build "$build" -j"${JOBS:-$(nproc)}" --target ng2 >"$out/build.log"
 cmake -S "$repo" -B "$build_avx2" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$toolchain" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$sdk/out/install/windows-x64" \
     -DNG2_CROSS_FLAGS="-march=x86-64-v3" \
-    -DNG2_FFMPEG_DIR="$deps/ffmpeg" >"$out/configure-avx2.log"
+    -DNG2_FFMPEG_DIR="$deps/ffmpeg" ${NG2_CMAKE_ARGS:-} >"$out/configure-avx2.log"
 cmake --build "$build_avx2" -j"${JOBS:-$(nproc)}" --target ng2 >"$out/build-avx2.log"
 
 pkg=$out/NinjaGaiden2

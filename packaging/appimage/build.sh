@@ -69,7 +69,7 @@ game() {  # <build dir> <march>
         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
         -DCMAKE_C_FLAGS="-march=$2" -DCMAKE_CXX_FLAGS="-march=$2" \
         -DCMAKE_EXE_LINKER_FLAGS="$flags" -DCMAKE_SHARED_LINKER_FLAGS="$flags" \
-        -DCMAKE_PREFIX_PATH="/out/sdk-install;/usr/local" -DNG2_GAME_DIR=/out/src/game_files
+        -DCMAKE_PREFIX_PATH="/out/sdk-install;/usr/local" -DNG2_GAME_DIR=/out/src/game_files '"${NG2_CMAKE_ARGS:-}"'
     step $1.log ninja -C $1 -j'"$jobs"' ng2
 }
 game /out/build-v2 x86-64-v2

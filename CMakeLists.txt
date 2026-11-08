@@ -63,7 +63,8 @@ endif()
 
 # xenos (GPU emulation) is the reference renderer while the native one is built.
 rexglue_setup_target(ng2 GPU_PLUGINS xenos)
-target_compile_definitions(ng2 PRIVATE NG2_VERSION="${PROJECT_VERSION}")
+set(NG2_VERSION_SUFFIX "" CACHE STRING "Appended to the version shown (test builds)")
+target_compile_definitions(ng2 PRIVATE NG2_VERSION="${PROJECT_VERSION}${NG2_VERSION_SUFFIX}")
 
 # The SDK sets an $ORIGIN rpath on Linux but only stages its shared runtime
 # libraries on Windows and macOS.
@@ -86,6 +87,13 @@ endif()
 set(NG2_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/game_files" CACHE PATH
     "Extracted game files (default.xex is read at build time for its shaders)")
 set(NG2_XENOS_RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/XenosRecomp")
+# NG2_NAN_SAFE_SHADERS=ON: the game's shaders drop NaNs before clamping (a test
+# for Intel GPUs, #18; XenosRecomp patch 0019).
+option(NG2_NAN_SAFE_SHADERS "Game shaders drop NaNs before clamping (Intel test)" OFF)
+set(NG2_XENOS_RECOMP_ENV "XENOS_NAN_SAFE_OFF=1")
+if(NG2_NAN_SAFE_SHADERS)
+    set(NG2_XENOS_RECOMP_ENV "XENOS_NAN_SAFE=1")
+endif()
 
 if(CMAKE_CROSSCOMPILING)
     set(NG2_SHADER_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
@@ -117,7 +125,8 @@ else()
         OUTPUT "${NG2_SHADER_CACHE}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${NG2_SHADER_DIR}/input"
         COMMAND ng2_dump_image "${NG2_GAME_DIR}" default.xex "${NG2_SHADER_DIR}/input/default.img"
-        COMMAND "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
+        COMMAND ${CMAKE_COMMAND} -E env ${NG2_XENOS_RECOMP_ENV}
+            "${CMAKE_CURRENT_BINARY_DIR}/xenos_recomp/XenosRecomp/XenosRecomp"
             "${NG2_SHADER_DIR}/input" "${NG2_SHADER_CACHE}"
             "${NG2_XENOS_RECOMP_DIR}/XenosRecomp/shader_common.h"
         DEPENDS ng2_dump_image xenos_recomp "${NG2_GAME_DIR}/default.xex"
