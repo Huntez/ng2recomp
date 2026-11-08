@@ -206,6 +206,13 @@ constexpr Setting kSettings[] = {
     {u"Input Latency", {u"Standard", u"Low"}, 2, "input_latency", Kind::kLevel},
     // The guest's vblanks on the display's refreshes (gpu/native_gpu.cpp).
     {u"Frame Pacing", {u"Auto", u"Timer"}, 2, "frame_pacing", Kind::kLevel},
+    // Pictures made between the game's frames: one each refresh of the
+    // display (Full Rate) or each second one (Half Rate; each one below
+    // 120 Hz, so never fewer than the game's 60), or one between each two
+    // of the game's frames (2x: 120 for its 60); gpu/video.cpp.
+    // (Short: a longer choice is squeezed narrow to fit.)
+    {u"Frame Interpolation", {u"Off", u"Full Rate", u"Half Rate", u"2x"}, 4,
+     "frame_interpolation", Kind::kLevel},
 };
 // The window sizes for the chosen aspect ratio.
 const WindowSize* WindowSizes() {
@@ -258,7 +265,7 @@ constexpr Page kPages[] = {
     {u"Graphics", 1, 0x2BB0, 0x2AD0,
      {{Row(0), Row(3), Row(1), Row(21), Row(2), Row(20)}},
      6},
-    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28)}}, 5},
+    {u"Display", 2, 0x1CC0, 0x1A20, {{Row(4), Row(5), Row(14), Row(6), Row(28), Row(29)}}, 6},
     // (its name in the game's third category name, which holds 7 letters)
     {u"Cheats", 3, 0x13E0, 0x1300,
      {{Row(8), Row(9), Row(11), Row(24), Row(25), Row(26)}},
