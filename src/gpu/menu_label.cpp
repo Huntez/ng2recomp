@@ -6,7 +6,7 @@
 // entries' pictures share one 8-bit atlas, one 90-pixel band per entry, in
 // the same font. Each word there is split into its letters at the columns
 // with the fewest bright pixels, and the new text is laid out from those
-// columns (letter, outline and glow), so it takes the menu's palettes like
+// letters with their outline and glow, so it takes the menu's palettes like
 // the rest. Nothing of the game's art is stored here.
 
 #include "menu_label.h"
@@ -170,6 +170,32 @@ std::map<std::string, Glyph, std::less<>> FindGlyphs() {
   return glyphs;
 }
 
+bool IsFace(uint8_t v) {
+  return v != kClear && v >= 112;
+}
+
+// Squared distance (up to kReach, else more) from each pixel of a band's
+// columns [x0, x1) to the nearest letter face in its columns [begin, end).
+constexpr int kReach = 14;
+std::vector<int> FaceDistance(uint32_t band, int begin, int end, int x0, int x1) {
+  std::vector<int> distance(size_t(x1 - x0) * kBand, kReach * kReach + 1);
+  const uint8_t* pixels = g_atlas.data() + band * kBand * kWidth;
+  for (int fy = 0; fy < int(kBand); fy++) {
+    for (int fx = std::max(begin, 0); fx < std::min(end, int(kWidth)); fx++) {
+      if (!IsFace(pixels[fy * kWidth + fx])) {
+        continue;
+      }
+      for (int y = std::max(0, fy - kReach); y < std::min(int(kBand), fy + kReach + 1); y++) {
+        for (int x = std::max(x0, fx - kReach); x < std::min(x1, fx + kReach + 1); x++) {
+          int& d = distance[size_t(y) * (x1 - x0) + (x - x0)];
+          d = std::min(d, (x - fx) * (x - fx) + (y - fy) * (y - fy));
+        }
+      }
+    }
+  }
+  return distance;
+}
+
 // A label into pixels (kWidth x kBand), false if a letter is missing: its
 // words as the atlas has them where it does, else letter by letter.
 bool Compose(std::string_view text, uint8_t* pixels) {
@@ -201,27 +227,63 @@ bool Compose(std::string_view text, uint8_t* pixels) {
   if (width > kWidth) {
     return false;
   }
-  // The plate's rows, from the NEW GAME entry.
-  std::array<bool, kBand> plateRows{};
-  for (uint32_t y = 0; y < kBand; y++) {
-    const uint8_t* row = g_atlas.data() + (kBand + y) * kWidth;
-    plateRows[y] = std::find(row, row + kWidth, kPlate) != row + kWidth;
-  }
+  // Each letter brings its surroundings (outline, shadow, glow) up to
+  // kReach from its face, where they're nearer its face than its source
+  // word's other letters'; where two placed letters' surroundings meet, the
+  // nearer face's wins. Cut at fixed columns instead, each letter kept its
+  // own word's shadow in a box (#66).
+  std::vector<int> best(kWidth * kBand, kReach * kReach + 1);
   std::memset(pixels, kClear, kWidth * kBand);
-  uint32_t x = (kWidth - width) / 2;
+  int x = int(kWidth - width) / 2;
   for (const Glyph* piece : pieces) {
     if (!piece) {
-      for (uint32_t i = 0; i < kSpace; i++, x++) {
-        for (uint32_t y = 0; y < kBand; y++) {
-          pixels[y * kWidth + x] = plateRows[y] ? kPlate : kClear;
-        }
-      }
+      x += kSpace;
       continue;
     }
     const Glyph& glyph = *piece;
-    for (uint32_t gx = glyph.begin; gx < glyph.end; gx++, x++) {
-      for (uint32_t y = 0; y < kBand; y++) {
-        pixels[y * kWidth + x] = g_atlas[(glyph.band * kBand + y) * kWidth + gx];
+    int begin = int(glyph.begin), end = int(glyph.end);
+    int x0 = std::max(0, begin - kReach), x1 = std::min(int(kWidth), end + kReach);
+    auto own = FaceDistance(glyph.band, begin, end, x0, x1);
+    auto left = FaceDistance(glyph.band, x0 - kReach, begin, x0, x1);
+    auto right = FaceDistance(glyph.band, end, x1 + kReach, x0, x1);
+    const uint8_t* source = g_atlas.data() + glyph.band * kBand * kWidth;
+    for (int y = 0; y < int(kBand); y++) {
+      for (int sx = x0; sx < x1; sx++) {
+        size_t i = size_t(y) * (x1 - x0) + (sx - x0);
+        int d = own[i];
+        int ox = x + sx - begin;
+        if (d > kReach * kReach || d > left[i] || d > right[i] || ox < 0 || ox >= int(kWidth)) {
+          continue;
+        }
+        size_t o = size_t(y) * kWidth + ox;
+        if (d < best[o]) {
+          best[o] = d;
+          pixels[o] = source[y * kWidth + sx];
+        }
+      }
+    }
+    x += end - begin;
+  }
+  // One plate behind it all, as the atlas's: the letters' box and 4 to 5
+  // pixels more.
+  int left = kWidth, right = -1, top = kBand, bottom = -1;
+  for (int y = 0; y < int(kBand); y++) {
+    for (int px = 0; px < int(kWidth); px++) {
+      if (IsLetter(pixels[y * kWidth + px])) {
+        left = std::min(left, px), right = std::max(right, px);
+        top = std::min(top, y), bottom = std::max(bottom, y);
+      }
+    }
+  }
+  left = std::max(0, left - 4), top = std::max(0, top - 4);
+  right = std::min(int(kWidth) - 1, right + 5), bottom = std::min(int(kBand) - 1, bottom + 5);
+  for (int y = 0; y < int(kBand); y++) {
+    for (int px = 0; px < int(kWidth); px++) {
+      uint8_t& v = pixels[y * kWidth + px];
+      if (px < left || px > right || y < top || y > bottom) {
+        v = kClear;
+      } else if (v == kClear) {
+        v = kPlate;
       }
     }
   }
