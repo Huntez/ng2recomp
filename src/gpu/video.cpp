@@ -1707,6 +1707,32 @@ void NoteAcquire(int64_t ns) {
   }
 }
 
+// A picture's drawing's fence, waited for once after each submit (plume's
+// wait resets it): by the presenter before presenting the picture, or by the
+// render thread before the picture's list and fence are used again, three
+// frames on (in exclusive full screen the presenter doesn't wait, and a
+// fence submitted again while still signaled is invalid).
+struct PictureFence {
+  std::unique_ptr<RenderCommandFence> fence;
+  std::atomic<int> state{0};  // 0: nothing to wait for, 1: submitted, 2: being waited for
+  void Submitted() {
+    state = 1;
+  }
+  void Wait() {
+    int expected = 1;
+    if (state.compare_exchange_strong(expected, 2)) {
+      g_queue->waitForCommandFence(fence.get());
+      state = 0;
+      state.notify_all();
+      return;
+    }
+    while (expected == 2) {  // (the other thread's wait: until it's done)
+      state.wait(2);
+      expected = state.load();
+    }
+  }
+};
+
 class Presenter {
  public:
   struct Item {
@@ -1714,7 +1740,7 @@ class Presenter {
     RenderCommandSemaphore* semaphore;
     int64_t atNs;
     uint64_t frame;                     // the game's frame it shows
-    RenderCommandFence* done = nullptr;  // its drawing's (a picture between)
+    PictureFence* done = nullptr;        // its drawing's (a picture between)
     int64_t inputNs = 0;                 // the frame's pad read (NG2_LATENCY_LOG)
     uint8_t order = 0;                   // 1: the frame's first picture, 2: its own, 3: both
     bool timed = false;                  // a slow screen's: by the clock always
@@ -1814,7 +1840,7 @@ class Presenter {
         return v && v[0] && v[0] != '0';
       }();
       if (item.done && !exclusive) {
-        g_queue->waitForCommandFence(item.done);
+        item.done->Wait();
       }
       // Exclusive full screen: the display flips one picture a refresh from
       // its queue itself, so each goes at once (a timer that let the queue
@@ -5644,7 +5670,7 @@ void Present(HostTexture* frontBuffer) {
     // lists recorded at once raced on them, for wrong barriers), before
     // waiting for the presenter to have room.
     static std::unique_ptr<RenderCommandList> interpLists[NUM_FRAMES][kMaxPictures - 1];
-    static std::unique_ptr<RenderCommandFence> interpFences[NUM_FRAMES][kMaxPictures - 1];
+    static PictureFence interpFences[NUM_FRAMES][kMaxPictures - 1];
     size_t recorded = 0;
     if (g_swapChainValid && interp) {
       recorded = std::min<size_t>(interp->phases.size(), kMaxPictures - 1);
@@ -5660,8 +5686,9 @@ void Present(HostTexture* frontBuffer) {
         if (!interpAcquire[frame][k]) {
           interpAcquire[frame][k] = g_device->createCommandSemaphore();
           interpLists[frame][k] = g_queue->createCommandList();
-          interpFences[frame][k] = g_device->createCommandFence();
+          interpFences[frame][k].fence = g_device->createCommandFence();
         }
+        interpFences[frame][k].Wait();  // (its last drawing done: the list is free)
         interpLists[frame][k]->begin();
       }
       for (size_t k = 0; k < recorded; k++) {
@@ -5702,7 +5729,7 @@ void Present(HostTexture* frontBuffer) {
       }
     };
     RenderCommandSemaphore* signalSemaphores[kMaxPictures] = {};
-    RenderCommandFence* doneFences[kMaxPictures] = {};
+    PictureFence* doneFences[kMaxPictures] = {};
     if (g_swapChainValid && interp) {
       if (prologue && PrologueMode() == 2) {
         // (the frame's submit runs it too: copies of the same memory)
@@ -5728,10 +5755,11 @@ void Present(HostTexture* frontBuffer) {
         RenderCommandSemaphore* wait = semaphore.get();
         RenderCommandSemaphore* signal = g_renderSemaphores[index].get();
         const RenderCommandList* lists[] = {interpList.get()};
-        g_queue->executeCommandLists(lists, 1, &wait, 1, &signal, 1, fence.get());
+        g_queue->executeCommandLists(lists, 1, &wait, 1, &signal, 1, fence.fence.get());
+        fence.Submitted();
         indices[pictures] = index;
         signalSemaphores[pictures] = signal;
-        doneFences[pictures] = fence.get();
+        doneFences[pictures] = &fence;
         pictures++;
       }
       for (; k < recorded; k++) {
