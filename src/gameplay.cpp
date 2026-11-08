@@ -101,9 +101,12 @@ bool SkipIntro() {
 
 }  // namespace ng2::gameplay
 
+void Ng2BeforeInputRead();  // frame_wait.cpp (NG2_LATE_INPUT)
+
 // The input update, once a frame: the pads read, the scripts still to run.
 REX_EXTERN(__imp__sub_822F2E38);
 REX_HOOK_RAW(sub_822F2E38) {
+  Ng2BeforeInputRead();
   PutBack();
   __imp__sub_822F2E38(ctx, base);
   ng2::video::NoteInputRead();
