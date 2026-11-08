@@ -157,6 +157,12 @@ enum : uint32_t {
 enum : uint32_t { SAMPLER_LINEAR_CLAMP, SAMPLER_FIRST_FREE };
 
 // A host texture with the layout it was last transitioned to.
+// The title menu's RECOMP SETTINGS label (menu_label.cpp) and the menu
+// atlas's palette this frame, which it's drawn with.
+uint32_t g_menuLabelBase = 0;
+uint32_t g_menuAtlasPalette = 0;
+uint64_t g_menuAtlasPaletteFrame = ~0ull;
+
 struct HostTexture {
   std::unique_ptr<RenderTexture> texture;
   RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
@@ -2798,11 +2804,14 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
           EnglishAtlasMissing();
         }
       }
-      if (info.format == RenderFormat::R8_UNORM &&
-          RewriteMenuLabel(level.width, level.height, upload.data, &labelRows) ==
-              LabelResult::kRetry &&
-          retry) {
-        *retry = true;
+      if (info.format == RenderFormat::R8_UNORM) {
+        LabelResult result = RewriteMenuLabel(level.width, level.height, upload.data, &labelRows);
+        if (result == LabelResult::kRetry && retry) {
+          *retry = true;
+        }
+        if (result == LabelResult::kRewritten && level.height == labelRows) {
+          g_menuLabelBase = uint32_t(fetch.base_address) << 12;  // the label alone, ours
+        }
       }
     } else {
       CopyLevel(fetch, info, level, mips.data(), mips.size(), upload.data);
@@ -4080,6 +4089,7 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
   bool widenHeader = false;  // the Options header, ours: a wider picture
   bool movieQuad = false;    // samples a movie's frame (movie.h)
   uint32_t textureSlots = vs->entry->textureSlotMask | (ps ? ps->entry->textureSlotMask : 0);
+  uint32_t indexBase = 0, indexWidth = 0, indexHeight = 0;  // slot 0's, an 8-bit picture
   for (uint32_t slot = 0; slot < 32; slot++) {
     if (!(textureSlots & (1u << slot))) {
       continue;
@@ -4094,6 +4104,10 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
       dwords[i] = guest::Load32(device + 0x480 + slot * 24 + i * 4);
     }
     uint32_t descriptor = GetTexture(fetch);
+    if (slot == 0 && fetch.format == xenos::TextureFormat::k_8) {
+      indexBase = uint32_t(fetch.base_address) << 12;
+      indexWidth = fetch.size_2d.width + 1, indexHeight = fetch.size_2d.height + 1;
+    }
     movieQuad |= inlineData && movie::IsFrameTexture(uint32_t(fetch.base_address) << 12);
     widenHeader |= (uint32_t(fetch.base_address) << 12) == g_menuHeader.base &&
                    g_menuHeader.widthScale != 1.0f;
@@ -4119,6 +4133,19 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
       shared.textureIndices[3][slot] = descriptor;  // 1D (sampled as Nx1 2D)
       shared.samplerIndices[slot] = GetSampler(fetch);
     }
+  }
+  // The title menu's labels are 8-bit pictures looked up in a 256x1 palette
+  // (slot 1). RECOMP SETTINGS, ours in place of the Marketplace label, is made
+  // of the menu atlas's letters, so it takes the atlas's palette, drawn
+  // before it in the frame: with the label's own, whose alphas differ, its
+  // glow came out as a dark speckled box (#66).
+  if (indexWidth == 520 && indexHeight == 990 && (textureSlots & 2)) {
+    g_menuAtlasPalette = shared.textureIndices[0][1];
+    g_menuAtlasPaletteFrame = g_frameCount;
+  } else if (indexBase && indexBase == g_menuLabelBase && (textureSlots & 2) &&
+             g_menuAtlasPalette && g_menuAtlasPaletteFrame == g_frameCount) {
+    shared.textureIndices[0][1] = g_menuAtlasPalette;
+    shared.textureIndices[3][1] = g_menuAtlasPalette;
   }
   // The header is a quad of inline vertices (position first) made each
   // frame: wider by as much as the picture, from its left edge.

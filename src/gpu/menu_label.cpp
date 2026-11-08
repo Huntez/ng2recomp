@@ -196,6 +196,31 @@ std::vector<int> FaceDistance(uint32_t band, int begin, int end, int x0, int x1)
   return distance;
 }
 
+// The atlas's halo around its letters by distance from the face (its median),
+// and its lowest value (below: the outline and shadow).
+constexpr uint8_t kHaloBase = 0x5d;
+constexpr uint8_t kHalo[] = {0x66, 0x66, 0x62, 0x60, 0x5e, 0x5d, 0x5d, 0x5d, 0x5d, 0x5d};
+
+// Squared distance (up to 10, else more) from each pixel of a label to its
+// nearest face.
+std::vector<int> FaceDistanceIn(const uint8_t* pixels) {
+  std::vector<int> distance(size_t(kWidth) * kBand, 101);
+  for (int fy = 0; fy < int(kBand); fy++) {
+    for (int fx = 0; fx < int(kWidth); fx++) {
+      if (!IsFace(pixels[fy * kWidth + fx])) {
+        continue;
+      }
+      for (int y = std::max(0, fy - 10); y < std::min(int(kBand), fy + 11); y++) {
+        for (int x = std::max(0, fx - 10); x < std::min(int(kWidth), fx + 11); x++) {
+          int& d = distance[size_t(y) * kWidth + x];
+          d = std::min(d, (x - fx) * (x - fx) + (y - fy) * (y - fy));
+        }
+      }
+    }
+  }
+  return distance;
+}
+
 // A label into pixels (kWidth x kBand), false if a letter is missing: its
 // words as the atlas has them where it does, else letter by letter.
 bool Compose(std::string_view text, uint8_t* pixels) {
@@ -228,10 +253,10 @@ bool Compose(std::string_view text, uint8_t* pixels) {
     return false;
   }
   // Each letter brings its surroundings (outline, shadow, glow) up to
-  // kReach from its face, where they're nearer its face than its source
-  // word's other letters'; where two placed letters' surroundings meet, the
-  // nearer face's wins. Cut at fixed columns instead, each letter kept its
-  // own word's shadow in a box (#66).
+  // kReach from its face, but not its source word's other letters' faces,
+  // nor their shadow past 5 pixels from its own face; where two placed
+  // letters' surroundings meet, the nearer face's wins. Cut at fixed columns
+  // instead, each letter kept its own word's shadow in a box (#66).
   std::vector<int> best(kWidth * kBand, kReach * kReach + 1);
   std::memset(pixels, kClear, kWidth * kBand);
   int x = int(kWidth - width) / 2;
@@ -252,17 +277,39 @@ bool Compose(std::string_view text, uint8_t* pixels) {
         size_t i = size_t(y) * (x1 - x0) + (sx - x0);
         int d = own[i];
         int ox = x + sx - begin;
-        if (d > kReach * kReach || d > left[i] || d > right[i] || ox < 0 || ox >= int(kWidth)) {
+        uint8_t v = source[y * kWidth + sx];
+        bool theirs = d > left[i] || d > right[i];
+        bool shadow = v != kClear && v != kPlate && v < kHaloBase;
+        if (d > kReach * kReach || (theirs && (IsFace(v) || (shadow && d > 25))) || ox < 0 ||
+            ox >= int(kWidth)) {
           continue;
         }
         size_t o = size_t(y) * kWidth + ox;
         if (d < best[o]) {
           best[o] = d;
-          pixels[o] = source[y * kWidth + sx];
+          pixels[o] = v;
         }
       }
     }
     x += end - begin;
+  }
+  // The halo follows the letters as the atlas's does: left empty near them,
+  // the atlas's halo at that distance (its words have no plate pixels within
+  // 5 of a face); past 9, the plate (a halo out to the plate's edge drew a
+  // dark box around the label).
+  auto faces = FaceDistanceIn(pixels);
+  for (size_t i = 0; i < size_t(kWidth) * kBand; i++) {
+    uint8_t& v = pixels[i];
+    bool empty = v == kClear || v == kPlate;
+    bool halo = v >= kHaloBase && !IsFace(v);
+    if (faces[i] > 81) {
+      if (halo) {
+        v = kPlate;
+      }
+    } else if (empty) {
+      int distance = int(std::lround(std::sqrt(double(faces[i]))));
+      v = kHalo[std::min(distance, 9)];
+    }
   }
   // One plate behind it all, as the atlas's: the letters' box and 4 to 5
   // pixels more.
