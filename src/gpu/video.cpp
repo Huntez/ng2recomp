@@ -5486,7 +5486,21 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       }
     }
     g.borrowed += borrowedDraws;
-    for (uint32_t k = 0; k < steps; k++) {
+    // Each picture on its own thread (they share nothing but the uploads,
+    // taken under a lock): a crowd's 3 ms of constants in about one picture's
+    // time. The first is this thread's, and counts the registers.
+    // NG2_INTERP_PARALLEL=0: one after another.
+    static const bool parallelPictures = [] {
+      const char* v = std::getenv("NG2_INTERP_PARALLEL");
+      return !v || v[0] != '0';
+    }();
+    std::mutex uploadLock;
+    auto LockedAllocate = [&](uint64_t size) {
+      std::lock_guard lock(uploadLock);
+      return Allocate(size);
+    };
+    auto picture = [&](uint32_t k) {
+      auto Allocate = LockedAllocate;
       float t = frames->paced ? frames->fractions[k] : float(k + 1) / float(steps + 1);
       // NG2_INTERP_DEBUG_T=<t>: every picture between at that point (-5: five frames back, to see them).
       static const char* debugT = std::getenv("NG2_INTERP_DEBUG_T");
@@ -5579,6 +5593,20 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           std::memcpy(out + d.registers[r] * 4, v, sizeof(v));  // (write-combined: written once)
         }
         phase[i][0] = upload.address;
+      }
+    };
+    if (parallelPictures && steps > 1 && submitted >= 200) {
+      std::vector<std::future<void>> others;
+      for (uint32_t k = 1; k < steps; k++) {
+        others.push_back(std::async(std::launch::async, picture, k));
+      }
+      picture(0);
+      for (auto& other : others) {
+        other.get();
+      }
+    } else {
+      for (uint32_t k = 0; k < steps; k++) {
+        picture(k);
       }
     }
     // F9: every draw of this frame and the next two, what it was matched with
