@@ -87,11 +87,11 @@ devices, and none of the player's settings or saves.
   sets the headless display's rate.
 - `NG2_RENDER_THREAD=0`: Vulkan commands, submits and presents on the game's render thread again
   instead of the "Render Commands" thread (for comparisons).
-- `NG2_EXCLUSIVE=1` (Windows): the swapchain takes the display (VK_EXT_full_screen_exclusive), so its
-  presents are flipped by the display instead of composed by DWM, which drops pictures at high refresh
-  rates. Needs `fullscreen` and `exclusive_fullscreen` on in ng2.toml; `2` leaves it to the driver.
-  Those two on (Window Mode: Fullscreen) turn it on by themselves at start; `NG2_EXCLUSIVE=0` keeps it
-  off.
+- Exclusive full screen (Windows): with Frame Interpolation on and Window Mode Fullscreen (`fullscreen`
+  and `exclusive_fullscreen`), the swapchain takes the display (VK_EXT_full_screen_exclusive, plume
+  patches 0017 and 0020), so its presents are flipped by the display instead of composed by DWM, which
+  drops pictures at high refresh rates; decided again when either changes. `NG2_EXCLUSIVE=1` takes it
+  always, `2` leaves it to the driver, `0` never.
 - Frame Interpolation (RECOMP SETTINGS, Display; `frame_interpolation` 0 off, 1 a picture each refresh,
   2 each second, each one below 120 Hz, 3 2x: one picture between the game's frames; experimental,
   off by default; switched live), or `NG2_INTERP=1`/`0` over it: each frame's draws
@@ -99,7 +99,7 @@ devices, and none of the player's settings or saves.
   display, as far along as when it is shown (`NG2_INTERP_REFRESH=<Hz>`: paced as for that display, for tests).
   Draws are matched by mesh, then by shaders and constants; stats every 600 frames. When building the pictures
   takes the game below 60 (a big fight on a slow CPU) it drops to half rate, then pauses them for a while.
-  Best with `NG2_EXCLUSIVE=1`. `NG2_INTERP_DEBUG=1` leaves out the draws without their own match.
+  Best in Window Mode Fullscreen (exclusive). `NG2_INTERP_DEBUG=1` leaves out the draws without their own match.
 - `--log_slow_reads=<ms>`: log game file reads that take at least that long (thread, size, file).
   `--async_file_reads=false`: reads the game asks to be asynchronous block its thread again.
   `--test_read_delay_us_per_mb=12000`: slow every read to about SD card speed, to measure loading

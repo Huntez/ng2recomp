@@ -2046,9 +2046,45 @@ void BeginFrame() {
 
 void SwitchInterp();
 
+// Exclusive full screen (the swapchain takes the display, its presents
+// flipped by it instead of composed by DWM, which spoils the pictures'
+// pacing): only for frame interpolation, in Window Mode Fullscreen
+// (fullscreen and exclusive_fullscreen). NG2_EXCLUSIVE (0, 1, 2: left to the
+// driver) over it. Decided again between frames: the menu changes both.
+int ExclusiveMode() {
+#if defined(_WIN32)
+  static const char* forced = std::getenv("NG2_EXCLUSIVE");
+  if (forced && forced[0]) {
+    return std::clamp(std::atoi(forced), 0, 2);
+  }
+  return InterpEnabled() && rex::cvar::Query<bool>("fullscreen") &&
+                 rex::cvar::Query<bool>("exclusive_fullscreen")
+             ? 1
+             : 0;
+#else
+  return 0;
+#endif
+}
+int g_exclusiveMode = 0;  // the swapchain's (game thread)
+// The swapchain's mode set to ExclusiveMode's; true if it changed (made
+// again at the next resize).
+bool UpdateExclusiveMode() {
+  int mode = ExclusiveMode();
+  if (!g_swapChain || mode == g_exclusiveMode) {
+    return false;
+  }
+  REXLOG_INFO("video: exclusive full screen {}", mode ? "asked for" : "off");
+  g_exclusiveMode = mode;
+  g_swapChain->setFullScreenExclusive(mode);
+  return true;
+}
+
 RenderCommandList* CommandList() {
   if (!g_recording) {
     SwitchInterp();
+    if (UpdateExclusiveMode()) {
+      g_resizeRequested = true;  // (Borderless from Fullscreen: no resize of its own)
+    }
     if (g_resizeRequested.load()) {
       WaitForGPU();  // (queued presents may raise it again: cleared after)
       g_resizeRequested.store(false);
@@ -4288,6 +4324,7 @@ void SwitchInterp() {
   WaitInterpBuild();
   WaitForGPU();
   ResetInterp(wanted);
+  UpdateExclusiveMode();  // (with interpolation only: made again below)
   if (g_frame >= FrameSlots()) {
     g_frame = 0;
   }
@@ -6204,17 +6241,6 @@ int64_t DisplayClockNow() {
 
 bool CreateHostDevice() {
   std::lock_guard lock(g_mutex);
-#if defined(_WIN32)
-  // Window Mode Fullscreen (fullscreen and exclusive_fullscreen): the
-  // swapchain takes the display too (VK_EXT_full_screen_exclusive, plume patch
-  // 0016), its presents flipped by the display instead of composed by DWM,
-  // which spoils frame interpolation's pacing. NG2_EXCLUSIVE set says otherwise
-  // (0: not). As the game starts: a change in the menu at the next start.
-  if (!std::getenv("NG2_EXCLUSIVE") && rex::cvar::Query<bool>("fullscreen") &&
-      rex::cvar::Query<bool>("exclusive_fullscreen")) {
-    _putenv_s("NG2_EXCLUSIVE", "1");
-  }
-#endif
   g_resolutionScale = uint32_t(std::clamp(REXCVAR_GET(render_scale), 1, 8));
   g_antialiasing = AntialiasingSetting();
   RenderWindow renderWindow{};
@@ -6252,10 +6278,8 @@ bool CreateHostDevice() {
   }
 
   g_swapChain = g_queue->createSwapChain(renderWindow, SwapChainImages(), BACKBUFFER_FORMAT, 1);
-  // NG2_EXCLUSIVE: 1 the display taken, 2 left to the driver (made again with it).
-  if (const char* v = std::getenv("NG2_EXCLUSIVE"); g_swapChain && v && std::atoi(v) > 0) {
-    g_swapChain->setFullScreenExclusive(std::atoi(v));
-    g_swapChain->resize();
+  if (UpdateExclusiveMode()) {
+    g_swapChain->resize();  // (made again with it)
   }
   g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
   g_presentDrainCheck.store(g_swapChain != nullptr);
