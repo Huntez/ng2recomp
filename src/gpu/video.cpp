@@ -4527,7 +4527,10 @@ bool InterpPacedByDisplay() {
   return paced;
 }
 int64_t InterpRefreshNs();
-uint32_t InterpDivider() {
+// Half rate set by the autopause (2) while the pictures cost the game frames:
+// half the pictures' GPU work, before pausing them altogether.
+std::atomic<uint32_t> g_interpAutoDivider{1};
+uint32_t InterpSetDivider() {
   const char* v = std::getenv("NG2_INTERP_DIVIDER");
   if (v) {
     return std::clamp<uint32_t>(uint32_t(std::atoi(v)), 1u, 6u);
@@ -4544,6 +4547,9 @@ uint32_t InterpDivider() {
     return 2;
   }
   return std::clamp<uint32_t>(uint32_t(1e9 / 60.0 / double(refresh) + 0.05), 1u, 2u);
+}
+uint32_t InterpDivider() {
+  return std::max(InterpSetDivider(), g_interpAutoDivider.load());
 }
 // The display's refresh: measured (VK_KHR_present_wait) when steady, else
 // the display mode's; 0 not known.
@@ -4640,6 +4646,7 @@ void SwitchInterp() {
   g_interp.baseNs = g_interp.gridNs = g_interp.lastFullNs = g_interp.lastPresentNs = 0;
   g_interp.slowRun = 0;
   g_interp.slow = false;
+  g_interpAutoDivider = 1;
   g_interpCapture.current.clear();
   g_interpCapture.palettes.clear();
   g_interpCapture.paletteIndex.clear();
@@ -4832,6 +4839,123 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       g_interp.lastBuildNs = ns;
     }
   } timed{startNs};
+  // Paused when the pictures cost the game its 60 (the Steam Deck in a big
+  // fight: 7-12 ms of building a frame, the game at 30): the frames shown as
+  // they are for a while (1.5 s, longer each time it comes back too soon), then
+  // tried again. Whether they cost it is seen in the pause: a game no faster
+  // without them (a cutscene at 30 of its own) isn't paused again while it
+  // runs at that rate. NG2_INTERP_AUTOPAUSE=0: never.
+  {
+    static const bool autoPause = [] {
+      const char* v = std::getenv("NG2_INTERP_AUTOPAUSE");
+      return !v || v[0] != '0';
+    }();
+    static int64_t pausedUntil = 0, holdNs = 0, resumedNs = 0, lastNs = 0;
+    static int64_t halvedNs = 0, halfHoldNs = 0, fullAgainNs = 0;  // (half rate)
+    static double buildAvg = 0, gapAvg = 1e9 / 60.0, gapFast = 1e9 / 60.0, gapBefore = 0, ownRate = 0,
+                  pausedSum = 0;
+    static uint32_t behind = 0, pausedCount = 0, sharpRun = 0;
+    int64_t gap = lastNs ? presentNs - lastNs : 0;
+    lastNs = presentNs;
+    const bool gapValid = gap > 0 && gap < 150'000'000;
+    if (gapValid) {
+      gapAvg += (double(gap) - gapAvg) * 0.1;
+      gapFast += (double(gap) - gapFast) * 0.3;
+    }
+    if (pausedUntil) {
+      if (gapValid) {
+        pausedSum += double(gap);
+        pausedCount++;
+      }
+      if (presentNs < pausedUntil) {
+        g.previous.clear();
+        g.older.clear();
+        g.current.clear();
+        g.previousPalettes.clear();
+        g.palettes.clear();
+        g.paletteIndex.clear();
+        g.keptFor = 0;
+        g.lastFullNs = g.lastPresentNs = g.baseNs = g.gridNs = 0;
+        g.slowRun = 0;
+        g.slow = false;
+        g.lastBuildNs = 0;
+        return nullptr;
+      }
+      pausedUntil = 0;
+      resumedNs = presentNs;
+      behind = 0;
+      buildAvg = 0;
+      double without = pausedCount ? pausedSum / pausedCount : 0;
+      // (a tenth faster without them is not worth the 60 on the screen: a
+      // heavy room at 53 alone, 50 with the pictures at half rate)
+      if (pausedCount >= 10 && without > gapBefore * 0.9) {
+        ownRate = gapBefore;  // (no faster without them: its own rate)
+        holdNs = 0;
+        REXLOG_INFO("video: interp: on again: the game is at {:.0f} fps without the pictures too", 1e9 / without);
+      } else {
+        REXLOG_INFO("video: interp: on again ({:.0f} fps without the pictures, {:.0f} with)",
+                    without > 0 ? 1e9 / without : 0.0, 1e9 / gapBefore);
+      }
+    } else if (autoPause && !g_interpDumping) {
+      buildAvg += (double(g.lastBuildNs) - buildAvg) * 0.1;
+      if (ownRate && gapAvg < 17'000'000) {
+        ownRate = 0;  // (back at 60)
+      }
+      // Half rate back to full once the game is at 60 again for the hold
+      // (longer each time full rate costs it frames again soon after).
+      if (g_interpAutoDivider.load() > 1 && presentNs - halvedNs > halfHoldNs && gapAvg < 17'000'000) {
+        g_interpAutoDivider = 1;
+        fullAgainNs = presentNs;
+        behind = 0;
+        REXLOG_INFO("video: interp: full rate again");
+      }
+      // On the average, not each frame's: at 55 a slow frame of 33 ms comes
+      // once in ten among ones of 16.7, which each frame's count never added up.
+      // Whatever the build takes: the pictures' cost can be the GPU's (a heavy
+      // pass at 4K, 10 ms a frame and four times that with the pictures: the
+      // game at 47 for 40 s, never paused while the build took under 3 ms).
+      // A game no faster without them is found in the pause (ownRate).
+      const double late = ownRate ? ownRate * 1.08 : 17'500'000.0;
+      if (gapValid && gapAvg > late) {
+        behind++;
+      } else if (gapValid && gapAvg < (ownRate ? ownRate * 1.02 : 17'000'000.0)) {
+        behind = behind > 2 ? behind - 2 : 0;
+      }
+      // A sharp drop (under 45 fps, or well under the game's own rate, for 6
+      // frames in a row on a quick average): at once, not after the 45 above
+      // (a dip to 72 on the screen came and went before they added up).
+      const double sharp = ownRate ? ownRate * 1.3 : 1e9 / 45.0;
+      sharpRun = gapValid && gapFast > sharp ? sharpRun + 1 : 0;
+      // First half rate (at 120 Hz and up: 60 pictures a second or more
+      // still), then the pause: the step from 180 to 60 on the screen was
+      // what showed (a heavy room: the game at 45 with the pictures, 53 without).
+      const int64_t refresh = InterpRefreshNs();
+      const bool canHalve = InterpPacedByDisplay() && InterpDivider() < 2 && refresh > 0 && refresh < 8'500'000;
+      if ((behind >= 45 || sharpRun >= 6) && canHalve) {
+        sharpRun = 0;
+        behind = 0;
+        halfHoldNs = fullAgainNs && presentNs - fullAgainNs < 10'000'000'000
+                         ? std::min<int64_t>(halfHoldNs * 2, 60'000'000'000)
+                         : 2'000'000'000;
+        g_interpAutoDivider = 2;
+        halvedNs = presentNs;
+        REXLOG_INFO("video: interp: half rate for {:.0f} s at least (building a frame {:.1f} ms, the game at {:.0f} fps)",
+                    double(halfHoldNs) / 1e9, buildAvg / 1e6, 1e9 / gapAvg);
+      } else if (behind >= 45 || sharpRun >= 6) {
+        sharpRun = 0;
+        holdNs = resumedNs && holdNs && presentNs - resumedNs < 10'000'000'000
+                     ? std::min<int64_t>(holdNs * 2, 24'000'000'000)
+                     : 1'500'000'000;
+        pausedUntil = presentNs + holdNs;
+        gapBefore = gapAvg;
+        pausedSum = 0;
+        pausedCount = 0;
+        g.paused++;
+        REXLOG_INFO("video: interp: paused for {:.0f} s (building a frame {:.1f} ms, the game at {:.0f} fps)",
+                    double(holdNs) / 1e9, buildAvg / 1e6, 1e9 / gapAvg);
+      }
+    }
+  }
   g.drawsSeen += g.current.size();
   g.drawsWorst = std::max<uint64_t>(g.drawsWorst, g.current.size());
   std::shared_ptr<InterpFrames> frames;
