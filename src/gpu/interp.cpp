@@ -87,7 +87,7 @@ struct InterpState {
   uint64_t drawsSeen = 0, drawsWorst = 0;
   uint64_t frames = 0, interpolated = 0, draws = 0, matched = 0, snapped = 0, registers = 0;
   uint64_t fromOlder = 0;  // things not drawn the frame before, taken from the one before it
-  uint64_t borrowed = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0, psDraws = 0, timeStill = 0, paused = 0;
+  uint64_t borrowed = 0, byMesh = 0, cuts = 0, jumped = 0, partial = 0, psDraws = 0, paused = 0;
   int64_t lastBuildNs = 0;  // the last frame's build
   uint32_t keptFor = 0;  // frames the last full frame was kept over (partial ones)
   int64_t lastFullNs = 0;  // the last full frame's present (game thread's clock)
@@ -1278,35 +1278,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       for (size_t i = 0; i < g.current.size(); i++) {
         auto& d = g.current[i];
         phase[i] = d.pushConstants;
-        // A pass into a small target given the frame's time (1/60: the eye's
-        // adaptation to the scene's brightness, kept in a texture from frame to
-        // frame): with no time in the pictures between, or each would adapt
-        // once more and the brightness jump from one to the next.
-        bool timeStill = false;
-        if (d.targetWidth * d.targetHeight <= 64 * 64) {
-          for (float v : d.psConstants) {
-            if (std::fabs(v - 1.0f / 60.0f) < 1e-6f || std::fabs(v - 1.0f / 30.0f) < 1e-6f) {
-              timeStill = true;
-              break;
-            }
-          }
-        }
-        if (timeStill && d.submitted) {
-          Upload upload = Allocate((d.psRegisters.back() + 1u) * 16u);
-          auto* out = reinterpret_cast<float*>(upload.data);
-          for (size_t r = 0; r < d.psRegisters.size(); r++) {
-            float v[4];
-            for (uint32_t c = 0; c < 4; c++) {
-              float y = d.psConstants[r * 4 + c];
-              v[c] = (std::fabs(y - 1.0f / 60.0f) < 1e-6f || std::fabs(y - 1.0f / 30.0f) < 1e-6f) ? 0.0f : y;
-            }
-            std::memcpy(out + d.psRegisters[r] * 4, v, sizeof(v));  // (write-combined: written once)
-          }
-          phase[i][1] = upload.address;
-          if (k == 0) {
-            g.timeStill++;
-          }
-        } else if (!psLerp[i].empty()) {
+        if (!psLerp[i].empty()) {
           auto& before = g.previous[lerpMatch[i]];
           Upload upload = Allocate((d.psRegisters.back() + 1u) * 16u);
           auto* out = reinterpret_cast<float*>(upload.data);
@@ -1570,9 +1542,9 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
                 g.cuts, 100.0 * double(g.byMesh) / double(std::max<uint64_t>(g.draws, 1)), g.jumped, g.fromOlder);
     g.fromOlder = 0;
     REXLOG_INFO("video: interp: {} partial frames (the last full one kept), {:.1f}% of draws with pixel "
-                "shader constants part of the way, {} passes given no time", g.partial,
-                100.0 * double(g.psDraws) / double(std::max<uint64_t>(g.draws, 1)), g.timeStill);
-    g.borrowed = g.cuts = g.byMesh = g.jumped = g.partial = g.psDraws = g.timeStill = 0;
+                "shader constants part of the way", g.partial,
+                100.0 * double(g.psDraws) / double(std::max<uint64_t>(g.draws, 1)));
+    g.borrowed = g.cuts = g.byMesh = g.jumped = g.partial = g.psDraws = 0;
     REXLOG_INFO("video: interp: {:.1f} bone palettes a frame part of the way ({:.0f} KB), {:.2f} ms "
                 "a frame matching and mixing",
                 double(g.bonesLerped) / 600.0, double(g.bonesBytes) / 600.0 / 1024.0,
