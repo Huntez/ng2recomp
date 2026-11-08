@@ -1499,6 +1499,8 @@ void NoteFrameWait(int64_t ns) {
   }
 }
 
+void ApplyResolveReadbacks(uint32_t frame);
+
 void WaitForFrame(uint32_t frame) {
   if (g_commandListPending[frame]) {
     StageTimer timer(Stage::kWait);
@@ -1513,6 +1515,7 @@ void WaitForFrame(uint32_t frame) {
     }
     g_queue->waitForCommandFence(g_commandFences[frame].get());
     g_commandListPending[frame] = false;
+    ApplyResolveReadbacks(frame);
     if (UnderGamescope()) {
       NoteFrameWait(SteadyNs() - waitStart);
     }
@@ -5257,6 +5260,324 @@ void SetPipelineListPath(const std::filesystem::path& path) {
 
 void StopDrawWorker();
 
+namespace {
+
+// Resolves the CPU reads ------------------------------------------------------
+// The game decides some things from pictures it resolves to small textures and
+// then reads on the CPU: a lens flare's visibility is 3600 points drawn into a
+// 3x3 target with additive blending (each adds where the scene's depth leaves
+// it in view), resolved, and summed by the CPU (#65). Resolves only write host
+// textures, so small resolve destinations are also copied into a readback
+// buffer and written into guest memory, in the texture's own layout (tiling,
+// endianness), once the GPU has finished the frame: at the wait for the frame
+// slot, two frames later. At a render scale above 1 a guest texel covers
+// scale x scale host texels: float ones are added (counts of points, one host
+// pixel each), normalized ones averaged (pictures). The resolved texture's
+// memory hash is refreshed so the GPU keeps reading the host texture.
+// NG2_RESOLVE_READBACK=0 turns this off.
+struct ResolveReadbackItem {
+  uint32_t address = 0;  // guest physical, the texture's base
+  xenos::xe_gpu_texture_fetch_t fetch{};
+  TextureFormatInfo info;
+  uint32_t width = 0, height = 0;  // guest texels
+  uint32_t scale = 1;
+  uint32_t rowWidth = 0;  // host texels a row of the readback spans
+  RenderFormat format = RenderFormat::UNKNOWN;
+  const RenderBuffer* buffer = nullptr;
+  uint64_t offset = 0;  // into the buffer
+};
+struct ResolveReadback {
+  std::unique_ptr<RenderBuffer> buffer;
+  std::vector<std::unique_ptr<RenderBuffer>> retired;  // outgrown this frame: still read by its copies
+  uint64_t capacity = 0, used = 0;
+  std::vector<ResolveReadbackItem> items;
+};
+ResolveReadback g_resolveReadbacks[NUM_FRAMES];
+constexpr uint32_t kReadbackTexels = 64 * 64;
+
+bool ResolveReadbackOn() {
+  static const bool on = !TestSwitch("NG2_RESOLVE_READBACK", "0");
+  return on;
+}
+
+float HalfToFloat(uint16_t h) {
+  uint32_t sign = uint32_t(h & 0x8000) << 16, exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF;
+  uint32_t bits;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      bits = sign;
+    } else {  // subnormal
+      exponent = 1;
+      while (!(mantissa & 0x400)) {
+        mantissa <<= 1;
+        exponent--;
+      }
+      mantissa &= 0x3FF;
+      bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+    }
+  } else if (exponent == 31) {
+    bits = sign | 0x7F800000 | (mantissa << 13);
+  } else {
+    bits = sign | ((exponent + 112) << 23) | (mantissa << 13);
+  }
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
+uint16_t FloatToHalf(float f) {
+  uint32_t bits;
+  std::memcpy(&bits, &f, 4);
+  uint32_t sign = (bits >> 16) & 0x8000;
+  int32_t exponent = int32_t((bits >> 23) & 0xFF) - 127 + 15;
+  uint32_t mantissa = bits & 0x7FFFFF;
+  if (((bits >> 23) & 0xFF) == 0xFF) {  // inf or NaN
+    return uint16_t(sign | 0x7C00 | (mantissa ? 0x200 : 0));
+  }
+  if (exponent >= 31) {
+    return uint16_t(sign | 0x7C00);  // too large: infinity
+  }
+  if (exponent <= 0) {
+    if (exponent < -10) {
+      return uint16_t(sign);
+    }
+    mantissa |= 0x800000;
+    uint32_t shift = uint32_t(14 - exponent);
+    uint32_t half = mantissa >> shift;
+    if ((mantissa >> (shift - 1)) & 1) {
+      half++;  // round half up
+    }
+    return uint16_t(sign | half);
+  }
+  uint32_t half = uint32_t(exponent << 10) | (mantissa >> 13);
+  if (mantissa & 0x1000) {
+    half++;  // round half up (may carry into the exponent, correctly)
+  }
+  return uint16_t(sign | half);
+}
+
+// One guest texel's bytes (before the endian swap) from its host texels.
+void CombineReadbackTexels(const ResolveReadbackItem& item, const uint8_t* data, uint32_t x,
+                           uint32_t y, uint8_t* out) {
+  const uint32_t bytes = item.info.bytesPerBlock, scale = item.scale;
+  auto at = [&](uint32_t hx, uint32_t hy) {
+    return data + item.offset + (uint64_t(hy) * item.rowWidth + hx) * bytes;
+  };
+  if (scale == 1) {
+    std::memcpy(out, at(x, y), bytes);
+    return;
+  }
+  const uint32_t count = scale * scale;
+  switch (item.format) {
+    case RenderFormat::R32_FLOAT:
+    case RenderFormat::R32G32_FLOAT:
+    case RenderFormat::R32G32B32A32_FLOAT: {
+      float sum[4] = {};
+      for (uint32_t sy = 0; sy < scale; sy++) {
+        for (uint32_t sx = 0; sx < scale; sx++) {
+          const uint8_t* texel = at(x * scale + sx, y * scale + sy);
+          for (uint32_t c = 0; c < bytes / 4; c++) {
+            float v;
+            std::memcpy(&v, texel + c * 4, 4);
+            sum[c] += v;
+          }
+        }
+      }
+      std::memcpy(out, sum, bytes);
+      return;
+    }
+    case RenderFormat::R16_FLOAT:
+    case RenderFormat::R16G16_FLOAT:
+    case RenderFormat::R16G16B16A16_FLOAT: {
+      float sum[4] = {};
+      for (uint32_t sy = 0; sy < scale; sy++) {
+        for (uint32_t sx = 0; sx < scale; sx++) {
+          const uint8_t* texel = at(x * scale + sx, y * scale + sy);
+          for (uint32_t c = 0; c < bytes / 2; c++) {
+            uint16_t h;
+            std::memcpy(&h, texel + c * 2, 2);
+            sum[c] += HalfToFloat(h);
+          }
+        }
+      }
+      for (uint32_t c = 0; c < bytes / 2; c++) {
+        uint16_t h = FloatToHalf(sum[c]);
+        std::memcpy(out + c * 2, &h, 2);
+      }
+      return;
+    }
+    case RenderFormat::R8_UNORM:
+    case RenderFormat::R8G8_UNORM:
+    case RenderFormat::R8G8B8A8_UNORM: {
+      for (uint32_t c = 0; c < bytes; c++) {
+        uint32_t sum = 0;
+        for (uint32_t sy = 0; sy < scale; sy++) {
+          for (uint32_t sx = 0; sx < scale; sx++) {
+            sum += at(x * scale + sx, y * scale + sy)[c];
+          }
+        }
+        out[c] = uint8_t((sum + count / 2) / count);
+      }
+      return;
+    }
+    case RenderFormat::R16_UNORM:
+    case RenderFormat::R16G16_UNORM:
+    case RenderFormat::R16G16B16A16_UNORM: {
+      for (uint32_t c = 0; c < bytes / 2; c++) {
+        uint32_t sum = 0;
+        for (uint32_t sy = 0; sy < scale; sy++) {
+          for (uint32_t sx = 0; sx < scale; sx++) {
+            uint16_t v;
+            std::memcpy(&v, at(x * scale + sx, y * scale + sy) + c * 2, 2);
+            sum += v;
+          }
+        }
+        uint16_t v = uint16_t((sum + count / 2) / count);
+        std::memcpy(out + c * 2, &v, 2);
+      }
+      return;
+    }
+    default:
+      std::memcpy(out, at(x * scale, y * scale), bytes);  // the first host texel
+      return;
+  }
+}
+
+// Records the copy of a small resolve destination into this frame's readback
+// buffer, to be written into guest memory when the frame is done.
+void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t& fetch,
+                          HostTexture& dest) {
+  if (!ResolveReadbackOn() || !dest.texture || dest.scale == 0) {
+    return;
+  }
+  uint32_t width = dest.width / dest.scale, height = dest.height / dest.scale;
+  if (!width || !height || uint64_t(width) * height > kReadbackTexels) {
+    return;
+  }
+  TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
+  // (a texel at least the endian swap's word: the swap is done per texel)
+  uint32_t swapWord = fetch.endianness == xenos::Endian::k8in16 ? 2
+                      : fetch.endianness == xenos::Endian::kNone ? 1 : 4;
+  if (info.format == RenderFormat::UNKNOWN || info.blockSize != 1 ||
+      info.bytesPerBlock != RenderFormatSize(dest.format) || info.bytesPerBlock > 16 ||
+      info.bytesPerBlock < swapWord) {
+    static std::unordered_set<uint32_t> reported;
+    if (reported.insert(uint32_t(fetch.format)).second) {
+      REXLOG_INFO("video: resolves to texture format {} aren't read back for the CPU",
+                  uint32_t(fetch.format));
+    }
+    return;
+  }
+  ResolveReadback& r = g_resolveReadbacks[g_frame];
+  uint32_t rowWidth = (dest.width + 63) & ~63u;
+  uint64_t size = uint64_t(rowWidth) * dest.height * info.bytesPerBlock;
+  if (size > (1u << 20)) {
+    return;  // (at a high render scale: the game's own values aren't that big)
+  }
+  uint64_t offset = (r.used + 511) & ~511ull;
+  if (!r.buffer || offset + size > r.capacity) {
+    // A bigger buffer: the old one stays until this frame's copies into it
+    // have been read (the copies recorded so far point at it).
+    uint64_t capacity = std::max<uint64_t>(offset + size, std::max<uint64_t>(r.capacity * 2, 64 << 10));
+    auto buffer = g_device->createBuffer(RenderBufferDesc::ReadbackBuffer(capacity));
+    if (!buffer) {
+      return;
+    }
+    if (r.buffer) {
+      r.retired.push_back(std::move(r.buffer));
+    }
+    r.buffer = std::move(buffer);
+    r.capacity = capacity;
+    offset = 0;
+  }
+  Transition(dest, RenderTextureLayout::COPY_SOURCE);
+  CommandList()->copyTextureRegion(
+      RenderTextureCopyLocation::PlacedFootprint(r.buffer.get(), dest.format, dest.width,
+                                                 dest.height, 1, rowWidth, offset),
+      RenderTextureCopyLocation::Subresource(dest.texture.get()));
+  ResolveReadbackItem item;
+  item.address = address, item.fetch = fetch, item.info = info;
+  item.width = width, item.height = height, item.scale = dest.scale, item.rowWidth = rowWidth;
+  item.format = dest.format, item.buffer = r.buffer.get(), item.offset = offset;
+  r.items.push_back(item);
+  r.used = offset + size;
+  static std::unordered_set<uint64_t> logged;
+  if (logged.insert(uint64_t(address) << 32 | width << 16 | height).second) {
+    REXLOG_INFO("video: resolve {}x{} texture format {} at {:#x} read back for the CPU", width,
+                height, uint32_t(fetch.format), address);
+  }
+}
+
+// Writes one read-back resolve into guest memory, in the texture's layout.
+void WriteResolveReadback(const ResolveReadbackItem& item, const uint8_t* data) {
+  const uint32_t bytes = item.info.bytesPerBlock;
+  TextureLayout layout = GetTextureLayout(item.fetch, item.info, item.width, item.height);
+  const LevelLayout& level = layout.levels[0];
+  if (uint64_t(item.address) + level.start + level.size > GUEST_MEMORY_SIZE) {
+    return;
+  }
+  // Not over memory the CPU has changed since the resolve (freed and reused,
+  // a texture loaded there): that is the game's now, and the resolved host
+  // texture is already stale.
+  if (auto it = g_resolvedMemory.find(item.address); it != g_resolvedMemory.end()) {
+    if (it->second.stale || ResolvedMemoryHash(item.address, it->second.size) != it->second.hash) {
+      return;
+    }
+  }
+  uint8_t* out = guest::Physical(item.address) + level.start;
+  uint32_t bppLog2 = uint32_t(std::countr_zero(bytes));
+  uint8_t texel[16];
+  for (uint32_t y = 0; y < item.height; y++) {
+    for (uint32_t x = 0; x < item.width; x++) {
+      CombineReadbackTexels(item, data, x, y, texel);
+      EndianSwap(texel, bytes, item.fetch.endianness);
+      int64_t offset;
+      if (item.fetch.tiled) {
+        offset = TiledOffset2D(int32_t(x + level.offsetX), int32_t(y + level.offsetY),
+                               level.pitchBlocks, bppLog2);
+      } else {
+        offset = (int64_t(y + level.offsetY) * level.pitchBlocks + (x + level.offsetX)) * bytes;
+      }
+      if (offset >= 0 && uint64_t(offset) + bytes <= level.size) {
+        std::memcpy(out + offset, texel, bytes);
+      }
+    }
+  }
+  // The CPU didn't write this memory: the resolved host texture stays current.
+  if (auto it = g_resolvedMemory.find(item.address); it != g_resolvedMemory.end()) {
+    it->second.hash = ResolvedMemoryHash(item.address, it->second.size);
+  }
+}
+
+// After the frame's fence: its read-back resolves into guest memory.
+void ApplyResolveReadbacks(uint32_t frame) {
+  ResolveReadback& r = g_resolveReadbacks[frame];
+  if (!r.items.empty()) {
+    const RenderBuffer* mapped = nullptr;
+    const uint8_t* data = nullptr;
+    for (const ResolveReadbackItem& item : r.items) {
+      if (item.buffer != mapped) {
+        if (data) {
+          const_cast<RenderBuffer*>(mapped)->unmap();
+        }
+        mapped = item.buffer;
+        data = static_cast<const uint8_t*>(const_cast<RenderBuffer*>(mapped)->map());
+      }
+      if (data) {
+        WriteResolveReadback(item, data);
+      }
+    }
+    if (data) {
+      const_cast<RenderBuffer*>(mapped)->unmap();
+    }
+    r.items.clear();
+  }
+  r.retired.clear();
+  r.used = 0;
+}
+
+}  // namespace
+
 void DestroyHostDevice() {
   StopDrawWorker();
   if (g_displayThread) {
@@ -5283,6 +5604,9 @@ void DestroyHostDevice() {
   g_textures.clear();
   for (auto& garbage : g_garbage) {
     garbage.clear();
+  }
+  for (auto& readback : g_resolveReadbacks) {
+    readback = ResolveReadback();
   }
   g_samplers.clear();
   for (auto& allocator : g_uploads) {
@@ -5535,6 +5859,13 @@ void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t d
               RenderTextureCopyLocation::Subresource(dest->texture.get()),
               RenderTextureCopyLocation::Subresource(target->texture.get()), dx, dy, 0, &box);
         }
+      }
+      // Small destinations wholly written go back to guest memory too, for
+      // the CPU (depth doesn't: its texture holds floats, not the 24_8 the
+      // CPU would read).
+      if (!depth && dx == 0 && dy == 0 && x2 - x1 == int32_t(dest->width) &&
+          y2 - y1 == int32_t(dest->height)) {
+        QueueResolveReadback(address, fetch, *dest);
       }
     }
   }
