@@ -1010,14 +1010,15 @@ bool TestNoBorder() {
   return on;
 }
 
-// NG2_TEST_EVEN_PRESENT=1 (#36, #46): a present that would follow the last
-// by less than 90% of a refresh waits until then. With a frame's work near a
+// Even presents (#36, #46; on by default since 0.5.58, NG2_TEST_EVEN_PRESENT=0
+// turns them off): a present that would follow the last by less than 90% of a
+// refresh waits until then. With a frame's work near a
 // refresh the game hands frames over in pairs (3 then 33 ms apart); this
 // spreads them out so the display's queue doesn't run dry between them, at up
 // to a frame of latency while it happens. The last part of the wait spins
 // (Windows' sleeps are whole milliseconds).
 void EvenOutPresent() {
-  static const bool on = TestSwitch("NG2_TEST_EVEN_PRESENT", "1");
+  static const bool on = !TestSwitch("NG2_TEST_EVEN_PRESENT", "0");
   // (with V-Sync on, FIFO or Mailbox: off or Adaptive, the game runs
   // uncapped and this would cap it near the refresh rate)
   int32_t mode = REXCVAR_GET(present_mode);

@@ -77,8 +77,8 @@ devices, and none of the player's settings or saves.
   scratch, instructions; VK_KHR_pipeline_executable_properties, plume patches 0011 and 0012: the driver feature is only enabled with it). On AMD the vertex
   stage is `ShaderProperties.gs`; `scratchMemUsageInBytes` above 0 there means spilled registers.
 - `NG2_PRESENT_GAPS=1`: the time between real presents (on the thread that makes them) each second.
-  Test switches for choppy play at a steady 60 (#36, #46): `NG2_TEST_EVEN_PRESENT=1` holds a present
-  until 90% of a refresh after the last (V-Sync FIFO or Mailbox only); `NG2_TEST_GAMESCOPE_AUTO=1` lets
+  Test switches for choppy play at a steady 60 (#36, #46): presents are held until 90% of a refresh
+  after the last (V-Sync FIFO or Mailbox only; on by default since 0.5.58, `NG2_TEST_EVEN_PRESENT=0` turns it off); `NG2_TEST_GAMESCOPE_AUTO=1` lets
   Frame Pacing Auto work under gamescope, where it otherwise acts as Timer (experimental: if gamescope
   reports a frame shown when it arrives, the lock can follow its own presents). At 60 fps the game's own
   frame limiter (sub_822F0BF8) doesn't run (its interval word is 0): the presents pace the game.
