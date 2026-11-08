@@ -329,7 +329,7 @@ How it works: [docs/renderer-plan.md](docs/renderer-plan.md) (the renderer),
 
 ## Support
 
-If you'd like to support the project: [ko-fi.com/gamboozino](https://ko-fi.com/gamboozino)
+If you'd like to support the project: [GitHub Sponsors](https://github.com/sponsors/gamboozino) or [ko-fi.com/gamboozino](https://ko-fi.com/gamboozino)
 
 ## Credits
 
