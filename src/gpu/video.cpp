@@ -1312,6 +1312,126 @@ thread_local const std::vector<std::array<uint64_t, 3>>* g_replayConstants = nul
 // runs again (g_replayCopies, by palette; ref null = as it was).
 int32_t g_copyTag = -1;
 thread_local const std::vector<RenderBufferReference>* g_replayCopies = nullptr;
+// Draws that export to memory (memexport) aren't run again for the pictures:
+// what they write is the frame's, once (g_drawMemExport: the next draw is one).
+bool g_drawMemExport = false;
+
+// What a frame carries from the last one in textures: a resolved texture
+// read in the frame before anything is resolved to it (the eye's adaptation
+// to the brightness, afterimages and glows mixed with the last frame's).
+// Each picture between runs the whole frame again, so each would move that
+// state on once more (the effect sped up, and the next frame starting from a
+// picture's state instead of the last frame's): it's saved before the
+// pictures and put back after each one (SaveCarried, RestoreCarried).
+std::unordered_map<HostTexture*, bool> g_carriedTouch;  // game thread: the frame's first use, true if read
+void NoteCarriedRead(HostTexture* texture) {
+  if (g_logOps) {
+    g_carriedTouch.emplace(texture, true);
+  }
+}
+void NoteCarriedWrite(HostTexture* texture) {
+  if (g_logOps) {
+    g_carriedTouch.emplace(texture, false);
+  }
+}
+struct CarriedTexture {
+  HostTexture* texture;  // (freed frames later, through g_garbage)
+  RenderTextureLayout layout;  // its layout at the frame's end, as the frame left it
+};
+// The frame's carried textures, and the touches forgotten for the next.
+std::vector<CarriedTexture> TakeCarried() {
+  std::vector<CarriedTexture> carried;
+  for (auto [texture, read] : g_carriedTouch) {
+    if (read && texture->texture && texture->samples == RenderSampleCount::COUNT_1) {
+      carried.push_back({texture, texture->layout});
+    }
+  }
+  g_carriedTouch.clear();
+  static size_t logged = ~size_t(0);
+  if (carried.size() != logged) {
+    logged = carried.size();
+    std::string list;
+    for (auto& c : carried) {
+      list += fmt::format(" {}x{}", c.texture->width, c.texture->height);
+    }
+    REXLOG_INFO("video: interp: {} textures carried from frame to frame:{}", carried.size(), list);
+  }
+  return carried;
+}
+// Render thread: each carried texture's saved copy, kept while it's carried
+// (one no longer used goes after a few frames: the GPU may still read it).
+struct CarriedCopy {
+  std::unique_ptr<RenderTexture> texture;
+  uint32_t width = 0, height = 0;
+  RenderFormat format = RenderFormat::UNKNOWN;
+  uint64_t usedFrame = 0;
+};
+std::unordered_map<const HostTexture*, CarriedCopy> g_carriedCopies;
+std::vector<std::pair<uint64_t, std::unique_ptr<RenderTexture>>> g_carriedRetired;
+uint64_t g_carriedFrame = 0;
+RenderTexture* CarriedCopyOf(const HostTexture& texture) {
+  auto& copy = g_carriedCopies[&texture];
+  if (copy.texture && (copy.width != texture.width || copy.height != texture.height ||
+                       copy.format != texture.format)) {
+    g_carriedRetired.emplace_back(g_carriedFrame, std::move(copy.texture));
+  }
+  if (!copy.texture) {
+    copy.texture = g_device->createTexture(RenderTextureDesc::Texture2D(
+        texture.width, texture.height, 1, texture.format, RenderTextureFlag::RENDER_TARGET));
+    copy.width = texture.width, copy.height = texture.height, copy.format = texture.format;
+  }
+  copy.usedFrame = g_carriedFrame;
+  return copy.texture.get();
+}
+// Before the first picture: each carried texture copied aside.
+void SaveCarried(RenderCommandList* l, const std::vector<CarriedTexture>& carried) {
+  g_carriedFrame++;
+  for (auto& c : carried) {
+    RenderTexture* copy = CarriedCopyOf(*c.texture);
+    if (!copy) {
+      continue;
+    }
+    l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                RenderTextureBarrier(c.texture->texture.get(), RenderTextureLayout::COPY_SOURCE));
+    l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(copy, RenderTextureLayout::COPY_DEST));
+    l->copyTextureRegion(RenderTextureCopyLocation::Subresource(copy),
+                         RenderTextureCopyLocation::Subresource(c.texture->texture.get()));
+    if (c.layout != RenderTextureLayout::UNKNOWN) {
+      l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                  RenderTextureBarrier(c.texture->texture.get(), c.layout));
+    }
+  }
+  // Copies of textures no longer carried, and replaced ones, freed a few frames on.
+  for (auto it = g_carriedCopies.begin(); it != g_carriedCopies.end();) {
+    if (g_carriedFrame - it->second.usedFrame > 8) {
+      g_carriedRetired.emplace_back(g_carriedFrame, std::move(it->second.texture));
+      it = g_carriedCopies.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  std::erase_if(g_carriedRetired, [](auto& retired) { return g_carriedFrame - retired.first > 8; });
+}
+// After each picture: the carried textures as the last frame left them.
+void RestoreCarried(RenderCommandList* l, const std::vector<CarriedTexture>& carried) {
+  for (auto& c : carried) {
+    auto it = g_carriedCopies.find(c.texture);
+    if (it == g_carriedCopies.end() || !it->second.texture) {
+      continue;
+    }
+    RenderTexture* copy = it->second.texture.get();
+    l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(copy, RenderTextureLayout::COPY_SOURCE));
+    l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                RenderTextureBarrier(c.texture->texture.get(), RenderTextureLayout::COPY_DEST));
+    l->copyTextureRegion(RenderTextureCopyLocation::Subresource(c.texture->texture.get()),
+                         RenderTextureCopyLocation::Subresource(copy));
+    l->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(copy, RenderTextureLayout::COPY_DEST));
+    if (c.layout != RenderTextureLayout::UNKNOWN) {
+      l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                  RenderTextureBarrier(c.texture->texture.get(), c.layout));
+    }
+  }
+}
 
 // NG2_PROFILE: how long the Render Commands thread ran batches (ns), and of
 // that in the presents (ns, by part), logged once a second by the presents.
@@ -1481,10 +1601,20 @@ class QueuedCommandList final : public RenderCommandList {
     });
   }
   void drawInstanced(uint32_t a, uint32_t b, uint32_t c, uint32_t d) override {
-    Op([=](RenderCommandList* l) { l->drawInstanced(a, b, c, d); });
+    bool once = g_logOps && g_drawMemExport;  // (not in the pictures: g_replayConstants set)
+    Op([=](RenderCommandList* l) {
+      if (!(once && g_replayConstants)) {
+        l->drawInstanced(a, b, c, d);
+      }
+    });
   }
   void drawIndexedInstanced(uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) override {
-    Op([=](RenderCommandList* l) { l->drawIndexedInstanced(a, b, c, d, e); });
+    bool once = g_logOps && g_drawMemExport;
+    Op([=](RenderCommandList* l) {
+      if (!(once && g_replayConstants)) {
+        l->drawIndexedInstanced(a, b, c, d, e);
+      }
+    });
   }
   void setPipeline(const RenderPipeline* p) override {
     Op([=](RenderCommandList* l) { l->setPipeline(p); });
@@ -3516,10 +3646,12 @@ uint32_t LookUpTexture(const xenos::xe_gpu_texture_fetch_t& fetch) {
     // texels (XenosRecomp's getGuestTexture2DDimensions).
     if (auto it = g_resolvedTextures.find(ResolvedKey(base, fetch));
         it != g_resolvedTextures.end()) {
+      NoteCarriedRead(it->second.get());
       Transition(*it->second, RenderTextureLayout::SHADER_READ);
       return it->second->descriptor | ((it->second->scale - 1) << 20);
     }
     if (auto it = g_lastResolve.find(base); it != g_lastResolve.end()) {
+      NoteCarriedRead(it->second);
       Transition(*it->second, RenderTextureLayout::SHADER_READ);
       return it->second->descriptor | ((it->second->scale - 1) << 20);
     }
@@ -4380,12 +4512,14 @@ void SubmitDraw(DrawRecord& record) {
       WriteGpuMark(commandList, g_frame, mark);
     }
   }
+  g_drawMemExport = record.memExport;
   if (record.indexed) {
     commandList->setIndexBuffer(&*record.indexView);
     commandList->drawIndexedInstanced(record.drawCount, 1, 0, int32_t(record.startVertex), 0);
   } else {
     commandList->drawInstanced(record.drawCount, 1, record.startVertex, 0);
   }
+  g_drawMemExport = false;
   if (g_profile.perDraw) {
     // (what comes before the next draw, clears and copies, isn't the draw's)
     if (uint32_t mark = AllocGpuMark(GpuMark::kDrawEnd); mark != UINT32_MAX) {
@@ -5443,8 +5577,10 @@ void Present(HostTexture* frontBuffer) {
   // them before drawing them.
   std::shared_future<std::shared_ptr<InterpFrames>> interpJob;
   const bool interpWanted = source == frontBuffer && sourceDescriptor;
+  std::vector<CarriedTexture> carried;
   if (InterpEnabled()) {
     interpJob = StartInterpBuild(frame, g_frameCount, SteadyNs());
+    carried = TakeCarried();
   }
   g_logOps = false;
   OpArena* frameLog = &g_frameLogs[frame];
@@ -5708,6 +5844,9 @@ void Present(HostTexture* frontBuffer) {
       recorded = std::min<size_t>(interp->phases.size(), kMaxPictures - 1);
       int64_t replayStart = SteadyNs();
       auto record = [&](size_t k) {
+        if (k == 0) {
+          SaveCarried(interpLists[frame][k].get(), carried);
+        }
         g_replayConstants = &interp->phases[k];
         g_replayCopies = k < interp->copies.size() ? &interp->copies[k] : nullptr;
         frameLog->RunKeep(interpLists[frame][k].get());
@@ -5783,6 +5922,7 @@ void Present(HostTexture* frontBuffer) {
         parts.acquire += SteadyNs() - acquireStart;
         growSemaphores();
         blit(interpList.get(), index);
+        RestoreCarried(interpList.get(), carried);  // (the next picture, or the frame, starts from them)
         interpList->end();
         RenderCommandSemaphore* wait = semaphore.get();
         RenderCommandSemaphore* signal = g_renderSemaphores[index].get();
@@ -7139,6 +7279,7 @@ void RunResolve(uint32_t device, uint32_t flags, uint32_t sourceRect, uint32_t d
     uint32_t address = PhysicalAddress(uint32_t(fetch.base_address) << 12);
     HostTexture* dest = GetResolveDestination(address, fetch, target->scale);
     if (dest) {
+      NoteCarriedWrite(dest);
       int32_t x1 = 0, y1 = 0, x2 = int32_t(target->width), y2 = int32_t(target->height);
       if (sourceRect) {
         x1 = guest::LoadS32(sourceRect);
