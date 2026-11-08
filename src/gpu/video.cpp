@@ -5639,8 +5639,9 @@ void Present(HostTexture* frontBuffer) {
     // Each picture between in a list and submit of its own, before the
     // frame's (so its drawing's end is its own, and what the next frame finds
     // is the frame's): the frame's commands again, its draws part of the way
-    // from the last frame's. Recorded first, all at once (each list on a
-    // thread: in a crowd one took about as long as the game's frame), before
+    // from the last frame's. Recorded first, one after another (plume keeps
+    // each texture's and buffer's layout and stages on the object itself:
+    // lists recorded at once raced on them, for wrong barriers), before
     // waiting for the presenter to have room.
     static std::unique_ptr<RenderCommandList> interpLists[NUM_FRAMES][kMaxPictures - 1];
     static std::unique_ptr<RenderCommandFence> interpFences[NUM_FRAMES][kMaxPictures - 1];
@@ -5663,7 +5664,9 @@ void Present(HostTexture* frontBuffer) {
         }
         interpLists[frame][k]->begin();
       }
-      g_interpPool.ForEach(recorded, uint32_t(recorded) - 1, record);
+      for (size_t k = 0; k < recorded; k++) {
+        record(k);
+      }
       int64_t took = SteadyNs() - replayStart;
       parts.record += took;
       replayNs += took;
