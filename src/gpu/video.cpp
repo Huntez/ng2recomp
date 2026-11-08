@@ -1832,13 +1832,11 @@ class Presenter {
       }
       // Presented once drawn: a present ahead of its picture's drawing is
       // shown when that ends, with the next one if it ends with it.
-      // (Not in exclusive full screen, NG2_EXCLUSIVE: there a drawing can wait
-      // for its image, freed by a later present, and the display flips one a
-      // refresh itself.)
-      static const bool exclusive = [] {
-        const char* v = std::getenv("NG2_EXCLUSIVE");
-        return v && v[0] && v[0] != '0';
-      }();
+      // (Not while the swapchain holds the display, exclusive full screen:
+      // there a drawing can wait for its image, freed by a later present, and
+      // the display flips one a refresh itself. Asked for and not held, or
+      // lost to an overlay, it's composed as in a window, and paced so.)
+      const bool exclusive = g_swapChain->isFullScreenExclusive();
       if (item.done && !exclusive) {
         item.done->Wait();
       }
@@ -5646,10 +5644,7 @@ void Present(HostTexture* frontBuffer) {
     // an image taken whose release waited for a present behind its own
     // drawing stood the GPU still (the Steam Deck: 40 s) - there each frame
     // hurries the last one's out before its first acquire, as before.
-    static const bool exclusive = [] {
-      const char* v = std::getenv("NG2_EXCLUSIVE");
-      return v && v[0] && v[0] != '0';
-    }();
+    const bool exclusive = g_swapChain->isFullScreenExclusive();
     auto hurryIfShort = [&](uint32_t taken) {
       if (hide || !InterpEnabled()) {
         return;
@@ -6461,6 +6456,11 @@ bool CreateHostDevice() {
   }
 
   g_swapChain = g_queue->createSwapChain(renderWindow, SwapChainImages(), BACKBUFFER_FORMAT, 1);
+  // NG2_EXCLUSIVE: 1 the display taken, 2 left to the driver (made again with it).
+  if (const char* v = std::getenv("NG2_EXCLUSIVE"); g_swapChain && v && std::atoi(v) > 0) {
+    g_swapChain->setFullScreenExclusive(std::atoi(v));
+    g_swapChain->resize();
+  }
   g_interpPictureCap = std::max(2u, std::min(kInterpMaxPictures, g_swapChain->getTextureCount() - 2));
   g_presentDrainCheck.store(g_swapChain != nullptr);
   // NG2_TEST_DXGI_CLOCK=1 (Windows): the DXGI display clock even with present_wait.
