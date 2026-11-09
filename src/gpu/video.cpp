@@ -5255,16 +5255,17 @@ void DisplayClockThread() {
       if (runUnits >= 60) {
         period = double(t - runStart) / double(runUnits);
       }
-      // Steady: fewer than 1 in 20 refreshes off their expected time, judged
+      // Steady: fewer than 1 in 10 refreshes off their expected time, judged
       // over the first 5 s, then over each 5 s; once steady, lost only past
       // 1 in 4 (a busy GPU makes the reports jitter, #46: judged over the
       // whole run, steady was lost for good after a while, and Frame Pacing
-      // Auto went back to the guest's own timer, which drifts from the display).
+      // Auto went back to the guest's own timer, which drifts from the display;
+      // with 1 in 20 to start, a display reporting 4-5% off took minutes).
       bool was = steady;
       if (runUnits < 300) {
-        steady = runUnits >= 120 && uneven * 20 < runUnits;
+        steady = runUnits >= 120 && uneven * 10 < runUnits;
       } else if (windowUnits >= 300) {
-        steady = steady ? windowUneven * 4 <= windowUnits : windowUneven * 20 < windowUnits;
+        steady = steady ? windowUneven * 4 <= windowUnits : windowUneven * 10 < windowUnits;
         if (steady != was && steadyChanges < 20) {
           steadyChanges++;
           REXLOG_INFO("video: display clock {} ({} of {} refreshes off time)",
