@@ -994,8 +994,12 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         // Or changed by about its whole size: another value, not a move (a
         // thing's list of lights given others as it went from room to room:
         // 17,26,-425 then -5.7,-7.3,0; part of the way, its light swept
-        // across the room). A fast turn changes a matrix by half at most.
-        const bool replaced = !shared && change > 0.9f * size;
+        // across the room). Only a light's (c64 on): a camera's matrix row is
+        // about 1 each, and a turn changes it by about that much; taken as
+        // replaced, the floor's camera went as now while Ryu's (the same
+        // matrix, in other registers) went part of the way, and the floor
+        // slid off under him.
+        const bool replaced = !shared && change > 0.9f * size && d.registers[r] >= 64;
         // A light's place (c96-c99: where, its reach in w) gone further than
         // half its reach, or its reach changed by a quarter: another light in
         // that place of the list, not this one moving. The game gives a thing
