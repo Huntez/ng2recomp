@@ -31,6 +31,7 @@ set(NG2_SOURCES
     src/main.cpp
     src/gpu/video.cpp
     src/gpu/native_gpu.cpp
+    src/gpu/win_display.cpp
     src/gpu/menu_label.cpp
     src/gpu/prompts.cpp
     src/controls.cpp
@@ -160,6 +161,8 @@ if(WIN32)
     # The first-run setup (src/windows_setup.cpp): the title update's SHA-1.
     target_link_libraries(ng2 PRIVATE bcrypt)
 endif()
+    # The display clock where Vulkan has no present_wait (src/gpu/win_display.cpp).
+    target_link_libraries(ng2 PRIVATE dxgi)
 
 # Movies decoded on the host (src/movie): the game's WMV3/VC-1 and WMA files.
 if(WIN32)

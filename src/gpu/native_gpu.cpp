@@ -36,6 +36,7 @@
 //   device+21608 is set and sub_83771778 in device mode 2; neither happened.
 // Each step was checked against the packets TU3's functions write.
 
+#include "win_display.h"
 #include "native_gpu.h"
 #include "video.h"
 
@@ -349,14 +350,13 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   // A sleep to a point, its last part spun (yielding): what a sleep may
   // overshoot by (Windows' sleeps are whole milliseconds).
   static void SleepNs(int64_t ns) {
-#if defined(_WIN32)
-    constexpr int64_t kSpin = 1'500'000;
-#else
-    constexpr int64_t kSpin = 300'000;
-#endif
+    // Asleep, then the last 0.3 ms awake (Windows: a high-resolution timer,
+    // where a plain sleep wakes on the scheduler's tick).
+    // (1.5 ms awake where the sleep isn't precise: Windows before 10 1803)
+    static thread_local const int64_t kSpin = ng2::video::PreciseSleepAvailable() ? 300'000 : 1'500'000;
     int64_t end = ng2::video::DisplayClockNow() + ns;
     if (ns > kSpin) {
-      std::this_thread::sleep_for(std::chrono::nanoseconds(ns - kSpin));
+      ng2::video::PreciseSleepNs(ns - kSpin);
     }
     while (ng2::video::DisplayClockNow() < end) {
       std::this_thread::yield();
@@ -510,9 +510,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       auto left = std::chrono::nanoseconds(
           int64_t(double(last + interval - now) * 1e9 / double(frequency)));
 #if defined(_WIN32)
-      // Sleeps are whole milliseconds there (a vblank up to 1 ms late, as the SDK's worker).
-      if (left >= std::chrono::milliseconds(1)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      // A high-resolution timer to 0.3 ms before, then awake (a plain sleep
+      // there wakes on the scheduler's tick: a vblank up to 1 ms late, or a spin).
+      if (left > std::chrono::microseconds(400)) {
+        ng2::video::PreciseSleepNs(left.count() - 300'000);
       } else {
         std::this_thread::yield();
       }

@@ -15,6 +15,7 @@
 #include "../aspect.h"
 #include "../movie/movie.h"
 #include "prompts.h"
+#include "win_display.h"
 
 #include <atomic>
 #include <bit>
@@ -5307,6 +5308,14 @@ void NoteFrameTaken() {
   }
 }
 
+// The Windows display clock's report (win_display.cpp), where there is no
+// VK_KHR_present_wait: the monitor's vblanks, not our frames, so no counts.
+void ReportWindowsVblank(int64_t vblankNs, int64_t periodNs, bool steady) {
+  g_displayPeriodNs.store(periodNs);
+  g_displayRefreshNs.store(vblankNs);
+  g_displaySteady.store(steady && periodNs > 0);
+}
+
 bool DisplayRefresh(int64_t* lastNs, int64_t* periodNs) {
   int64_t last = g_displayRefreshNs.load(), period = g_displayPeriodNs.load();
   if (!g_displaySteady.load() || !last || !period || SteadyNs() - last > 250'000'000) {
@@ -5430,7 +5439,16 @@ bool CreateHostDevice() {
 
   g_swapChain = g_queue->createSwapChain(renderWindow, 3, BACKBUFFER_FORMAT, 1);
   g_presentDrainCheck.store(g_swapChain != nullptr);
-  if (g_device->getCapabilities().presentWait) {
+  // NG2_TEST_DXGI_CLOCK=1 (Windows): the DXGI display clock even with present_wait.
+  static const bool forceDxgi = [] {
+#if defined(_WIN32)
+    const char* v = std::getenv("NG2_TEST_DXGI_CLOCK");
+    return v && v[0] == '1';
+#else
+    return false;
+#endif
+  }();
+  if (g_device->getCapabilities().presentWait && !forceDxgi) {
     g_displayRun.store(true);
     g_displayThread = new std::thread([] {
 #if defined(__linux__)
@@ -5439,6 +5457,17 @@ bool CreateHostDevice() {
       DisplayClockThread();
     });
   }
+#if defined(_WIN32)
+  else {
+    // (no present_wait, as on AMD's Windows driver: the monitor's vblanks from DXGI)
+    g_displayRun.store(true);
+    if (StartWindowsDisplayClock(renderWindow, &g_displayRun, SteadyNs, ReportWindowsVblank)) {
+      REXLOG_INFO("video: display clock from the monitor's vblanks (DXGI)");
+    } else {
+      g_displayRun.store(false);
+    }
+  }
+#endif
   SDL_AddEventWatch(WatchTraceKey, nullptr);
   REXLOG_INFO("video: wait for the screen (Input Latency Low): {}",
               g_device->getCapabilities().presentWait ? "yes" : "no (VK_KHR_present_wait missing)");
@@ -5836,6 +5865,7 @@ void DestroyHostDevice() {
     delete g_displayThread;
     g_displayThread = nullptr;
   }
+  g_displayRun.store(false);  // (the Windows display clock's thread, detached, stops too)
   std::lock_guard lock(g_mutex);
   if (g_queue) {
     if (g_recording) {
