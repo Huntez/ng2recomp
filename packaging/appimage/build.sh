@@ -48,7 +48,11 @@ mkdir -p "$out/src/game_files"  # the game's files are mounted here (the manifes
 
 docker run --rm -m 24g --shm-size=4g -u "$(id -u):$(id -g)" -e HOME=/tmp \
     -v "$out":/out -v "$game":/out/src/game_files:ro "$image" bash -euc '
-flags="-static-libstdc++ -static-libgcc -fuse-ld=lld"
+# The C++ runtime linked in stays private (--exclude-libs; only it: the SDK exports SDL and the
+# rest the game uses): exported, it took the place of
+# the system copy for Vulkan layers written in C++, and one that throws aborted the game (#27,
+# lsfg-vk).
+flags="-static-libstdc++ -static-libgcc -fuse-ld=lld -Wl,--exclude-libs,libstdc++.a:libgcc.a:libgcc_eh.a"
 # The SDK for any x86-64 PC since about 2009 (x86-64-v2: SSE4.2); the game twice, for those
 # and for AVX2 machines (x86-64-v3: the Steam Deck, any Ryzen, Intel since Haswell), which
 # the first hands over to where the CPU has it (src/cpu_handover.cpp).
