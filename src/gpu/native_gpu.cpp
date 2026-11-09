@@ -433,24 +433,27 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       // that is until a frame is queued and the display paces the game.
       // Bounded: a frame of queue takes 100 vblanks at 1%, so an episode
       // lasts 4 s at most; one that doesn't refill (a queue that can't fill:
-      // a slow GPU, a display the rate check let through) pauses the next
-      // for 30 s, doubling, and two in a row end it for the session.
+      // a slow GPU, a display the rate check let through, or a heavy scene
+      // where the game is under 60 anyway) pauses the next for 10 s,
+      // doubling up to a minute, and one that refills starts that over.
+      // Never off for good: heavy scenes failed it twice and left the queue
+      // dry for the rest of the session (#36, Mission 14).
       static bool refilling = false;
-      static int64_t refillStartNs = 0, refillPausedUntilNs = 0, refillPauseNs = 30'000'000'000;
-      static int refillsLogged = 0, refillsFailed = 0;
+      static int64_t refillStartNs = 0, refillPausedUntilNs = 0, refillPauseNs = 10'000'000'000;
+      static int refillsLogged = 0;
       bool drained = ng2::video::PresentQueueDrained();
       int64_t nowNs = ng2::video::DisplayClockNow();
       if (refilling && !drained) {
         refilling = false;  // (it filled: the acquires block again)
-        refillsFailed = 0;
+        refillPauseNs = 10'000'000'000;
       } else if (refilling && nowNs - refillStartNs > 4'000'000'000) {
         refilling = false;
-        refillPausedUntilNs = ++refillsFailed >= 2 ? INT64_MAX : nowNs + refillPauseNs;
-        refillPauseNs = std::min<int64_t>(refillPauseNs * 2, 600'000'000'000);
+        refillPausedUntilNs = nowNs + refillPauseNs;
         if (refillsLogged <= 10) {
-          REXLOG_INFO("gpu: the display's queue didn't refill in 4 s{}",
-                      refillsFailed >= 2 ? ": no more tries" : ", next try later");
+          REXLOG_INFO("gpu: the display's queue didn't refill in 4 s, next try in {} s",
+                      refillPauseNs / 1'000'000'000);
         }
+        refillPauseNs = std::min<int64_t>(refillPauseNs * 2, 60'000'000'000);
       } else if (!refilling && drained && REXCVAR_GET(vsync) && nowNs >= refillPausedUntilNs) {
         refilling = true;
         refillStartNs = nowNs;
