@@ -2376,6 +2376,8 @@ TextureFormatInfo GetTextureFormatInfo(xenos::TextureFormat format) {
     case F::k_8_8_8_8_AS_16_16_16_16: return {RenderFormat::R8G8B8A8_UNORM, 1, 4};
     case F::k_2_10_10_10:
     case F::k_2_10_10_10_AS_16_16_16_16: return {RenderFormat::R10G10B10A2_UNORM, 1, 4};
+    // Red in the low bits: swapped with blue at upload (SwapRedBlue565), as Xenia does.
+    case F::k_5_6_5: return {RenderFormat::B5G6R5_UNORM, 1, 2};
     case F::k_16: return {RenderFormat::R16_UNORM, 1, 2};
     case F::k_16_16: return {RenderFormat::R16G16_UNORM, 1, 4};
     case F::k_16_16_16_16: return {RenderFormat::R16G16B16A16_UNORM, 1, 8};
@@ -2392,6 +2394,17 @@ TextureFormatInfo GetTextureFormatInfo(xenos::TextureFormat format) {
     case F::k_DXN: return {RenderFormat::BC5_UNORM, 4, 16};
     case F::k_DXT5A: return {RenderFormat::BC4_UNORM, 4, 8};
     default: return {};
+  }
+}
+
+// k_5_6_5 keeps red in the low 5 bits; the host format (VK R5G6B5_PACK16,
+// DXGI B5G6R5) has it in the high ones.
+void SwapRedBlue565(std::vector<uint8_t>& data) {
+  for (size_t i = 0; i + 1 < data.size(); i += 2) {
+    uint16_t v;
+    std::memcpy(&v, data.data() + i, 2);
+    v = uint16_t((v >> 11) | (v & 0x07E0) | (v << 11));
+    std::memcpy(data.data() + i, &v, 2);
   }
 }
 
@@ -2717,6 +2730,10 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
   EndianSwap(base.data(), base.size(), fetch.endianness);
   std::vector<uint8_t> mips(mipData, mipData + mipSize);
   EndianSwap(mips.data(), mips.size(), fetch.endianness);
+  if (fetch.format == xenos::TextureFormat::k_5_6_5) {
+    SwapRedBlue565(base);
+    SwapRedBlue565(mips);
+  }
 
   // The Options header while RECOMP SETTINGS is open: a wider picture of
   // ours, one level (its draws are widened to match in Draw).
@@ -2884,6 +2901,23 @@ std::unique_ptr<HostTexture> CreateTexture(const xenos::xe_gpu_texture_fetch_t& 
     }
   }
 
+  if (dumpDir && info.format == RenderFormat::B5G6R5_UNORM) {  // (as RGB, red from the high bits)
+    std::string path = fmt::format("{}/{:08x}_{}x{}_565.ppm", dumpDir,
+                                   uint32_t(fetch.base_address) << 12, width, height);
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+      std::fprintf(f, "P6\n%u %u\n255\n", width, height);
+      for (uint32_t y = 0; y < height; y++) {
+        for (uint32_t x = 0; x < width; x++) {
+          uint16_t v;
+          std::memcpy(&v, upload.data + y * rowBytes + x * 2, 2);
+          uint8_t rgb[3] = {uint8_t((v >> 11) * 255 / 31), uint8_t(((v >> 5) & 63) * 255 / 63),
+                            uint8_t((v & 31) * 255 / 31)};
+          std::fwrite(rgb, 1, 3, f);
+        }
+      }
+      std::fclose(f);
+    }
+  }
   auto host = std::make_unique<HostTexture>();
   host->prompts = isPrompts;
   host->width = width;
