@@ -5538,7 +5538,10 @@ struct ResolveReadback {
   std::vector<ResolveReadbackItem> items;
 };
 ResolveReadback g_resolveReadbacks[NUM_FRAMES];
-constexpr uint32_t kReadbackTexels = 64 * 64;
+// Resolves up to 64x64 are read back (the brightness chain, the lens flare's
+// 3x3). Not by texel count: Chapter 9's opening resolves an 80x45 picture of
+// the screen, and with it read back the game waits on it forever (#73).
+constexpr uint32_t kReadbackSide = 64;
 
 bool ResolveReadbackOn() {
   static const bool on = !TestSwitch("NG2_RESOLVE_READBACK", "0");
@@ -5696,7 +5699,7 @@ void QueueResolveReadback(uint32_t address, const xenos::xe_gpu_texture_fetch_t&
     return;
   }
   uint32_t width = dest.width / dest.scale, height = dest.height / dest.scale;
-  if (!width || !height || uint64_t(width) * height > kReadbackTexels) {
+  if (!width || !height || width > kReadbackSide || height > kReadbackSide) {
     return;
   }
   TextureFormatInfo info = GetTextureFormatInfo(fetch.format);
