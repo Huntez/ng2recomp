@@ -73,6 +73,7 @@
 #include <zstd.h>
 
 #include <plume_render_interface.h>
+#include <plume_vulkan.h>  // (the textures' layouts plume keeps: frame interpolation's pictures)
 #include <smolv.h>
 
 #include "guest.h"
@@ -1419,6 +1420,64 @@ void RestoreCarried(RenderCommandList* l, const std::vector<CarriedTexture>& car
   }
 }
 
+// The textures' layouts around the pictures. plume keeps a texture's layout
+// on the object, as last recorded; the pictures run the frame's commands
+// again, which were recorded for the layouts the frame found, but are
+// recorded after the frame's own commands (and each after the one before),
+// so plume would take those commands' last layouts for where a picture
+// starts (a texture made this frame: as if loaded already). Each texture's
+// layout as the frame found it is noted (game thread, in Transition, while
+// the frame's commands are kept); each picture is recorded from those, and
+// ends by putting the textures back to them, so the next picture and the
+// frame's own commands start from them.
+using TextureLayouts = std::vector<std::pair<HostTexture*, RenderTextureLayout>>;
+std::unordered_map<HostTexture*, RenderTextureLayout> g_frameStartLayouts;
+void NoteStartLayout(HostTexture& texture) {
+  if (g_logOps) {
+    g_frameStartLayouts.emplace(&texture, texture.layout);
+  }
+}
+struct PictureLayouts {
+  TextureLayouts start;  // as the frame found them
+  TextureLayouts end;    // as a picture's commands (and the frame's) leave them
+  // The frame's (game thread), and the notes forgotten for the next.
+  void Take() {
+    start.assign(g_frameStartLayouts.begin(), g_frameStartLayouts.end());
+    g_frameStartLayouts.clear();
+  }
+  static void Track(const TextureLayouts& layouts) {  // (plume's idea of them)
+    for (auto [texture, layout] : layouts) {
+      if (texture->texture) {
+        static_cast<plume::VulkanTexture*>(texture->texture.get())->textureLayout = layout;
+      }
+    }
+  }
+  // Before a picture's commands are recorded.
+  void BeforeRecord() const { Track(start); }
+  // After the first picture's: where they leave each texture.
+  void NoteEnd() {
+    end = start;
+    for (auto& [texture, layout] : end) {
+      if (texture->texture) {
+        layout = static_cast<plume::VulkanTexture*>(texture->texture.get())->textureLayout;
+      }
+    }
+  }
+  // Before a picture's submit (its blit and the rest recorded then), and
+  // after the pictures (for the frame's present and the next frame).
+  void AtEnd() const { Track(end); }
+  // Barriers back to where the frame started.
+  void BackToStart(RenderCommandList* l) const {
+    for (auto [texture, layout] : start) {
+      auto* vk = texture->texture ? static_cast<plume::VulkanTexture*>(texture->texture.get()) : nullptr;
+      if (vk && layout != RenderTextureLayout::UNKNOWN && vk->textureLayout != layout) {
+        l->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
+                    RenderTextureBarrier(texture->texture.get(), layout));
+      }
+    }
+  }
+};
+
 // NG2_PROFILE: how long the Render Commands thread ran batches (ns), and of
 // that in the presents (ns, by part), logged once a second by the presents.
 std::atomic<int64_t> g_renderBusyNs{0};
@@ -2251,6 +2310,7 @@ RenderCommandList* CommandList() {
 }
 
 void Transition(HostTexture& texture, RenderTextureLayout layout) {
+  NoteStartLayout(texture);
   if (texture.layout != layout) {
     g_profile.barriers++;
     CommandList()->barriers(RenderBarrierStage::GRAPHICS | RenderBarrierStage::COPY,
@@ -5405,9 +5465,11 @@ void Present(HostTexture* frontBuffer) {
   std::shared_future<std::shared_ptr<InterpFrames>> interpJob;
   const bool interpWanted = source == frontBuffer && sourceDescriptor;
   std::vector<CarriedTexture> carried;
+  PictureLayouts layouts;
   if (InterpEnabled()) {
     interpJob = StartInterpBuild(frame, g_frameCount, SteadyNs());
     carried = TakeCarried();
+    layouts.Take();
   }
   g_logOps = false;
   OpArena* frameLog = &g_frameLogs[frame];
@@ -5671,14 +5733,19 @@ void Present(HostTexture* frontBuffer) {
       recorded = std::min<size_t>(interp->phases.size(), kMaxPictures - 1);
       int64_t replayStart = SteadyNs();
       auto record = [&](size_t k) {
+        layouts.BeforeRecord();
         if (k == 0) {
           SaveCarried(interpLists[frame][k].get(), carried);
+          layouts.BackToStart(interpLists[frame][k].get());  // (SaveCarried leaves them as the frame ends)
         }
         g_replayConstants = &interp->phases[k];
         g_replayCopies = k < interp->copies.size() ? &interp->copies[k] : nullptr;
         frameLog->RunKeep(interpLists[frame][k].get());
         g_replayConstants = nullptr;
         g_replayCopies = nullptr;
+        if (k == 0) {
+          layouts.NoteEnd();
+        }
       };
       for (size_t k = 0; k < recorded; k++) {
         if (!interpAcquire[frame][k]) {
@@ -5748,8 +5815,10 @@ void Present(HostTexture* frontBuffer) {
         NoteAcquire(SteadyNs() - acquireStart);
         parts.acquire += SteadyNs() - acquireStart;
         growSemaphores();
+        layouts.AtEnd();  // (the lists recorded since moved plume's idea of them on)
         blit(interpList.get(), index);
         RestoreCarried(interpList.get(), carried);  // (the next picture, or the frame, starts from them)
+        layouts.BackToStart(interpList.get());
         interpList->end();
         RenderCommandSemaphore* wait = semaphore.get();
         RenderCommandSemaphore* signal = g_renderSemaphores[index].get();
@@ -5764,6 +5833,7 @@ void Present(HostTexture* frontBuffer) {
       for (; k < recorded; k++) {
         interpLists[frame][k]->end();  // (recorded, not shown: no image)
       }
+      layouts.AtEnd();
     } else if (recorded) {
       for (size_t k = 0; k < recorded; k++) {
         interpLists[frame][k]->end();
