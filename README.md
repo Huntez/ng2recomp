@@ -158,8 +158,9 @@ each defaults to the game's own behaviour.
   16:10, 21:9, 32:9, 4:3); V-Sync (Off, FIFO, Mailbox, Adaptive; a mode the driver lacks falls back
   to FIFO); Frame Pacing (Timer, the game's own 60 Hz clock, or Auto: the game's frames on the
   display's own refreshes, measured from the frames reaching the screen, so no frame is shown
-  twice for the drift on a screen a little off 60 Hz, as 59.94; needs VK_KHR_present_wait, else it
-  runs as Timer). Timer is the default: use it on a variable-refresh display, G-Sync or FreeSync.
+  twice for the drift on a screen a little off 60 Hz, as 59.94; it needs VK_KHR_present_wait, or on
+  Windows, where the driver lacks it (AMD), it follows the monitor's own refreshes; else it runs as
+  Timer). Timer is the default: use it on a variable-refresh display, G-Sync or FreeSync.
   In the Steam Deck's Game Mode (and any game run through gamescope) Auto acts as Timer: there it
   gave me uneven frame pacing
 - **Cheats**: Infinite Health; Infinite Ninpo (each cast's ninpo filled back); Unlock Costumes;
@@ -246,6 +247,9 @@ for each button; a key in two lists presses both, as the game's two-button moves
 ## Known issues
 
 - Some cutscenes may have slight audio delays.
+- Overlays and frame limiters that hook the game's presents (MSI Afterburner with RivaTuner, and the
+  like) can upset frame pacing: if the game looks choppy at a steady 60 fps, close them completely
+  (not only minimized) and try again.
 - Tested on a Linux desktop, the Steam Deck, under Proton and in a Windows 11 virtual machine; reports
   from other systems, and from real Windows PCs especially, are welcome.
 
