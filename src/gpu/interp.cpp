@@ -1152,6 +1152,22 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
         if (!std::isfinite(change)) {
           continue;  // (as now)
         }
+        // A register of part numbers (each n.1, 65535.1 for none) is numbers,
+        // not amounts: as now. The bodies' pixel shaders (SupDel, c30) drop
+        // the pixels of a cut-off part, its number equal to one of these to
+        // 0.0001; mixed, the number between named no part, and the cut part
+        // showed, stretched (corpse spikes).
+        auto numbers = [](const float* v) {
+          for (uint32_t c = 0; c < 4; c++) {
+            if (!(v[c] >= 0.0f && std::fabs(v[c] - std::floor(v[c]) - 0.1f) < 0.01f)) {
+              return false;
+            }
+          }
+          return true;
+        };
+        if (numbers(x) && numbers(y)) {
+          continue;
+        }
         lerp[r] = 1;
         psMoved[r] = InterpMovedFromAnother(before.psConstants.data(), d.psConstants.data(), d.psRegisters.size(), r);
       }
