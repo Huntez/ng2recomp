@@ -1393,6 +1393,7 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
       bool jumped = false, finite = true;
       double moved = 0;
       size_t rows = 0, worstRow = 0, farRows = 0;
+      size_t changed = 0;  // (rows that moved: the mean over them)
       float worst = 0;
       uint32_t* outs[kInterpMaxPictures] = {};
       uint64_t snapped = 0;
@@ -1431,12 +1432,18 @@ std::shared_ptr<InterpFrames> BuildInterpFrames(uint32_t slot, uint64_t frameCou
           move = std::max(move, std::fabs(fx - fy));
         }
         job.moved += move;
+        job.changed += move > 0;
         job.farRows += move > 2.0f;
         if (move > job.worst) {
           job.worst = move, job.worstRow = job.rows;
         }
       }
-      job.jumped = !job.finite || (job.rows && !(job.moved / double(job.rows) <= kPaletteJump));
+      // (Over the rows that moved, not all: a buffer of a group of bodies
+      // is read whole, its few hundred bones among thousands of rows unused.
+      // When the camera turns the game lays the bones of the bodies in view
+      // out anew, many moved to another bone's rows at once: a spike on each
+      // body of the group, unseen in the mean over the whole buffer.)
+      job.jumped = !job.finite || (job.changed && !(job.moved / double(job.changed) <= kPaletteJump));
     });
     for (size_t i = 0; i < jobs.size(); i++) {
       auto& job = jobs[i];
