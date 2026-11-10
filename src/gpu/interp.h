@@ -45,8 +45,6 @@ struct InterpDraw {
   // the camera's space, must turn with the camera part of the way too.
   std::vector<uint16_t> psRegisters;
   std::vector<float> psConstants;
-  uint16_t targetWidth = 0, targetHeight = 0;  // (F9's dump: what it draws to)
-  bool depthOnly = false;
   bool ui = false;  // in the game's 2D pass (HUD, menus): drawn as it is now
 };
 struct InterpPalette {

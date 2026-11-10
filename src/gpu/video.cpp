@@ -53,8 +53,12 @@
 #include <sys/stat.h>
 #endif
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 #include <rex/ui/windowed_app_context.h>
@@ -5045,9 +5049,6 @@ void Draw(uint32_t device, uint32_t primitive, uint32_t startVertex, uint32_t co
     captured.boneAddress = interpBoneAddress;
     captured.boneSize = interpBoneSize;
     captured.mesh = interpMesh;
-    captured.targetWidth = uint16_t(shape->width);
-    captured.targetHeight = uint16_t(shape->height);
-    captured.depthOnly = !target;
   }
 
   Upload sharedUpload = Allocate(sizeof(shared));

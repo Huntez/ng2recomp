@@ -209,7 +209,7 @@ constexpr Setting kSettings[] = {
     // Pictures made between the game's frames: one each refresh of the
     // display (Full Rate) or each second one (Half Rate; each one below
     // 120 Hz, so never fewer than the game's 60), or one between each two
-    // of the game's frames (2x: 120 for its 60); gpu/video.cpp.
+    // of the game's frames (2x: 120 for its 60); gpu/interp.cpp.
     // (Short: a longer choice is squeezed narrow to fit.)
     {u"Frame Interpolation", {u"Off", u"Full Rate", u"Half Rate", u"2x"}, 4,
      "frame_interpolation", Kind::kLevel},
